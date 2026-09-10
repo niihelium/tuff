@@ -1,0 +1,108 @@
+<svg version="1.1" width="1200" height="223" viewBox="0 0 1200 223" xmlns="http://www.w3.org/2000/svg">
+<style>
+  text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  .node:hover rect { filter: brightness(1.18); stroke: #ffffff; stroke-width: 1.5px; cursor: pointer; }
+  .title { font-weight: bold; font-size: 16px; fill: #111; }
+  .subtitle { font-size: 12px; fill: #555; }
+</style>
+<rect width="100%" height="100%" fill="#fafafa"/>
+<text x="10" y="25" class="title">Tuff Execution FlameGraph Profile (Qwen 3.6 35B-A3B)</text>
+<text x="10" y="44" class="subtitle">Total Time: 26.12 ms / token (38.29 tok/s) | Hardware: RTX 3070 (8GB VRAM) + DDR4 System RAM</text>
+<g class="node">
+  <title>tuff_decode_step: 26.120 ms (100.0%)</title>
+  <rect x="10.0" y="161.0" width="1180.0" height="28" fill="#263238" rx="3" ry="3" stroke="#222" stroke-width="0.5" stroke-opacity="0.3"/>
+  <text x="16.0" y="179.0" font-size="12px" fill="#ffffff" font-weight="500">tuff_decode_step (26.12ms, 100.0%)</text>
+</g>
+<g class="node">
+  <title>Delta-Net (30 SSM Layers): 10.507 ms (40.2%)</title>
+  <rect x="10.0" y="129.0" width="474.7" height="28" fill="#e65100" rx="3" ry="3" stroke="#222" stroke-width="0.5" stroke-opacity="0.3"/>
+  <text x="16.0" y="147.0" font-size="12px" fill="#ffffff" font-weight="500">Delta-Net (30 SSM Layers) (10.51ms, 40.2%)</text>
+</g>
+<g class="node">
+  <title>CUDA Graph Replay (30 Delta Layers): 10.087 ms (38.6%)</title>
+  <rect x="10.0" y="97.0" width="455.7" height="28" fill="#e65100" rx="3" ry="3" stroke="#222" stroke-width="0.5" stroke-opacity="0.3"/>
+  <text x="16.0" y="115.0" font-size="12px" fill="#ffffff" font-weight="500">CUDA Graph Replay (30 Delta Layers) (10.09ms, 38.6%)</text>
+</g>
+<g class="node">
+  <title>Host Enqueue & State Sync: 0.420 ms (1.6%)</title>
+  <rect x="465.7" y="97.0" width="19.0" height="28" fill="#00838f" rx="3" ry="3" stroke="#222" stroke-width="0.5" stroke-opacity="0.3"/>
+</g>
+<g class="node">
+  <title>MoE Expert Stage (40 Layers): 9.269 ms (35.5%)</title>
+  <rect x="484.7" y="129.0" width="418.7" height="28" fill="#d84315" rx="3" ry="3" stroke="#222" stroke-width="0.5" stroke-opacity="0.3"/>
+  <text x="490.7" y="147.0" font-size="12px" fill="#ffffff" font-weight="500">MoE Expert Stage (40 Layers) (9.27ms, 35.5%)</text>
+</g>
+<g class="node">
+  <title>CPU Worker Pool (Miss Experts): 7.009 ms (26.8%)</title>
+  <rect x="484.7" y="97.0" width="316.7" height="28" fill="#2e7d32" rx="3" ry="3" stroke="#222" stroke-width="0.5" stroke-opacity="0.3"/>
+  <text x="490.7" y="115.0" font-size="12px" fill="#ffffff" font-weight="500">CPU Worker Pool (Miss Experts) (7.01ms, 26.8%)</text>
+</g>
+<g class="node">
+  <title>AVX2 Gate/Up MatVec: 3.364 ms (12.9%)</title>
+  <rect x="484.7" y="65.0" width="152.0" height="28" fill="#2e7d32" rx="3" ry="3" stroke="#222" stroke-width="0.5" stroke-opacity="0.3"/>
+  <text x="490.7" y="83.0" font-size="12px" fill="#ffffff" font-weight="500">AVX2 Gate/Up MatVec (3.36ms, 12.9%)</text>
+</g>
+<g class="node">
+  <title>AVX2 Down MatVec: 2.944 ms (11.3%)</title>
+  <rect x="636.7" y="65.0" width="133.0" height="28" fill="#2e7d32" rx="3" ry="3" stroke="#222" stroke-width="0.5" stroke-opacity="0.3"/>
+  <text x="642.7" y="83.0" font-size="12px" fill="#ffffff" font-weight="500">AVX2 Down MatVec</text>
+</g>
+<g class="node">
+  <title>SwiGLU & Quantization: 0.701 ms (2.7%)</title>
+  <rect x="769.7" y="65.0" width="31.7" height="28" fill="#546e7a" rx="3" ry="3" stroke="#222" stroke-width="0.5" stroke-opacity="0.3"/>
+</g>
+<g class="node">
+  <title>GPU Expert Kernels (Hit Slots): 1.275 ms (4.9%)</title>
+  <rect x="801.3" y="97.0" width="57.6" height="28" fill="#d84315" rx="3" ry="3" stroke="#222" stroke-width="0.5" stroke-opacity="0.3"/>
+  <text x="807.3" y="115.0" font-size="12px" fill="#ffffff" font-weight="500">GPU Expert K..</text>
+</g>
+<g class="node">
+  <title>MMVQ Gate/Up Fused: 0.701 ms (2.7%)</title>
+  <rect x="801.3" y="65.0" width="31.7" height="28" fill="#d84315" rx="3" ry="3" stroke="#222" stroke-width="0.5" stroke-opacity="0.3"/>
+</g>
+<g class="node">
+  <title>MMVQ Down Projection: 0.574 ms (2.2%)</title>
+  <rect x="833.0" y="65.0" width="25.9" height="28" fill="#d84315" rx="3" ry="3" stroke="#222" stroke-width="0.5" stroke-opacity="0.3"/>
+</g>
+<g class="node">
+  <title>Shared Expert MLP: 0.578 ms (2.2%)</title>
+  <rect x="858.9" y="97.0" width="26.1" height="28" fill="#d84315" rx="3" ry="3" stroke="#222" stroke-width="0.5" stroke-opacity="0.3"/>
+</g>
+<g class="node">
+  <title>Router D2H + Top-k Select: 0.171 ms (0.7%)</title>
+  <rect x="885.0" y="97.0" width="7.7" height="28" fill="#00838f" rx="3" ry="3" stroke="#222" stroke-width="0.5" stroke-opacity="0.3"/>
+</g>
+<g class="node">
+  <title>Background Fill Enqueue: 0.156 ms (0.6%)</title>
+  <rect x="892.8" y="97.0" width="7.1" height="28" fill="#00838f" rx="3" ry="3" stroke="#222" stroke-width="0.5" stroke-opacity="0.3"/>
+</g>
+<g class="node">
+  <title>Full Attention (10 Layers): 4.054 ms (15.5%)</title>
+  <rect x="903.4" y="129.0" width="183.2" height="28" fill="#6a1b9a" rx="3" ry="3" stroke="#222" stroke-width="0.5" stroke-opacity="0.3"/>
+  <text x="909.4" y="147.0" font-size="12px" fill="#ffffff" font-weight="500">Full Attention (10 Layers) (4.05ms, 15.5%)</text>
+</g>
+<g class="node">
+  <title>Flash Attention & KV-Cache: 3.041 ms (11.6%)</title>
+  <rect x="903.4" y="97.0" width="137.4" height="28" fill="#6a1b9a" rx="3" ry="3" stroke="#222" stroke-width="0.5" stroke-opacity="0.3"/>
+  <text x="909.4" y="115.0" font-size="12px" fill="#ffffff" font-weight="500">Flash Attention & KV-Cache</text>
+</g>
+<g class="node">
+  <title>RoPE & QKV Projections: 1.014 ms (3.9%)</title>
+  <rect x="1040.8" y="97.0" width="45.8" height="28" fill="#546e7a" rx="3" ry="3" stroke="#222" stroke-width="0.5" stroke-opacity="0.3"/>
+  <text x="1046.8" y="115.0" font-size="12px" fill="#ffffff" font-weight="500">RoPE & QKV P..</text>
+</g>
+<g class="node">
+  <title>Output LM-Head & Norms: 2.289 ms (8.8%)</title>
+  <rect x="1086.6" y="129.0" width="103.4" height="28" fill="#1565c0" rx="3" ry="3" stroke="#222" stroke-width="0.5" stroke-opacity="0.3"/>
+  <text x="1092.6" y="147.0" font-size="12px" fill="#ffffff" font-weight="500">Output LM-He..</text>
+</g>
+<g class="node">
+  <title>LM-Head MatVec (398 MB Q6_K): 2.015 ms (7.7%)</title>
+  <rect x="1086.6" y="97.0" width="91.0" height="28" fill="#1565c0" rx="3" ry="3" stroke="#222" stroke-width="0.5" stroke-opacity="0.3"/>
+  <text x="1092.6" y="115.0" font-size="12px" fill="#ffffff" font-weight="500">LM-Head MatV..</text>
+</g>
+<g class="node">
+  <title>RMS-Norm & Argmax: 0.275 ms (1.1%)</title>
+  <rect x="1177.6" y="97.0" width="12.4" height="28" fill="#1565c0" rx="3" ry="3" stroke="#222" stroke-width="0.5" stroke-opacity="0.3"/>
+</g>
+</svg>

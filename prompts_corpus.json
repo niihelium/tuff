@@ -1,0 +1,32 @@
+[
+  {
+    "id": "casimir_surrogate_solver",
+    "domain": "STEM (ML + Physics + Code)",
+    "title": "Neural Surrogate Solver for Casimir Effect",
+    "prompt": "Write a complete PyTorch implementation of a Physics-Informed Neural Network (PINN) surrogate solver for calculating the Casimir effect force between non-parallel conductive plates. Include loss functions incorporating boundary conditions of vacuum quantum fluctuations and stress-energy tensor calculations."
+  },
+  {
+    "id": "fastapi_backend",
+    "domain": "Software Engineering & Web",
+    "title": "FastAPI Production Backend",
+    "prompt": "Implement a production-grade FastAPI web backend with asynchronous SQLAlchemy 2.0 ORM, JWT authentication, rate-limiting middleware, background worker queues via Celery/Redis, and OpenAPI documentation."
+  },
+  {
+    "id": "casimir_theory",
+    "domain": "Theoretical Physics",
+    "title": "Explanation of Casimir Effect",
+    "prompt": "Explain the Casimir effect from first principles of Quantum Electrodynamics (QED). Derive the zero-point energy summation over vacuum photon modes between parallel conducting plates using zeta function regularization."
+  },
+  {
+    "id": "armenia_history",
+    "domain": "History & Humanities",
+    "title": "History of Armenia",
+    "prompt": "Provide a comprehensive historical analysis of Armenia from the Urartu civilization and Kingdom of Armenia under Tigranes the Great through Medieval Bagratid era to modern statehood in the 20th and 21st centuries."
+  },
+  {
+    "id": "dorian_gray_analysis",
+    "domain": "Literature & Philosophy",
+    "title": "Analysis of The Picture of Dorian Gray",
+    "prompt": "Provide a deep literary and philosophical analysis of Oscar Wilde's 'The Picture of Dorian Gray'. Discuss aestheticism vs hedonism, the Faustian bargain archetype, and the symbolism of the deteriorating portrait."
+  }
+]

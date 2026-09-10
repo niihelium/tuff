@@ -1,0 +1,5 @@
+build/
+*.o
+*.d
+*.log
+test_chat.md
