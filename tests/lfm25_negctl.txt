@@ -1,0 +1,82 @@
+# Negative-control table for tests/lfm25_negative_controls.sh.
+#
+# Each control = one realistic one-line bug, applied to a scratch COPY of the tree (never to the real repo)
+# as an EXACT string replacement that must match exactly once in `file` (0 or >1 matches => the control is
+# STALE: the source moved on, fix the table). Every listed check must then FAIL on the mutant build.
+#
+# Fields (one per line, blank line between controls; '#' comment lines ignored):
+#   id:      short unique id
+#   tags:    optional; "quick" = also run by --quick
+#   desc:    one-line description of the bug
+#   file:    path relative to the repo root
+#   old/new: text to replace; "\n" is a newline, "\\" a backslash. Whitespace after "old: " is significant.
+#   targets: cmake targets to rebuild (space separated): tuff lfm25-router-test lfm25-moe-ffn-test
+#   checks:  golden:<mode> oracle:<mode> router8 router24 moeffn8 moeffn24   (all must FAIL on the mutant)
+
+id: conv-taps-swap
+tags: quick
+desc: conv taps k0/k1 swapped in fused in_proj+shortconv kernel
+file: src/lfm25_gpu.cu
+old: float x_val = s_proj[64 + lane];\n\n    float u = b_val * x_val;\n\n    float s0 = conv_state[i];\n    float s1 = conv_state[d + i];\n\n    float k0 = conv_w[i * 3 + 0];\n    float k1 = conv_w[i * 3 + 1];
+new: float x_val = s_proj[64 + lane];\n\n    float u = b_val * x_val;\n\n    float s0 = conv_state[i];\n    float s1 = conv_state[d + i];\n\n    float k0 = conv_w[i * 3 + 1];\n    float k1 = conv_w[i * 3 + 0];
+targets: tuff
+checks: golden:dense oracle:dense
+
+id: inproj-bc-swap
+tags: quick
+desc: b and c in_proj rows swapped in fused in_proj+shortconv kernel
+file: src/lfm25_gpu.cu
+old: float b_val = s_proj[lane];\n    float c_val = s_proj[32 + lane];
+new: float b_val = s_proj[32 + lane];\n    float c_val = s_proj[lane];
+targets: tuff
+checks: golden:dense oracle:dense
+
+id: rmsnorm-block-offset
+tags: quick
+desc: multi-block RMSNorm+Q8_1 blocks start at warp_id instead of blockIdx.x*8+warp_id
+file: src/lfm25_gpu.cu
+old: for (int b = blockIdx.x * 8 + warp_id; b < total_q_blocks;
+new: for (int b = warp_id; b < total_q_blocks;
+targets: tuff
+checks: golden:dense oracle:dense
+
+id: warp-reduce-reversed
+tags: quick
+desc: reversed warp-reduction order (masks 1..16) in fused kernel; oracle gate is known to PASS this, golden must not
+file: src/lfm25_gpu.cu
+old:         tmp = warp_reduce_sum_f(tmp);\n        if (lane == 0) s_proj[r] = tmp;
+new:         for (int m = 1; m < 32; m <<= 1) tmp += __shfl_xor_sync(0xffffffff, tmp, m, 32);\n        if (lane == 0) s_proj[r] = tmp;
+targets: tuff
+checks: golden:dense
+
+id: router-ignores-bias
+desc: router ignores the selection bias exp_probs_b
+file: src/lfm25_gpu.cu
+old: sel[c] = p[c] + bias[lane + 32 * c];
+new: sel[c] = p[c];
+targets: tuff lfm25-router-test
+checks: router8 oracle:moe8
+
+id: down-expert0-acts
+desc: expert down projection reads expert-0 activations for every expert
+file: src/lfm25_gpu.cu
+old: const block_q8_1_c *yk8 = y + (size_t)k * nblk * (QK_K / QK8_1);
+new: const block_q8_1_c *yk8 = y + (size_t)0 * nblk * (QK_K / QK8_1);
+targets: lfm25-moe-ffn-test
+checks: moeffn8
+
+id: q6k-down-as-q4k
+desc: Q6_K expert down dispatched through the Q4_K kernel
+file: src/lfm25_gpu.cu
+old: if (down_type == GGML_TYPE_Q4_K) {
+new: if (down_type == GGML_TYPE_Q4_K || down_type == GGML_TYPE_Q6_K) {
+targets: lfm25-moe-ffn-test
+checks: moeffn8
+
+id: unweighted-expert-sum
+desc: expert outputs summed without router weights
+file: src/lfm25_gpu.cu
+old: float o = topk_w[0] * yk[0];\n        o = o + topk_w[1] * yk[1];\n        o = o + topk_w[2] * yk[2];\n        o = o + topk_w[3] * yk[3];
+new: float o = yk[0];\n        o = o + yk[1];\n        o = o + yk[2];\n        o = o + yk[3];
+targets: tuff lfm25-moe-ffn-test
+checks: moeffn8 golden:moe8

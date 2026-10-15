@@ -1,0 +1,22 @@
+# LFM2.5 oracle-gate thresholds - LOCKED.
+#
+# Read by tests/verify_lfm25_oracle.sh (and N / CTX by tests/verify_lfm25_golden.sh).
+# Changing a value here changes what "the gate passes" means: do it only in its own commit, with the
+# justification written in the commit message and BEFORE looking at a result it would turn from fail to pass.
+# Setting the matching environment variable to a different value makes a run EXPLORATORY
+# (exit 3, "NOT A GATE RESULT"); only the values in this file define a gate pass.
+# Format: KEY=VALUE, '#' starts a comment.
+
+N=128              # teacher-forced / golden steps
+N_EXACT=16         # stage 1: max exact-prefix length (cut at first reference margin < MIN_MARGIN)
+MIN_MARGIN=0.5     # stage 1/2: near-tie margin (logits); also the FP64-adjudication threshold
+MAX_RATIO=1.10     # stage 3: mean (dense) / median (MoE) tuff-vs-llama.cpp RMS-error ratio
+MAX_STEP_RATIO=2.0 # stage 3, dense only: worst single-step ratio
+MAX_P90_RATIO=1.5  # stage 3, MoE only: p90 ratio
+N_FP_DENSE=32      # steps covered by the FP64 reference / stage 3
+N_FP_MOE8=32
+N_FP_MOE=72
+CTX=1024           # -c for every tuff run in the gates
+STAT_DENSE=mean    # stage 3 statistic per mode
+STAT_MOE8=robust
+STAT_MOE=robust

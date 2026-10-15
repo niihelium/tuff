@@ -127,14 +127,26 @@ Current results:
   (13 near-ties + step 68 FP64-adjudicated: ref margin 0.954 but FP64 prefers ref by only 0.328), median 0.69, p90 0.55.
   FP64 argmax agrees with tuff 69/72 vs with the reference 63/72.
 
-### 4.3 Honest caveats (raised by the user; to be fixed — see §11)
-- Thresholds (0.5 / 1.10 / 1.5 / 2.0) are judgment calls, not derived.
+### 4.3 Honest caveats and how they are now addressed
+- Thresholds (0.5 / 1.10 / 1.5 / 2.0) are judgment calls, not derived. **Now locked** in `tests/lfm25_gate_thresholds.txt`
+  (sha256 `996f77a5ea01`, printed by every gate run; table in the roadmap's *Gate Design*). An env override makes the run
+  `EXPLORATORY ... NOT A GATE RESULT`, exit 3. Changing the file needs its own commit with the rationale, written before
+  looking at the result it would flip.
 - The gate was changed twice **after** a failure (robust MoE stat; FP64 adjudication). Both were evidence-backed and
   followed by a negative control that still fails — but "test fails → change test" is a pattern to distrust.
 - Stage 1 is nearly vacuous for MoE (2 and 1 tokens).
-- Planned fix: **golden self-regression gate** (freeze tuff's validated 128 tokens + logit hashes per model, require
-  byte-identical output from every later change — a true 1:1 exact test), **lock thresholds** in the roadmap, and **wire the
-  negative controls into the gate script** so they run every time.
+- **Golden self-regression gate** (`tests/verify_lfm25_golden.sh`, 2026-10-16): the true 1:1 test. It freezes tuff's
+  validated 128 greedy tokens plus the sha256 of each of the 128 teacher-forced logit rows per model (`tests/golden/*.json`),
+  and every later build must reproduce them byte-for-byte with the graph on, the graph off, and (8B) the forced expert cache.
+  Current goldens = `18ebb70`; their logits sha256 equal the independently built `e133b44` dumps on all three models.
+  The goldens are environment-specific (GPU, driver, nvcc, arch, per-thread stream; checked first, FAIL with a message on
+  mismatch). Only `--update --reason` regenerates them, and it requires a full oracle-gate pass and agreement of all
+  configs first. A golden FAIL on an intentional numerics change is expected: update only after the oracle gate passes.
+- **Negative controls automated** (`tests/lfm25_negative_controls.sh`, table `tests/lfm25_negctl.txt`): 8 mutations,
+  applied as exact single-match string replacements in a scratch copy (`/tmp/tuff_negctl`). A control whose string
+  no longer matches is reported STALE and fails the run. ~100 s.
+- One entry point: `tests/verify_lfm25_all.sh [--controls]` (golden ×3, oracle ×3, 4 unit tests, optionally the controls),
+  ~3 min with controls.
 
 ### 4.4 Negative controls that must fail (keep using them)
 | Bug injected | Caught by |
@@ -146,6 +158,10 @@ Current results:
 | down reads expert-0 activations | moe_ffn 0/44 |
 | unweighted expert sum | moe_ffn 0/44 |
 | Q6_K down dispatched as Q4_K | moe_ffn fails exactly the 20 Q6_K cases |
+| fused kernel: b/c in_proj rows swapped (4.2) | golden FAIL; dense gate prefix 0/10, 79 hard misses, ratio 19.8 |
+| multi-block RMSNorm: all blocks write the first share (4.2) | golden FAIL; dense gate 0/128 TF |
+| fused kernel: x channel off by one (4.2) | golden FAIL; dense gate 101 hard misses |
+| fused kernel: reversed warp-reduction order (bit-level only) | **golden FAIL only** — dense oracle gate PASSES (ratio 0.80); greedy stream forks at token 19, max \|Δlogit\| 0.95 at step 0 |
 | reversed router tie-break | **NOT caught** (no exact ties in real data; tie rule unverified vs ggml CUDA argsort) |
 
 ---
@@ -166,6 +182,14 @@ Gates (dense ~30 s; moe8 ~1 min; moe ~15 s — FP64 cached; first FP64 build: de
 ```
 Env knobs: `N` (128), `N_EXACT` (16), `N_FP` (32/32/72), `MIN_MARGIN` (0.5), `MAX_RATIO` (1.10), `MAX_P90_RATIO` (1.5),
 `CTX` (1024), `MODEL_PATH`, `TUFF_BIN`, `REF_BIN`, `PYTHON`. The FP64 cache key is model size+mtime, ref sha1, N_FP.
+
+Everything at once (~1.3 min; ~3 min with the 8 negative controls):
+```bash
+./tests/verify_lfm25_all.sh            # golden x3 (byte-identity), oracle x3, 4 unit tests
+./tests/verify_lfm25_all.sh --controls # + tests/lfm25_negative_controls.sh
+./tests/verify_lfm25_golden.sh dense|moe8|moe|all
+./tests/verify_lfm25_golden.sh <mode> --update --reason "..."   # only for an intentional numerics change
+```
 
 Unit tests (seconds each):
 ```bash
@@ -225,6 +249,10 @@ $PY tools/lfm25_pack_moe_fixtures.py    /tmp/d24 tests/fixtures/lfm25_24b_moe_ff
 | Tool | What it does |
 | :--- | :--- |
 | `tests/verify_lfm25_oracle.sh` | three-stage gate (§4.2) |
+| `tests/verify_lfm25_golden.sh` + `tools/lfm25_golden.py` | golden self-regression gate (byte-identity; goldens in `tests/golden/`) |
+| `tests/lfm25_gate_thresholds.txt` | locked gate thresholds (read by the oracle and golden gates) |
+| `tests/lfm25_negative_controls.sh` + `tests/lfm25_negctl.txt` | automated injected-bug controls (scratch tree `/tmp/tuff_negctl`) |
+| `tests/verify_lfm25_all.sh` | runs all of the above + unit tests, summary table |
 | `tests/gen_lfm25_ref.sh` | reproducible llama.cpp references + margins + recipe |
 | `tools/lfm25_llama_ref.c` (`build/lfm25-llama-ref`) | llama.cpp single-token GPU decode: greedy tokens, margins, logits; `--teacher`, `--cpu-experts` |
 | `tools/lfm25_fp64_ref.py` | FP64 numpy forward pass (lfm2 + lfm2moe, on-demand expert dequant, LRU) |
@@ -324,8 +352,9 @@ $PY tools/lfm25_pack_moe_fixtures.py    /tmp/d24 tests/fixtures/lfm25_24b_moe_ff
    ([+6.85, +7.16]); 6 interleaved rounds, `8bfb4ed` vs `e133b44`. Gates re-run on clean `e133b44`: identical numbers to §4.2. Correctness is done: graph logits byte-identical to the pre-change
    engine on 1.2B and 8B, all three gates unchanged, memcheck clean (1.2B, 8B). Speed 346 tok/s vs target 350 — the
    remaining gap is kernel time → Task 4.2. Logits D2H is now only done when logit capture is on.
-2. **Strengthen the gate** (user request): golden self-regression (byte-identical tokens + logit hashes per model vs the
-   last validated commit), thresholds locked in the roadmap, negative controls automated in the gate script.
+2. **Strengthen the gate — done 2026-10-16** (§4.3): golden self-regression gate, locked thresholds, automated
+   negative controls (8/8 caught), `tests/verify_lfm25_all.sh --controls` = ALL PASS. **Rule from now on: every change
+   runs `tests/verify_lfm25_all.sh`; an optimization/refactor must pass the golden unchanged.**
 3. **Task 4.2 — done 2026-10-16**: fused in_proj+conv kernel + multi-block RMSNorm; byte-identical, A/B +5.46% (1.2B,
    361.7 tok/s), +5.65% (8B), +4.79% (24B); evidence in the roadmap. Leftovers: `lfm25_gpu_shortconv_step` and
    `eng->d_in_proj` are now unused (kept as the reference path; remove when convenient). Next speed candidate on the 1.2B:

@@ -56,6 +56,21 @@ The gate therefore has three stages, all required:
 
 **FP64 adjudication of stage-2 hard misses (24B).** With the CPU-expert reference being noisy (logit RMS vs FP64 ~0.44 median, ~3x the 8B's GPU reference), the reference's own top1-top2 margin is unreliable as a near-tie test. Over 72 FP64 steps the FP64 argmax agrees with tuff 69/72 but with the llama.cpp reference only 63/72; of tuff's 11 misses FP64 sides with tuff on 9. The lone hard miss (step 68, reference margin 0.954) is a near-tie in ground truth: FP64 logit(ref token) - logit(tuff token) = 0.328. `lfm25_gate.py teacher --fp64` therefore reclassifies a hard miss as a near-tie only if |FP64 gap| < `MIN_MARGIN` (0.5) and the step is covered by the FP64 file (`N_FP`: 72 for `moe`, 32 otherwise); uncovered steps stay hard misses. This is a real test, not a waiver: with `--min-margin 0.3` step 68 is not excused.
 
+**Locked thresholds (2026-10-16).** Gate parameters live in `tests/lfm25_gate_thresholds.txt` (sha256 `996f77a5ea01`, printed by every run). An environment override makes the run EXPLORATORY (exit 3, never a pass). A change needs its own commit with the rationale, written before looking at the result it would flip.
+
+| Parameter | Value | Applies to |
+| :--- | :---: | :--- |
+| N (teacher-forced / golden steps) | 128 | all |
+| N_EXACT (max exact prefix) | 16 | stage 1 (cut at first ref margin < MIN_MARGIN) |
+| MIN_MARGIN | 0.5 | stages 1, 2 and FP64 adjudication |
+| MAX_RATIO | 1.10 | stage 3: dense mean / MoE median |
+| MAX_STEP_RATIO | 2.0 | stage 3 dense worst step |
+| MAX_P90_RATIO | 1.5 | stage 3 MoE p90 |
+| N_FP | 32 / 32 / 72 | dense / moe8 / moe |
+| CTX | 1024 | all tuff gate runs |
+
+**Golden self-regression gate (byte-identity).** The oracle gate cannot see bit-level regressions: a reversed warp-reduction order passes it (FP64 ratio 0.80) while changing every logit row. `tests/verify_lfm25_golden.sh` freezes tuff's validated output per model (128 greedy tokens + sha256 of each teacher-forced logit row, `tests/golden/*.json`). Every optimization/refactor must reproduce it byte-for-byte with the graph on, the graph off, and (8B) the forced expert cache. Goldens are regenerated only with `--update --reason`, after a full oracle-gate pass. Negative controls run automatically with `tests/lfm25_negative_controls.sh` (8 controls); `tests/verify_lfm25_all.sh --controls` runs everything.
+
 The reference is produced by `tests/gen_lfm25_ref.sh` (`build/lfm25-llama-ref`: libllama, all layers on GPU, single-token decode, greedy). It is byte-reproducible; the command, llama.cpp commit and model SHA-256 are recorded in `tests/ref_lfm25_dense_128.recipe`. Negative control: swapping two conv taps fails all three stages (1/16 prefix, 55 hard misses, 17.9× FP64 error).
 
 ---

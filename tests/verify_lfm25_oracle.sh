@@ -15,6 +15,8 @@
 #                         near-ties flip experts, heavy-tailed spikes): median ratio <= MAX_RATIO
 #                         and p90 ratio <= MAX_P90_RATIO
 #
+# All thresholds live in tests/lfm25_gate_thresholds.txt (locked); an env override of any of them makes
+# the run EXPLORATORY (exit 3, never a pass).
 # The reference comes from tests/gen_lfm25_ref.sh (recipe recorded next to it). Rationale for
 # not requiring a long exact-match run: see tools/lfm25_gate.py and LFM25_ROADMAP.md.
 set -euo pipefail
@@ -22,32 +24,55 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 MODE="${1:-dense}"
-N="${N:-128}"
-N_EXACT="${N_EXACT:-16}"
-MIN_MARGIN="${MIN_MARGIN:-0.5}"
-MAX_RATIO="${MAX_RATIO:-1.10}"
-MAX_P90_RATIO="${MAX_P90_RATIO:-1.5}"
 PROMPT="${PROMPT:-Hello}"
+
+# Gate parameters are LOCKED in tests/lfm25_gate_thresholds.txt. An environment override that differs
+# from the locked value is allowed for exploration, but the run is then marked EXPLORATORY (exit 3).
+THR="tests/lfm25_gate_thresholds.txt"
+[ -f "$THR" ] || { echo "Error: $THR missing" >&2; exit 1; }
+THR_SHA="$(sha256sum "$THR" | cut -c1-12)"
+locked() {
+    local v
+    v="$(sed -n "s/^$1=\([^#[:space:]]*\).*/\1/p" "$THR" | head -1)"
+    [ -n "$v" ] || { echo "Error: $1 missing in $THR" >&2; exit 1; }
+    echo "$v"
+}
+OVERRIDES=()
+# param NAME LOCKED_VALUE: take env override if set, record it when it differs numerically/textually.
+param() {
+    local name="$1" lock="$2" cur
+    cur="${!name:-$lock}"
+    if [ "$cur" != "$lock" ] && ! awk -v a="$cur" -v b="$lock" 'BEGIN{exit !(a+0==b+0 && a ~ /^[0-9.]+$/)}'; then
+        OVERRIDES+=("$name=$cur (locked $lock)")
+    fi
+    printf -v "$name" '%s' "$cur"
+}
+param N "$(locked N)"
+param N_EXACT "$(locked N_EXACT)"
+param MIN_MARGIN "$(locked MIN_MARGIN)"
+param MAX_RATIO "$(locked MAX_RATIO)"
+param MAX_STEP_RATIO "$(locked MAX_STEP_RATIO)"
+param MAX_P90_RATIO "$(locked MAX_P90_RATIO)"
 # Context for the tuff runs: prompt + N tokens fits easily. Without it tuff sizes the KV cache for
 # the model's full 128k context (~3.1 GiB FP32 on 1.2B), so the gate could not share the GPU.
-CTX="${CTX:-1024}"
+param CTX "$(locked CTX)"
 
 REF_EXTRA=()
 if [ "$MODE" = "dense" ]; then
     MODEL_PATH="${MODEL_PATH:-/run/media/nii/pohjola/models/unsloth/LFM2.5-1.2B-Thinking-GGUF/LFM2.5-1.2B-Thinking-Q4_K_M.gguf}"
     REF="tests/ref_lfm25_dense_128.txt"
-    STAT="mean"
-    N_FP="${N_FP:-32}"
+    STAT="$(locked STAT_DENSE)"
+    param N_FP "$(locked N_FP_DENSE)"
 elif [ "$MODE" = "moe8" ]; then
     MODEL_PATH="${MODEL_PATH:-/run/media/nii/pohjola/models/LiquidAI/LFM2.5-8B-A1B-GGUF/LFM2.5-8B-A1B-Q4_K_M.gguf}"
     REF="tests/ref_lfm25_moe8_128.txt"
-    STAT="robust"
-    N_FP="${N_FP:-32}"
+    STAT="$(locked STAT_MOE8)"
+    param N_FP "$(locked N_FP_MOE8)"
 elif [ "$MODE" = "moe" ]; then
     MODEL_PATH="${MODEL_PATH:-/run/media/nii/pohjola/models/LiquidAI/LFM2.5-24B-A2B-GGUF/LFM2.5-24B-A2B-Q4_K_M.gguf}"
     REF="tests/ref_lfm25_moe_128.txt"
-    STAT="robust"
-    N_FP="${N_FP:-72}"   # 72 steps so FP64 can adjudicate the noisy CPU-expert reference
+    STAT="$(locked STAT_MOE)"
+    param N_FP "$(locked N_FP_MOE)"   # 72 steps so FP64 can adjudicate the noisy CPU-expert reference
     # Same recipe as tests/gen_lfm25_ref.sh moe: llama.cpp keeps the experts on its CPU backend.
     REF_EXTRA=(--cpu-experts)
 else
@@ -86,6 +111,7 @@ TF_ERR="$TMP_DIR/tuff_tf_lfm25_${MODE}.err"
 LL_LOGITS="$TMP_DIR/llama_tf_lfm25_${MODE}.bin"
 
 echo "LFM2.5 oracle gate ($MODE): $MODEL_PATH"
+echo "thresholds: $THR sha256=$THR_SHA"
 
 # Run tuff: greedy prefix, then the teacher-forced pass with per-step logits.
 "$BIN" --model "$MODEL_PATH" --prompt "$PROMPT" -c "$CTX" -n "$N_EXACT" --temp 0 --dump-tokens > "$GOT" 2> "$ERR" \
@@ -124,7 +150,7 @@ rc=0
     --vocab "$VOCAB" -n "$N" --min-margin "$MIN_MARGIN" --fp64 "$FP_LOGITS" || rc=1
 "$PY" tools/lfm25_gate.py tolerance --fp64 "$FP_LOGITS" --tuff "$TF_LOGITS" --llama "$LL_LOGITS" \
     --vocab "$VOCAB" -n "$N_FP" --stat "$STAT" \
-    --max-ratio "$MAX_RATIO" --max-p90-ratio "$MAX_P90_RATIO" || rc=1
+    --max-ratio "$MAX_RATIO" --max-step-ratio "$MAX_STEP_RATIO" --max-p90-ratio "$MAX_P90_RATIO" || rc=1
 echo "=========================================================="
 if [ "$rc" -eq 0 ]; then
     echo "  ORACLE PASS ($MODE)"
@@ -132,4 +158,9 @@ else
     echo "  ORACLE FAIL ($MODE)"
 fi
 echo "=========================================================="
+if [ "${#OVERRIDES[@]}" -gt 0 ]; then
+    list="$(printf '%s, ' "${OVERRIDES[@]}")"
+    echo "EXPLORATORY (thresholds overridden: ${list%, }) — NOT A GATE RESULT"
+    [ "$rc" -eq 0 ] && exit 3
+fi
 exit "$rc"
