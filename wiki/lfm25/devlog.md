@@ -21,6 +21,7 @@ Last updated: 2026-10-16. Branch: `lfm25-phase1` (pushed to `origin`; not merged
 | 3.1b/3.2 — VRAM expert cache, 24B | done, **Gate 3 PASS** | `8bfb4ed` | 8B forced-cache logits byte-identical |
 | 4.1 — whole-trunk CUDA graph (1.2B, 8B) | done; A/B +6.69% (1.2B) / +7.00% (8B) | `e133b44` | graph logits byte-identical to pre-change engine; A/B §11 |
 | 4.2 — fused in_proj+conv+gate+Q8_1, multi-block RMSNorm | done; A/B +5.46% / +5.65% / +4.79% | see git log | logits byte-identical to `e133b44` (3 models, graph on/off, forced cache) |
+| 4.2b — long-K Q6_K/Q4_K down matvec (unroll) | done; A/B 1.2B +4.26% (≈378 tok/s) | see git log | golden PASS ×3, 336/322 GB/s |
 | 4.3 — async prefetch / CPU misses (24B) | not started | | |
 | 5 — speculative decoding | not started | | |
 
@@ -28,7 +29,7 @@ Decode speed (RTX 3070 Laptop, `-c 1024 -n 128 --runs 3`, `balanced` profile, in
 
 | Model | tuff | llama.cpp (tg128) | Note |
 | :--- | :---: | :---: | :--- |
-| 1.2B dense | 322 → 343 (graph) → **362** (4.2) | 331 | Phase-4 target ≥ 350 met |
+| 1.2B dense | 322 → 343 (graph) → 362 (4.2) → **378** (4.2b) | 331 | Phase-4 target ≥ 350 met |
 | 8B-A1B | 214 → 229 (graph) → **242** (4.2) | 218 | fully VRAM resident |
 | 24B-A2B | 110 → **115** (4.2) | 34.8 (`-ot exps=CPU`) | expert cache, 95.5 % hit rate on a short repetitive run |
 

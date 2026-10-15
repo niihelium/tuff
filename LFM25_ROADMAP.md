@@ -227,6 +227,10 @@ Usable VRAM: **~7,880 MiB**
   - **Byte-identical** teacher-forced logits vs `e133b44` on 1.2B, 8B, 24B with graph on and `LFM25_CUDA_GRAPH=0`, and on the 8B forced through an 88-slot expert cache. All three gates unchanged to the printed digit; router 176/176 + 304/304, moe_ffn 44/44 + 76/76; memcheck 0 errors / 0 leaks (1.2B, 8B, 24B), racecheck 0 hazards, synccheck 0 errors.
   - Negative controls (dense): b/c rows swapped → gate FAIL (prefix 0/10, 79 hard misses, ratio 19.8); norm blocks all writing the first share → FAIL (0/128 TF); x channel off by one → FAIL (101 hard misses); reversed warp-reduction order (bit-level only) → **byte-identity FAILS but the oracle gate PASSES** (ratio 0.80) — motivates the golden self-regression gate.
   - A/B (`ab_interleaved.sh`, 6 rounds, `e133b44` vs 4.2, balanced profile, `FORCE=1`): 1.2B 342.9 → 361.7 tok/s **+5.46% ± 0.21**; 8B 228.7 → 241.6 **+5.65% ± 0.08**; 24B 110.2 → 115.5 **+4.79% ± 0.10**.
+- [x] **Task 4.2b: Long-K dense matvec efficiency (Q6_K / Q4_K `ffn_down`)**
+  - `#pragma unroll 16` (Q6_K) / `unroll 4` (Q4_K) on the per-lane block loop of the dense MMVQ kernels: the next blocks' loads issue before the dependent float accumulation; per-lane accumulation order unchanged ⇒ byte-identical (golden PASS ×3).
+  - nsys (1.2B, per call): Q6_K down 51.4 → 41.0 µs (268 → 336 GB/s); Q4_K down ~35 → 29.3 µs (270 → 322 GB/s).
+  - `verify_lfm25_all.sh --controls` ALL PASS (8/8 controls); memcheck 0 errors. A/B vs `e0efcc1` (balanced, `FORCE=1`): 1.2B **+4.26% ± 0.06** (≈378 tok/s), 8B +0.17%, 24B +0.28% (their down projections run in the expert kernels).
 - [ ] **Task 4.3: Async Prefetch & Dual-Stream MoE Execution (24B)**
   - Overlap layer $L$ expert computation with layer $L+1$ PCIe miss transfers.
   - Target: **$\ge 95 - 110$ tok/s** on RTX 3070 Laptop.

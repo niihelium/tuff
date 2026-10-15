@@ -161,6 +161,7 @@ __global__ void lfm_mmvq_q4_K_dense_kernel(
     const block_q4_K * __restrict__ rw = w + (size_t)row * nblk;
     const int kqs = vdr * (threadIdx.x % tpsb);
     float tmp = 0.0f;
+#pragma unroll 4
     for (int kbx = threadIdx.x / tpsb; kbx < nblk; kbx += blocks_per_iter) {
         tmp += vec_dot_q4_K_q8_1_c(rw + kbx, y + kbx * (QK_K / QK8_1), kqs);
     }
@@ -188,6 +189,7 @@ __global__ void lfm_mmvq_q6_K_dense_kernel(
     const block_q6_K * __restrict__ rw = w + (size_t)row * nblk;
     const int kqs = vdr * (threadIdx.x % tpsb);
     float tmp = 0.0f;
+#pragma unroll 16
     for (int kbx = threadIdx.x / tpsb; kbx < nblk; kbx += blocks_per_iter) {
         tmp += vec_dot_q6_K_q8_1_c(rw + kbx, y + kbx * (QK_K / QK8_1), kqs);
     }
