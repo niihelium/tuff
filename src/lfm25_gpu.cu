@@ -937,3 +937,148 @@ void lfm25_gpu_router_top4(const float *d_x, const float *d_w_gate_inp, const fl
     lfm_router_top4_kernel<<<1, 32 * LFM_ROUTER_N_EXPERT>>>(d_x, d_w_gate_inp, d_bias, d_topk_ids, d_topk_w, d_logits, dim);
     CUDA_CHECK_LAST();
 }
+
+// -----------------------------------------------------------------------------
+// MoE expert FFN: gate/up (Q4_K) + SwiGLU, down (Q4_K or Q6_K), weighted ordered sum
+// -----------------------------------------------------------------------------
+void lfm25_gpu_quantize_q8_1(const float *d_x, void *d_q8, int n) {
+    lfm_quantize_q8_1_kernel<<<(n + 255) / 256, 256>>>(d_x, (block_q8_1_c*)d_q8, n);
+    CUDA_CHECK_LAST();
+}
+
+// grid (ceil(ffn_dim/rows), 4): blockIdx.y = k selects expert topk_ids[k] (read on device).
+// Expert e starts at e * ffn_dim * nblk blocks. Writes act[k * ffn_dim + row].
+template <int rows_per_block>
+__launch_bounds__(rows_per_block * 32, 1)
+__global__ void lfm_moe_gate_up_swiglu_q4_K_kernel(
+        const block_q4_K * __restrict__ wg,
+        const block_q4_K * __restrict__ wu,
+        const block_q8_1_c * __restrict__ y,
+        const int * __restrict__ topk_ids,
+        float * __restrict__ d_act,
+        int ffn_dim, int nblk) {
+    constexpr int vdr = VDR_Q4_K_Q8_1_MMVQ;
+    constexpr int tpsb = QI4_K / vdr;
+    constexpr int blocks_per_iter = vdr * 32 / QI4_K;
+
+    const int row = blockIdx.x * rows_per_block + threadIdx.y;
+    if (row >= ffn_dim) return;
+    const int k = blockIdx.y;
+    const size_t eoff = ((size_t)topk_ids[k] * ffn_dim + row) * nblk;
+    const block_q4_K * __restrict__ rwg = wg + eoff;
+    const block_q4_K * __restrict__ rwu = wu + eoff;
+
+    const int kqs = vdr * (threadIdx.x % tpsb);
+    float tg = 0.0f;
+    float tu = 0.0f;
+    for (int kbx = threadIdx.x / tpsb; kbx < nblk; kbx += blocks_per_iter) {
+        const block_q8_1_c *yb = y + kbx * (QK_K / QK8_1);
+        tg += vec_dot_q4_K_q8_1_c(rwg + kbx, yb, kqs);
+        tu += vec_dot_q4_K_q8_1_c(rwu + kbx, yb, kqs);
+    }
+    tg = warp_reduce_sum_f(tg);
+    tu = warp_reduce_sum_f(tu);
+
+    if (threadIdx.x == 0) {
+        float silu_g = tg / (1.0f + expf(-tg));
+        d_act[(size_t)k * ffn_dim + row] = silu_g * tu;
+    }
+}
+
+template <typename block_t> struct lfm_moe_down_traits;
+template <> struct lfm_moe_down_traits<block_q4_K> {
+    static constexpr int vdr = VDR_Q4_K_Q8_1_MMVQ;
+    static constexpr int qi  = QI4_K;
+    static __device__ __forceinline__ float dot(const block_q4_K *b, const block_q8_1_c *y, int iqs) {
+        return vec_dot_q4_K_q8_1_c(b, y, iqs);
+    }
+};
+template <> struct lfm_moe_down_traits<block_q6_K> {
+    static constexpr int vdr = VDR_Q6_K_Q8_1_MMVQ;
+    static constexpr int qi  = QI6_K;
+    static __device__ __forceinline__ float dot(const block_q6_K *b, const block_q8_1_c *y, int iqs) {
+        return vec_dot_q6_K_q8_1_c(b, y, iqs);
+    }
+};
+
+// Each row computes y_k = down_e[row] . Q8_1(act_k) for k=0..3, then
+// out = ((w0*y0 + w1*y1) + w2*y2) + w3*y3, stored or added to dst[row].
+// nblk may be odd (7 for ffn_dim=1792); the strided loop handles any count.
+template <typename block_t, int rows_per_block, bool accum>
+__launch_bounds__(rows_per_block * 32, 1)
+__global__ void lfm_moe_down_kernel(
+        const block_t * __restrict__ w,
+        const block_q8_1_c * __restrict__ y,
+        const int * __restrict__ topk_ids,
+        const float * __restrict__ topk_w,
+        float * __restrict__ dst,
+        int out_dim, int nblk) {
+    constexpr int vdr = lfm_moe_down_traits<block_t>::vdr;
+    constexpr int tpsb = lfm_moe_down_traits<block_t>::qi / vdr;
+    constexpr int blocks_per_iter = vdr * 32 / lfm_moe_down_traits<block_t>::qi;
+
+    const int row = blockIdx.x * rows_per_block + threadIdx.y;
+    if (row >= out_dim) return;
+
+    const int kqs = vdr * (threadIdx.x % tpsb);
+    float yk[LFM_ROUTER_TOPK];
+#pragma unroll
+    for (int k = 0; k < LFM_ROUTER_TOPK; k++) {
+        const block_t * __restrict__ rw = w + ((size_t)topk_ids[k] * out_dim + row) * nblk;
+        const block_q8_1_c *yk8 = y + (size_t)k * nblk * (QK_K / QK8_1);
+        float tmp = 0.0f;
+        for (int kbx = threadIdx.x / tpsb; kbx < nblk; kbx += blocks_per_iter) {
+            tmp += lfm_moe_down_traits<block_t>::dot(rw + kbx, yk8 + kbx * (QK_K / QK8_1), kqs);
+        }
+        yk[k] = warp_reduce_sum_f(tmp);
+    }
+    if (threadIdx.x == 0) {
+        float o = topk_w[0] * yk[0];
+        o = o + topk_w[1] * yk[1];
+        o = o + topk_w[2] * yk[2];
+        o = o + topk_w[3] * yk[3];
+        if (accum) dst[row] += o;
+        else       dst[row]  = o;
+    }
+}
+
+void lfm25_gpu_moe_ffn(const void *d_xq8, const int *d_topk_ids, const float *d_topk_w,
+                       const void *dev_gate_exps, const void *dev_up_exps,
+                       const void *dev_down_exps, int down_type,
+                       float *d_act, void *d_act_q8,
+                       float *d_dst, bool accum, int dim, int ffn_dim) {
+    if (down_type != GGML_TYPE_Q4_K && down_type != GGML_TYPE_Q6_K) {
+        fprintf(stderr, "lfm25_gpu_moe_ffn: unsupported down_type=%d (only Q4_K/Q6_K)\n", down_type);
+        abort();
+    }
+    if (dim % QK_K != 0 || ffn_dim % QK_K != 0) {
+        fprintf(stderr, "lfm25_gpu_moe_ffn: dim=%d / ffn_dim=%d must be multiples of %d\n", dim, ffn_dim, QK_K);
+        abort();
+    }
+    const int nblk_in = dim / QK_K;
+    const int nblk_down = ffn_dim / QK_K;
+
+    dim3 block(32u, (unsigned)MMVQ_ROWS_PER_BLOCK, 1u);
+    dim3 grid_gu((unsigned)((ffn_dim + MMVQ_ROWS_PER_BLOCK - 1) / MMVQ_ROWS_PER_BLOCK), (unsigned)LFM_ROUTER_TOPK, 1u);
+    lfm_moe_gate_up_swiglu_q4_K_kernel<MMVQ_ROWS_PER_BLOCK><<<grid_gu, block>>>(
+        (const block_q4_K*)dev_gate_exps, (const block_q4_K*)dev_up_exps, (const block_q8_1_c*)d_xq8,
+        d_topk_ids, d_act, ffn_dim, nblk_in);
+    CUDA_CHECK_LAST();
+
+    lfm25_gpu_quantize_q8_1(d_act, d_act_q8, LFM_ROUTER_TOPK * ffn_dim);
+
+    dim3 grid_dn((unsigned)((dim + MMVQ_ROWS_PER_BLOCK - 1) / MMVQ_ROWS_PER_BLOCK), 1u, 1u);
+    const block_q8_1_c *yq = (const block_q8_1_c*)d_act_q8;
+#define LFM_MOE_DOWN_LAUNCH(BT, ACC) \
+    lfm_moe_down_kernel<BT, MMVQ_ROWS_PER_BLOCK, ACC><<<grid_dn, block>>>( \
+        (const BT*)dev_down_exps, yq, d_topk_ids, d_topk_w, d_dst, dim, nblk_down)
+    if (down_type == GGML_TYPE_Q4_K) {
+        if (accum) LFM_MOE_DOWN_LAUNCH(block_q4_K, true);
+        else       LFM_MOE_DOWN_LAUNCH(block_q4_K, false);
+    } else {
+        if (accum) LFM_MOE_DOWN_LAUNCH(block_q6_K, true);
+        else       LFM_MOE_DOWN_LAUNCH(block_q6_K, false);
+    }
+#undef LFM_MOE_DOWN_LAUNCH
+    CUDA_CHECK_LAST();
+}

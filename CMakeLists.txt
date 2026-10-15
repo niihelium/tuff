@@ -158,3 +158,24 @@ target_compile_options(lfm25-router-test PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3 ${TUFF_CUDA_STREAM_FLAG}>
 )
 target_link_libraries(lfm25-router-test PRIVATE CUDA::cudart OpenMP::OpenMP_C m)
+
+# MoE expert FFN test (Task 2.2): checks lfm25_gpu_moe_ffn against llama.cpp fixtures.
+# Calls lfm25_gpu_prepare (uploads all experts, ~4.8 GB VRAM).
+add_executable(lfm25-moe-ffn-test
+    src/gguf_parser.c
+    src/cpu_ops.c
+    src/lfm25_model.c
+    src/lfm25_gpu.cu
+    tests/test_lfm25_moe_ffn.cu
+)
+set_target_properties(lfm25-moe-ffn-test PROPERTIES
+    COMPILE_FLAGS "${OpenMP_C_FLAGS}"
+    LINK_FLAGS "${OpenMP_C_FLAGS} -Wl,--disable-new-dtags"
+    INSTALL_RPATH "/home/nii/workspace/llama.cpp/build/bin"
+    BUILD_WITH_INSTALL_RPATH TRUE
+)
+target_compile_options(lfm25-moe-ffn-test PRIVATE
+    $<$<COMPILE_LANGUAGE:C>:-g -O2 -Wall -Wextra -march=native -mfma -mavx2 -mf16c>
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3 ${TUFF_CUDA_STREAM_FLAG}>
+)
+target_link_libraries(lfm25-moe-ffn-test PRIVATE CUDA::cudart OpenMP::OpenMP_C m)

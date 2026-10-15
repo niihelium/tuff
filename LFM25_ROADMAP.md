@@ -160,9 +160,12 @@ Usable VRAM: **~7,880 MiB**
     * Warp-reduction top-4 selection (single block, one warp per expert logit).
   - Done: `lfm_router_top4_kernel` / `lfm25_gpu_router_top4` in `src/lfm25_gpu.cu`. `build/lfm25-router-test` checks it against 176 llama.cpp cases (22 MoE layers × 8 decode steps of LFM2.5-8B-A1B, `tests/fixtures/lfm25_8b_router_cases.bin`, regenerated with `tools/lfm25_router_fixtures.c` + `tools/lfm25_pack_router_fixtures.py`): 176/176 identical top-4 sets and order, max |Δw| 1.2e-7, max |Δlogit| 1.9e-6. memcheck/racecheck/synccheck clean. Negative controls caught: biased weights (0/176), missing selection bias (57/176).
   - Known gap: the tie rule (lower index wins) is not exercised by real data and not yet confirmed against ggml's CUDA `argsort_top_k`; exact FP32 ties in `sigmoid + bias` are not expected in practice.
-- [ ] **Task 2.2: In-VRAM Expert SwiGLU & Weighted Accumulation**
+- [x] **Task 2.2: In-VRAM Expert SwiGLU & Weighted Accumulation**
   - Dispatch the 4 active experts per token directly from resident VRAM slots.
-  - Accumulate weighted outputs: $x_{\text{moe}} = \sum_{k=1}^4 w_k \cdot y_k$.
+  - Per expert: $act_k = \text{silu}(\text{gate}_e \cdot x_q) \cdot (\text{up}_e \cdot x_q)$ (Q4_K gate/up, Q8_1 input), each $act_k$ quantized to Q8_1 on its own, then $y_k = \text{down}_e \cdot Q8_1(act_k)$. Down type is Q4_K in some layers and Q6_K in others (dispatched per layer on the host). Expert ids are read from device memory (no host sync).
+  - Weights are applied **after** the down projection and summed in fixed order: $x_{\text{moe}} = ((w_0 y_0 + w_1 y_1) + w_2 y_2) + w_3 y_3$, then stored or added to the residual.
+  - Done: `lfm25_gpu_moe_ffn` (+ `lfm25_gpu_quantize_q8_1`) in `src/lfm25_gpu.cu`. `lfm25-moe-ffn-test` against llama.cpp fixtures (`tests/fixtures/lfm25_8b_moe_ffn_cases.bin`, all 22 MoE layers × 2 steps, 12 Q4_K-down / 10 Q6_K-down layers; packed by `tools/lfm25_pack_moe_fixtures.py`): 44/44, max act error 1.6e-7, max output error 1.7e-7 (relative to max |ref|), residual-accumulate path verified. memcheck/racecheck/synccheck clean. Negative controls caught: wrong expert in gate/up, wrong activation slice in down, unweighted sum, Q6_K down dispatched as Q4_K (fails exactly the 20 Q6_K cases).
+  - Note for Task 2.3: `lfm25_engine.c` hardcodes the dense FFN width as 8192; the 8B model's dense layers 0–1 use `feed_forward_length = 7168` (and rope base is 5e6, vocab 128000).
 - [ ] **Task 2.3: MoE Pipeline Assembly & Oracle Gate 2**
   - Assemble LFM2.5-8B-A1B decode pipeline.
   - **Validation Gate 2**: Three-stage oracle gate on 8B (MoE FP64 reference to be added to `tools/lfm25_fp64_ref.py`); benchmark un-optimized baseline speed.

@@ -2,10 +2,11 @@
 //
 // Greedy single-token decode of "Hello" on GPU (n_batch = n_ubatch = 1); for every step and every
 // MoE layer writes the router input (ffn_norm output), logits, sigmoid probs, top-k ids and
-// normalized weights as raw files into <outdir>. tools/lfm25_pack_router_fixtures.py then packs
-// them into tests/fixtures/lfm25_8b_router_cases.bin.
+// normalized weights, plus the expert-FFN activations, per-expert down outputs and combined MoE
+// output, as raw files into <outdir>. tools/lfm25_pack_router_fixtures.py and
+// tools/lfm25_pack_moe_fixtures.py pack them into tests/fixtures/lfm25_8b_{router,moe_ffn}_cases.bin.
 //
-// build: gcc -O2 tools/lfm25_router_fixtures.c -I$LLAMA/include -I$LLAMA/ggml/include \
+// build: gcc -O2 tools/lfm25_router_fixtures.c -I$LLAMA/include -I$LLAMA/ggml/include
 //            -L$LLAMA/build/bin -lllama -lggml -lggml-base -Wl,-rpath,$LLAMA/build/bin -o lfm25_router_fixtures
 // usage: lfm25_router_fixtures <8b-model.gguf> <outdir> <n_steps>     (fixtures use n_steps = 8)
 #include "llama.h"
@@ -21,7 +22,9 @@ static int g_step = 0;
 static int wanted(const char *n) {
     return !strncmp(n, "ffn_moe_logits-", 15) || !strncmp(n, "ffn_moe_probs-", 14) ||
            !strncmp(n, "ffn_moe_topk-", 13) || !strncmp(n, "ffn_moe_weights_norm-", 21) ||
-           !strncmp(n, "model.layers.{}.ffn_out-", 24);
+           !strncmp(n, "model.layers.{}.ffn_out-", 24) ||
+           // expert FFN (tests/fixtures/lfm25_8b_moe_ffn_cases.bin)
+           !strncmp(n, "ffn_moe_swiglu-", 15) || !strncmp(n, "ffn_moe_down-", 13) || !strncmp(n, "ffn_moe_out-", 12);
 }
 
 static bool cb(struct ggml_tensor *t, bool ask, void *ud) {
