@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tests/verify_lfm25_golden.sh - LFM2.5 golden self-regression gate (byte-identity).
 #
-# Usage: verify_lfm25_golden.sh dense|moe8|moe|all
+# Usage: verify_lfm25_golden.sh dense|dense26|moe8|moe|all
 #        verify_lfm25_golden.sh <mode> --update --reason "<why the golden may change>"
 #
 # The oracle gate (verify_lfm25_oracle.sh) compares against llama.cpp/FP64 with tolerances, so it cannot
@@ -47,7 +47,7 @@ UPDATE=0
 REASON=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        dense|moe8|moe|all) TARGET="$1" ;;
+        dense|dense26|moe8|moe|all) TARGET="$1" ;;
         --update) UPDATE=1 ;;
         --reason) shift; REASON="${1:-}" ;;
         *) echo "Unknown argument: $1" >&2; usage ;;
@@ -74,6 +74,10 @@ mode_setup() {
         dense)
             MODEL="/run/media/nii/pohjola/models/unsloth/LFM2.5-1.2B-Thinking-GGUF/LFM2.5-1.2B-Thinking-Q4_K_M.gguf"
             REF="tests/ref_lfm25_dense_128.txt"
+            CONFIGS=("graph=1|LFM25_CUDA_GRAPH=1" "graph=0|LFM25_CUDA_GRAPH=0") ;;
+        dense26)
+            MODEL="/run/media/nii/pohjola/models/LiquidAI/LFM2.5-2.6B/LFM2.5-2.6B-Q4_K_M.gguf"
+            REF="tests/ref_lfm25_dense26_128.txt"
             CONFIGS=("graph=1|LFM25_CUDA_GRAPH=1" "graph=0|LFM25_CUDA_GRAPH=0") ;;
         moe8)
             MODEL="/run/media/nii/pohjola/models/LiquidAI/LFM2.5-8B-A1B-GGUF/LFM2.5-8B-A1B-Q4_K_M.gguf"

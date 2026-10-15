@@ -42,6 +42,7 @@ step() {  # <name> <cmd...>
     if [ $rc -eq 0 ]; then RES+=("PASS"); else RES+=("FAIL (exit $rc)"); fi
 }
 
+# dense26 excluded pending user decision on the stage-3 shift-sensitivity finding, see LFM25_ROADMAP.md
 for m in dense moe8 moe; do step "golden $m" ./tests/verify_lfm25_golden.sh "$m"; done
 for m in dense moe8 moe; do step "oracle $m" ./tests/verify_lfm25_oracle.sh "$m"; done
 step "router8"   "$BDIR/lfm25-router-test"  "$M8"  tests/fixtures/lfm25_8b_router_cases.bin

@@ -210,6 +210,12 @@ Usable VRAM: **~7,880 MiB**
 
 ---
 
+### Stepping stone 2: LFM2.5-2.6B (dense, 30 layers) — gate tooling done, **oracle stage 3 OPEN (user decision)**
+- tuff runs it (177 tok/s, `-c 1024`). Reference `tests/ref_lfm25_dense26_128.*` (llama.cpp `620d2225`, byte-reproducible), `verify_lfm25_oracle.sh dense26` and `verify_lfm25_golden.sh dense26` modes, thresholds `N_FP_DENSE26=32`, `STAT_DENSE26=mean` locked **before** the first run.
+- Result: stage 1 PASS (near-tie at step 0), stage 2 PASS (126/128, 2 near-ties), stage 3 **FAIL** on the worst-step limit only: mean ratio 0.95 ≤ 1.10, worst step 2.44 > 2.0 (step 1: tuff RMS 0.239 vs llama.cpp 0.098).
+- Analysis (not acted on): the step-1 error is almost entirely a **uniform shift of all logits** (tuff −0.225 vs llama.cpp −0.019), which softmax/argmax ignore. Shift-free RMS at step 1 is tuff 0.082 vs llama.cpp 0.096, worst shift-free ratio over 32 steps 1.33, mean 0.93. No systematic bias: mean |shift| is 0.056 for both runtimes and tuff's signed mean is −0.005. On the 128k-vocab models the shift is 56–66 % of the squared error in both runtimes (1.2B: 4 % / 27 %).
+- Changing stage 3 to a shift-invariant RMS would be principled, but it would turn this FAIL into a PASS after the result was seen, so per the lock rule it is **the user's decision**. Until then dense26 is excluded from the `all` targets (`verify_lfm25_golden.sh all`, `verify_lfm25_all.sh`) and has no golden.
+
 ### Phase 4: Fused Kernels & CUDA Graph Capture
 **Objective**: Eliminate global memory round-trips and drive launch latency to zero.
 

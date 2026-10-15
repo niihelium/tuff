@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tests/verify_lfm25_oracle.sh - LFM2.5 correctness gate (three stages, all must pass).
 #
-# Usage: verify_lfm25_oracle.sh [dense|moe8|moe]   (dense = 1.2B, moe8 = 8B-A1B, moe = 24B-A2B)
+# Usage: verify_lfm25_oracle.sh [dense|dense26|moe8|moe]   (dense = 1.2B, dense26 = 2.6B, moe8 = 8B-A1B, moe = 24B-A2B)
 #
 #   [1/3] exact prefix    first N_EXACT (16) greedy tokens identical to the llama.cpp reference,
 #                         cut short at the first reference step with margin < MIN_MARGIN
@@ -63,6 +63,11 @@ if [ "$MODE" = "dense" ]; then
     REF="tests/ref_lfm25_dense_128.txt"
     STAT="$(locked STAT_DENSE)"
     param N_FP "$(locked N_FP_DENSE)"
+elif [ "$MODE" = "dense26" ]; then
+    MODEL_PATH="${MODEL_PATH:-/run/media/nii/pohjola/models/LiquidAI/LFM2.5-2.6B/LFM2.5-2.6B-Q4_K_M.gguf}"
+    REF="tests/ref_lfm25_dense26_128.txt"
+    STAT="$(locked STAT_DENSE26)"
+    param N_FP "$(locked N_FP_DENSE26)"
 elif [ "$MODE" = "moe8" ]; then
     MODEL_PATH="${MODEL_PATH:-/run/media/nii/pohjola/models/LiquidAI/LFM2.5-8B-A1B-GGUF/LFM2.5-8B-A1B-Q4_K_M.gguf}"
     REF="tests/ref_lfm25_moe8_128.txt"
@@ -76,7 +81,7 @@ elif [ "$MODE" = "moe" ]; then
     # Same recipe as tests/gen_lfm25_ref.sh moe: llama.cpp keeps the experts on its CPU backend.
     REF_EXTRA=(--cpu-experts)
 else
-    echo "Unknown mode: $MODE (choose 'dense', 'moe8' or 'moe')" >&2
+    echo "Unknown mode: $MODE (choose 'dense', 'dense26', 'moe8' or 'moe')" >&2
     exit 2
 fi
 MARGINS="${REF%.txt}.margins.txt"
