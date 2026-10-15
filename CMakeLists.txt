@@ -26,6 +26,10 @@ set(SOURCES
     src/drafter.c
     src/sampler.c
     src/engine.c
+    src/tuff_vtable.c
+    src/lfm25_model.c
+    src/lfm25_gpu.cu
+    src/lfm25_engine.c
     src/chat.c
     src/main.c
 )
@@ -34,7 +38,7 @@ add_executable(tuff ${SOURCES})
 
 set_target_properties(tuff PROPERTIES
     COMPILE_FLAGS "${OpenMP_C_FLAGS}"
-    LINK_FLAGS "${OpenMP_C_FLAGS}"
+    LINK_FLAGS "${OpenMP_C_FLAGS} -Wl,--disable-new-dtags"
     INSTALL_RPATH "/home/nii/workspace/llama.cpp/build/bin"
     BUILD_WITH_INSTALL_RPATH TRUE
 )

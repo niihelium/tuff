@@ -6,6 +6,8 @@
 #include "chat.h"
 #include "drafter.h"
 #include "cupti_profiler.h"
+#include "tuff_vtable.h"
+#include "lfm25.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -369,8 +371,17 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[Tuff] expert split: %d layers pre-resident on GPU "
                     "(0 = none, hit/miss CPU overlap on)\n", g_n_gpu_expert_layers);
 
+    tuff_arch_t arch = tuff_detect_arch(model_path);
+    const engine_vtable_t *vtable = tuff_get_vtable(arch);
+    if (!vtable) {
+        fprintf(stderr, "[Tuff] ERROR: Unsupported or unrecognized architecture in %s\n", model_path);
+        return 1;
+    }
+    fprintf(stderr, "[Tuff] Detected architecture: %s (%s engine)\n",
+            tuff_arch_to_string(arch), vtable->name);
+
     fprintf(stderr, "[Tuff] Loading GGUF model from: %s\n", model_path);
-    model_t *model = model_load(model_path);
+    void *model = vtable->model_load(model_path);
     if (!model) {
         fprintf(stderr, "Failed to load model from %s\n", model_path);
         return 1;
@@ -378,11 +389,10 @@ int main(int argc, char **argv) {
 
     // Iteration 11: warm the model weight bytes (especially the lazy expert region) into
     // RAM before any timed decode, so miss-fill reads hit the page cache instead of disk.
-    // One-time load cost; outside the timed token loop. Only affects paging, not arithmetic.
     {
         double rss_before = vmrss_mib();
         double tw0 = omp_get_wtime();
-        tuff_gguf_warmup_memory(model->gguf);
+        tuff_gguf_warmup_memory(vtable->model_get_gguf(model));
         double tw1 = omp_get_wtime();
         double rss_after = vmrss_mib();
         fprintf(stderr, "[Tuff] Page-warmup: %.2f s (one-time, pre-decode); VmRSS %.0f MiB -> %.0f MiB\n",
@@ -390,36 +400,45 @@ int main(int argc, char **argv) {
     }
 
     if (inspect_mode) {
-        model_print_inspection(model);
-        model_free(model);
+        vtable->model_print_inspection(model);
+        vtable->model_free(model);
         return 0;
     }
 
     // M2: upload dense weights to VRAM once, before any decode.
-    gpu_prepare_ex(model, &max_context_len, fill_ram ? 1 : 0);
+    vtable->gpu_prepare(model, &max_context_len, fill_ram ? 1 : 0);
 
-    // M4 sub-step A self-test for the Q4_K expert kernel (TUFF_EXPERT_SELFTEST=1).
-    if (getenv("TUFF_EXPERT_SELFTEST")) gpu_selftest_q4k(model);
+    if (arch == TUFF_ARCH_QWEN35MOE) {
+        model_t *qm = (model_t*)model;
+        // M4 sub-step A self-test for the Q4_K expert kernel (TUFF_EXPERT_SELFTEST=1).
+        if (getenv("TUFF_EXPERT_SELFTEST")) gpu_selftest_q4k(qm);
 
-    // H7 stage 1: is the second token free in a dense projection? Picks the widest Q8_0
-    // projection in the model (attn_qkv of the first delta layer, 2048 -> 8192).
-    if (bench_dense_batch) {
-        for (uint32_t l = 0; l < model->block_count; ++l) {
-            model_layer_t *L = &model->layers[l];
-            if (L->type == LAYER_TYPE_ATTENTION || !L->attn_qkv.dev) continue;
-            gpu_bench_dense_batch(&L->attn_qkv, (int)model->embedding_length,
-                                  (int)model->ssm_qkv_dim, 200);
-            break;
+        // H7 stage 1: is the second token free in a dense projection?
+        if (bench_dense_batch) {
+            for (uint32_t l = 0; l < qm->block_count; ++l) {
+                model_layer_t *L = &qm->layers[l];
+                if (L->type == LAYER_TYPE_ATTENTION || !L->attn_qkv.dev) continue;
+                gpu_bench_dense_batch(&L->attn_qkv, (int)qm->embedding_length,
+                                      (int)qm->ssm_qkv_dim, 200);
+                break;
+            }
+            gpu_bench_head_batch(&qm->output_weight, (int)qm->embedding_length,
+                                 (int)qm->vocab_size, 50);
+            vtable->model_free(model);
+            return 0;
         }
-        gpu_bench_head_batch(&model->output_weight, (int)model->embedding_length,
-                             (int)model->vocab_size, 50);
-        model_free(model);
-        return 0;
     }
 
-    tokenizer_t *tok = tokenizer_init(model->gguf);
+    tokenizer_t *tok = tokenizer_init(vtable->model_get_gguf(model));
 
     if (chat_mode) {
+        if (arch != TUFF_ARCH_QWEN35MOE) {
+            fprintf(stderr, "[Tuff] Interactive chat is currently only supported for Qwen models.\n");
+            tokenizer_free(tok);
+            vtable->gpu_shutdown(model);
+            vtable->model_free(model);
+            return 1;
+        }
         chat_config_t cfg;
         cfg.model_path = model_path;
         cfg.system_prompt = system_prompt;
@@ -430,10 +449,10 @@ int main(int argc, char **argv) {
         cfg.n_gpu_expert_layers = g_n_gpu_expert_layers;
         cfg.sampler = sampler_params;
 
-        int rc = run_interactive_chat(model, tok, &cfg);
+        int rc = run_interactive_chat((model_t*)model, tok, &cfg);
         tokenizer_free(tok);
-        gpu_shutdown(model);
-        model_free(model);
+        vtable->gpu_shutdown(model);
+        vtable->model_free(model);
         return rc;
     }
 
@@ -441,8 +460,8 @@ int main(int argc, char **argv) {
     if (!prompt_tokens) {
         fprintf(stderr, "[Tuff] FATAL: failed to allocate prompt_tokens for context length %d\n", max_context_len);
         tokenizer_free(tok);
-        gpu_shutdown(model);
-        model_free(model);
+        vtable->gpu_shutdown(model);
+        vtable->model_free(model);
         return 1;
     }
     int n_prompt = tokenizer_tokenize(tok, prompt, prompt_tokens, max_context_len);
@@ -460,8 +479,8 @@ int main(int argc, char **argv) {
         if (!tf) {
             fprintf(stderr, "[Tuff] FATAL: cannot open teacher-force file: %s\n", teacher_force_path);
             tokenizer_free(tok);
-            gpu_shutdown(model);
-            model_free(model);
+            vtable->gpu_shutdown(model);
+            vtable->model_free(model);
             return 2;
         }
         int32_t ref_tokens[65536];
@@ -477,8 +496,8 @@ int main(int argc, char **argv) {
         if (n_ref == 0) {
             fprintf(stderr, "[Tuff] FATAL: teacher-force file contained 0 tokens\n");
             tokenizer_free(tok);
-            gpu_shutdown(model);
-            model_free(model);
+            vtable->gpu_shutdown(model);
+            vtable->model_free(model);
             return 2;
         }
 
@@ -486,12 +505,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[Tuff] --teacher-force: testing %d steps against %s\n",
                 target_steps, teacher_force_path);
 
-        engine_t *eng = engine_init(model, max_context_len);
-        engine_set_sampler(eng, &sampler_params);
+        void *eng = vtable->engine_init(model, max_context_len);
+        vtable->engine_set_sampler(eng, &sampler_params);
         int pos = 0;
         int32_t pred_token = prompt_tokens[0];
         for (int i = 0; i < n_prompt; ++i) {
-            pred_token = engine_forward_token(eng, prompt_tokens[i], pos++);
+            pred_token = vtable->engine_forward_token(eng, prompt_tokens[i], pos++);
         }
 
         tuff_logit_capture_enable(1);
@@ -515,7 +534,7 @@ int main(int argc, char **argv) {
                         got_logit - exp_logit);
             }
             // Teacher-force: next step receives expected reference token instead of pred_token
-            pred_token = engine_forward_token(eng, expected, pos++);
+            pred_token = vtable->engine_forward_token(eng, expected, pos++);
         }
         tuff_logit_capture_enable(0);
 
@@ -529,10 +548,10 @@ int main(int argc, char **argv) {
         }
         fprintf(stderr, "========================================================================\n");
 
-        engine_free(eng);
+        vtable->engine_free(eng);
         tokenizer_free(tok);
-        gpu_shutdown(model);
-        model_free(model);
+        vtable->gpu_shutdown(model);
+        vtable->model_free(model);
         return (matches == target_steps) ? 0 : 1;
     }
 
@@ -546,12 +565,12 @@ int main(int argc, char **argv) {
 
         tuff_logit_capture_enable(1);
 
-        engine_t *eng = engine_init(model, max_context_len);
-        engine_set_sampler(eng, &sampler_params);
+        void *eng = vtable->engine_init(model, max_context_len);
+        vtable->engine_set_sampler(eng, &sampler_params);
         int pos = 0;
         int32_t curr_token = prompt_tokens[0];
         for (int i = 0; i < n_prompt; ++i) {
-            curr_token = engine_forward_token(eng, prompt_tokens[i], pos++);
+            curr_token = vtable->engine_forward_token(eng, prompt_tokens[i], pos++);
         }
 
         // The vector left behind by the last prompt forward is the one that selected the
@@ -567,19 +586,19 @@ int main(int argc, char **argv) {
                 "             immediately after `mat_vec(logits, &m->output_weight, norm_x);`\n"
                 "             (and #include \"tuff_exact.h\"). Refusing to write a file:\n"
                 "             an empty or zero-filled dump would compare as a silent PASS.\n");
-            engine_free(eng);
+            vtable->engine_free(eng);
             tokenizer_free(tok);
-            gpu_shutdown(model);
-            model_free(model);
+            vtable->gpu_shutdown(model);
+            vtable->model_free(model);
             return 3;
         }
-        if (vocab != model->vocab_size) {
+        if (vocab != vtable->model_get_vocab_size(model)) {
             fprintf(stderr, "[Tuff] FATAL: captured logit width %u != model vocab_size %u\n",
-                    vocab, model->vocab_size);
-            engine_free(eng);
+                    vocab, vtable->model_get_vocab_size(model));
+            vtable->engine_free(eng);
             tokenizer_free(tok);
-            gpu_shutdown(model);
-            model_free(model);
+            vtable->gpu_shutdown(model);
+            vtable->model_free(model);
             return 3;
         }
 
@@ -587,10 +606,10 @@ int main(int argc, char **argv) {
         if (!fp) {
             fprintf(stderr, "[Tuff] FATAL: cannot open %s for writing: ", dump_logits_path);
             perror(NULL);
-            engine_free(eng);
+            vtable->engine_free(eng);
             tokenizer_free(tok);
-            gpu_shutdown(model);
-            model_free(model);
+            vtable->gpu_shutdown(model);
+            vtable->model_free(model);
             return 3;
         }
 
@@ -608,7 +627,7 @@ int main(int argc, char **argv) {
             n_written++;
             fprintf(stderr, "%s%d", i ? " " : "[Tuff] token IDs: ", curr_token);
 
-            curr_token = engine_forward_token(eng, curr_token, pos++);
+            curr_token = vtable->engine_forward_token(eng, curr_token, pos++);
             uint32_t vn = 0;
             lg = tuff_logit_capture_take(&vn);
             if (i + 1 < n_predict && (!lg || vn != vocab)) {
@@ -630,10 +649,10 @@ int main(int argc, char **argv) {
         if (fclose(fp) != 0) io_ok = 0;
 
         tuff_logit_capture_enable(0);
-        engine_free(eng);
+        vtable->engine_free(eng);
         tokenizer_free(tok);
-        gpu_shutdown(model);
-        model_free(model);
+        vtable->gpu_shutdown(model);
+        vtable->model_free(model);
 
         if (!io_ok) {
             fprintf(stderr, "[Tuff] FATAL: failed writing %s (%u/%d vectors); removing it "
@@ -650,24 +669,25 @@ int main(int argc, char **argv) {
     if (dump_tokens_mode) {
         // Oracle mode: a single deterministic greedy pass. One token ID per line on stdout;
         // everything else on stderr, so scripts/verify_vs_llama.sh can diff pure token streams.
-        fprintf(stderr, "[Tuff] --dump-tokens: generating %d tokens (CPU reference oracle)...\n", n_predict);
+        fprintf(stderr, "[Tuff] --dump-tokens: generating %d tokens (%s reference oracle)...\n",
+                n_predict, vtable->name);
 
-        engine_t *eng = engine_init(model, max_context_len);
-        engine_set_sampler(eng, &sampler_params);
+        void *eng = vtable->engine_init(model, max_context_len);
+        vtable->engine_set_sampler(eng, &sampler_params);
         int pos = 0;
         int32_t curr_token = prompt_tokens[0];
         for (int i = 0; i < n_prompt; ++i) {
-            curr_token = engine_forward_token(eng, prompt_tokens[i], pos++);
+            curr_token = vtable->engine_forward_token(eng, prompt_tokens[i], pos++);
         }
         for (int i = 0; i < n_predict; ++i) {
             printf("%d\n", curr_token);
             fflush(stdout);
-            curr_token = engine_forward_token(eng, curr_token, pos++);
+            curr_token = vtable->engine_forward_token(eng, curr_token, pos++);
         }
-        engine_free(eng);
+        vtable->engine_free(eng);
         tokenizer_free(tok);
-        gpu_shutdown(model);
-        model_free(model);
+        vtable->gpu_shutdown(model);
+        vtable->model_free(model);
         return 0;
     }
 
@@ -687,8 +707,8 @@ int main(int argc, char **argv) {
     }
 
     for (int run = 0; run < n_runs; ++run) {
-        engine_t *eng = engine_init(model, max_context_len);
-        engine_set_sampler(eng, &sampler_params);
+        void *eng = vtable->engine_init(model, max_context_len);
+        vtable->engine_set_sampler(eng, &sampler_params);
         int pos = 0;
         int32_t curr_token = prompt_tokens[0];
 
@@ -696,17 +716,17 @@ int main(int argc, char **argv) {
         memcpy(warmup_seq, prompt_tokens, (size_t)n_prompt * sizeof(int32_t));
 
         for (int i = 0; i < n_prompt; ++i) {
-            curr_token = engine_forward_token(eng, prompt_tokens[i], pos++);
+            curr_token = vtable->engine_forward_token(eng, prompt_tokens[i], pos++);
         }
 
         for (int i = 0; i < n_warmup; ++i) {
             warmup_seq[n_prompt + i] = curr_token;
-            curr_token = engine_forward_token(eng, curr_token, pos++);
+            curr_token = vtable->engine_forward_token(eng, curr_token, pos++);
         }
 
-        if (drafter) {
+        if (drafter && arch == TUFF_ARCH_QWEN35MOE) {
             drafter_prefill(drafter, warmup_seq, n_prompt + n_warmup);
-            engine_set_drafter(eng, drafter);
+            engine_set_drafter((engine_t*)eng, drafter);
         }
         free(warmup_seq);
 
@@ -731,9 +751,9 @@ int main(int argc, char **argv) {
                 fflush(stdout);
             }
 
-            if (spec_mtp_mode && !spec_measure_mode) {
+            if (spec_mtp_mode && !spec_measure_mode && arch == TUFF_ARCH_QWEN35MOE) {
                 int32_t emitted[4], next_tok = -1;
-                int n = engine_spec_step(eng, curr_token, pos, emitted, &next_tok, &sstat);
+                int n = engine_spec_step((engine_t*)eng, curr_token, pos, emitted, &next_tok, &sstat);
                 if (run == 0) {
                     for (int k = 0; k < n - 1; ++k) {
                         fputs(tokenizer_decode(tok, emitted[k]), stdout);
@@ -746,15 +766,15 @@ int main(int argc, char **argv) {
                 continue;
             }
 
-            int32_t next_tok = engine_forward_token(eng, curr_token, pos++);
+            int32_t next_tok = vtable->engine_forward_token(eng, curr_token, pos++);
             n_generated++;
 
-            if (spec_measure_mode) {
+            if (spec_measure_mode && arch == TUFF_ARCH_QWEN35MOE) {
                 if (pending_draft >= 0) {
                     n_drafts++;
                     if (pending_draft == next_tok) n_accepted++;
                 }
-                pending_draft = engine_get_last_draft_token(eng);
+                pending_draft = engine_get_last_draft_token((const engine_t*)eng);
             }
             curr_token = next_tok;
         }
@@ -791,7 +811,7 @@ int main(int argc, char **argv) {
                     run + 1, n_runs, n_warmup, n_predict, elapsed, tok_per_sec[run]);
         }
 
-        engine_free(eng);
+        vtable->engine_free(eng);
     }
     if (drafter) drafter_free(drafter);
 
@@ -811,7 +831,7 @@ int main(int argc, char **argv) {
             mean, spread, n_runs, n_warmup, n_predict);
     fprintf(stderr, " RSS: %.1f MiB\n", rss_mib());
     fprintf(stderr, " VRAM: %.1f MiB used\n", gpu_vram_used_mb());
-    {
+    if (arch == TUFF_ARCH_QWEN35MOE) {
         unsigned long long hits = 0, misses = 0;
         gpu_expert_cache_stats(&hits, &misses);
         double hr = (hits + misses) > 0 ? 100.0 * (double)hits / (double)(hits + misses) : 0.0;
@@ -821,7 +841,7 @@ int main(int argc, char **argv) {
 
     free(tok_per_sec);
     tokenizer_free(tok);
-    gpu_shutdown(model);
-    model_free(model);
+    vtable->gpu_shutdown(model);
+    vtable->model_free(model);
     return 0;
 }
