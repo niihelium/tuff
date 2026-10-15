@@ -11,15 +11,11 @@
 
 lfm25_engine_t* lfm25_engine_init(lfm25_model_t *model, int max_context_len) {
     if (!model) return NULL;
-    // Router / expert kernels support 32 or 64 experts, top-4. The 64-expert model (LFM2.5-24B-A2B) additionally
-    // needs the VRAM expert cache (Task 3.1b) because its experts do not fit in VRAM.
+    // Router / expert kernels support 32 or 64 experts, top-4. Models with >32 experts (LFM2.5-24B-A2B) use the
+    // VRAM expert cache (src/lfm25_expert_cache.c) because their experts do not fit in VRAM.
     if (model->is_moe && ((model->expert_count != 32 && model->expert_count != 64) || model->expert_used_count != 4)) {
         fprintf(stderr, "[LFM25] ERROR: MoE with %u experts / top-%u is not supported (only 32 or 64 / top-4)\n",
                 model->expert_count, model->expert_used_count);
-        return NULL;
-    }
-    if (model->is_moe && model->expert_count == 64) {
-        fprintf(stderr, "[LFM25] ERROR: MoE with 64 experts requires the VRAM expert cache (Task 3.1b), not implemented yet\n");
         return NULL;
     }
     lfm25_engine_t *eng = (lfm25_engine_t*)calloc(1, sizeof(lfm25_engine_t));
@@ -94,12 +90,21 @@ lfm25_engine_t* lfm25_engine_init(lfm25_model_t *model, int max_context_len) {
     CUDA_CHECK(cudaMallocHost((void**)&eng->h_logits, (size_t)vocab * sizeof(float)));
     eng->h_embd = (float*)malloc((size_t)d * sizeof(float));
 
+    // Expert cache: created last so its default size can take all VRAM left after trunk + KV + scratch.
+    if (lfm25_expert_cache_wanted(model)) {
+        CUDA_CHECK(cudaMalloc((void**)&eng->d_slot_ids, 4 * sizeof(int)));
+        eng->expert_cache = lfm25_expert_cache_create(model);
+        if (!eng->expert_cache) { lfm25_engine_free(eng); return NULL; }
+    }
+
     return eng;
 }
 
 void lfm25_engine_free(lfm25_engine_t *eng) {
     if (!eng) return;
 
+    lfm25_expert_cache_free(eng->expert_cache);
+    if (eng->d_slot_ids)   cudaFree(eng->d_slot_ids);
     if (eng->d_conv_state) cudaFree(eng->d_conv_state);
     if (eng->d_k_cache)    cudaFree(eng->d_k_cache);
     if (eng->d_v_cache)    cudaFree(eng->d_v_cache);
@@ -226,12 +231,29 @@ int32_t lfm25_engine_forward_token(lfm25_engine_t *eng, int32_t token, int pos) 
             // Sparse MoE: sigmoid top-4 router on the normed FP32 input, then in-VRAM expert FFN accumulated into d_x
             lfm25_gpu_router_top4(eng->d_norm_x, (const float*)L->ffn_gate_inp.dev, (const float*)L->exp_probs_b.dev,
                                   eng->d_topk_ids, eng->d_topk_w, NULL, dim, (int)m->expert_count);
-            lfm25_gpu_moe_ffn(eng->d_q8_x, eng->d_topk_ids, eng->d_topk_w, L->ffn_gate_exps.dev, L->ffn_up_exps.dev,
-                              L->ffn_down_exps.dev, (int)L->ffn_down_exps.info.type, eng->d_moe_act, eng->d_moe_act_q8,
-                              eng->d_x, true, dim, (int)m->expert_ffn_dim,
-                              (size_t)m->expert_ffn_dim * ggml_row_size(L->ffn_gate_exps.info.type, dim),
-                              (size_t)m->expert_ffn_dim * ggml_row_size(L->ffn_up_exps.info.type, dim),
-                              (size_t)dim * ggml_row_size(L->ffn_down_exps.info.type, m->expert_ffn_dim));
+            const size_t gs0 = (size_t)m->expert_ffn_dim * ggml_row_size(L->ffn_gate_exps.info.type, dim);
+            const size_t us0 = (size_t)m->expert_ffn_dim * ggml_row_size(L->ffn_up_exps.info.type, dim);
+            const size_t ds0 = (size_t)dim * ggml_row_size(L->ffn_down_exps.info.type, m->expert_ffn_dim);
+            if (eng->expert_cache) {
+                // Cache path: ids -> host (sync, baseline), look up / fill slots, run the same kernels on the slot pools.
+                lfm25_expert_cache_t *ec = eng->expert_cache;
+                int h_ids[4], h_slots[4];
+                CUDA_CHECK(cudaMemcpy(h_ids, eng->d_topk_ids, sizeof(h_ids), cudaMemcpyDeviceToHost));
+                lfm25_expert_cache_lookup(ec, (int)l, h_ids, 4, h_slots);
+                CUDA_CHECK(cudaMemcpyAsync(eng->d_slot_ids, h_slots, sizeof(h_slots), cudaMemcpyHostToDevice, 0));
+                // h_slots is a stack array: the pageable async copy is staged before returning, but sync to be safe.
+                CUDA_CHECK(cudaStreamSynchronize(0));
+                lfm25_gpu_moe_ffn(eng->d_q8_x, eng->d_slot_ids, eng->d_topk_w, lfm25_expert_cache_pool_gate(ec),
+                                  lfm25_expert_cache_pool_up(ec), lfm25_expert_cache_pool_down(ec),
+                                  (int)L->ffn_down_exps.info.type, eng->d_moe_act, eng->d_moe_act_q8,
+                                  eng->d_x, true, dim, (int)m->expert_ffn_dim,
+                                  lfm25_expert_cache_gate_slot_bytes(ec), lfm25_expert_cache_up_slot_bytes(ec),
+                                  lfm25_expert_cache_down_slot_bytes(ec));
+            } else {
+                lfm25_gpu_moe_ffn(eng->d_q8_x, eng->d_topk_ids, eng->d_topk_w, L->ffn_gate_exps.dev, L->ffn_up_exps.dev,
+                                  L->ffn_down_exps.dev, (int)L->ffn_down_exps.info.type, eng->d_moe_act, eng->d_moe_act_q8,
+                                  eng->d_x, true, dim, (int)m->expert_ffn_dim, gs0, us0, ds0);
+            }
         }
     }
 

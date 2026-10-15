@@ -42,6 +42,7 @@ set(SOURCES
     src/lfm25_model.c
     src/lfm25_gpu.cu
     src/lfm25_engine.c
+    src/lfm25_expert_cache.c
     src/chat.c
     src/main.c
 )

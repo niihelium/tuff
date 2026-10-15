@@ -3,6 +3,7 @@
 
 #include "lfm25_model.h"
 #include "sampler.h"
+#include "lfm25_expert_cache.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -44,6 +45,8 @@ typedef struct {
     float *d_topk_w;         // (4) normalized routing weights
     float *d_moe_act;        // (expert_used_count * expert_ffn_dim)
     void  *d_moe_act_q8;     // block_q8_1_c for d_moe_act (expert_used_count * expert_ffn_dim / 32)
+    int   *d_slot_ids;       // (4) expert-cache slot indices (cache path only)
+    lfm25_expert_cache_t *expert_cache; // non-NULL on the cache path
 
     // Device argmax scratch buffers
     float *d_block_max;      // (vocab_size / 4)

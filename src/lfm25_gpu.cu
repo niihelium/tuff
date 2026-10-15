@@ -813,7 +813,7 @@ int lfm25_gpu_prepare(lfm25_model_t *model, int *max_context_len, int fill_ram) 
             upload_tensor(&L->ffn_gate_inp);
             upload_tensor(&L->exp_probs_b);
             // In 8B (100% VRAM resident), upload all experts directly
-            if (!model->is_moe || model->expert_count <= 32) {
+            if (!model->is_moe || (model->expert_count <= 32 && !(getenv("LFM25_FORCE_EXPERT_CACHE") && getenv("LFM25_FORCE_EXPERT_CACHE")[0] == '1'))) {
                 upload_tensor(&L->ffn_gate_exps);
                 upload_tensor(&L->ffn_up_exps);
                 upload_tensor(&L->ffn_down_exps);

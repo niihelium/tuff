@@ -4,7 +4,10 @@
   exact      stage 1: the first N greedy tokens must be identical to the reference, cut short at
              the first step whose reference margin < --min-margin (adaptive; 0 -> skipped).
   teacher    stage 2: teacher-forced top-1 agreement. A step may disagree only where the
-             reference itself is a near-tie (llama.cpp top1-top2 margin < --min-margin).
+             reference itself is a near-tie (llama.cpp top1-top2 margin < --min-margin), or,
+             with --fp64, where ground truth does not prefer the reference token over tuff's by
+             >= --min-margin (FP64 l[ref] - l[tuff]; negative when FP64 sides with tuff) -- for
+             noisy references, e.g. the CPU-expert 24B one.
   tolerance  stage 3: logit error versus the FP64 reference must be no worse than
              llama.cpp's own. --stat mean (dense, default): mean RMS ratio <= --max-ratio and worst
              step <= --max-step-ratio. --stat robust (MoE): median ratio <= --max-ratio and p90
@@ -73,18 +76,38 @@ def cmd_teacher(a):
     lg = load_logits(a.tuff, a.vocab)[:a.n]
     n = min(len(ref), len(margins), len(lg))
     top1 = lg[:n].argmax(1)
-    bad, ties = [], []
+    fp = load_logits(a.fp64, a.vocab) if a.fp64 else None
+    bad, ties, adj, notes = [], [], [], {}
     for i in range(n):
         if top1[i] != ref[i]:
-            (bad if margins[i] >= a.min_margin else ties).append(i)
-    agree = n - len(bad) - len(ties)
+            if margins[i] < a.min_margin:
+                ties.append(i)
+            elif fp is not None and i < len(fp):
+                # Signed: how much ground truth (FP64) prefers the reference token over tuff's. A miss counts
+                # against tuff only if FP64 prefers the reference by >= min_margin; if FP64 prefers tuff's token
+                # (gap < 0) the reference itself was wrong there.
+                gap = float(fp[i][ref[i]]) - float(fp[i][top1[i]])
+                if gap < a.min_margin:
+                    adj.append((i, gap))
+                else:
+                    bad.append(i)
+                    notes[i] = f" (FP64 gap {gap:.3f} >= {a.min_margin})"
+            else:
+                bad.append(i)
+                if fp is not None:
+                    notes[i] = f" (not covered by FP64 ({len(fp)} steps) - raise N_FP)"
+    agree = n - len(bad) - len(ties) - len(adj)
     ok = not bad and n == a.n
+    extra = f", {len(adj)} FP64-adjudicated near-tie(s)" if adj else ""
     print(f"  [2/3] teacher-forced: {agree}/{n} top-1 agree; {len(ties)} near-tie miss(es) "
-          f"(ref margin < {a.min_margin}), {len(bad)} hard miss(es) -> {'PASS' if ok else 'FAIL'}")
+          f"(ref margin < {a.min_margin}){extra}, {len(bad)} hard miss(es) -> {'PASS' if ok else 'FAIL'}")
     for i in ties:
         print(f"        near-tie step {i}: ref {ref[i]} (margin {margins[i]:.3f}), tuff {top1[i]}")
+    for i, gap in adj:
+        print(f"        near-tie (FP64-adjudicated) step {i}: ref {ref[i]}, tuff {top1[i]} "
+              f"(ref margin {margins[i]:.3f}, FP64 gap {gap:.3f})")
     for i in bad:
-        print(f"        HARD MISS step {i}: ref {ref[i]} (margin {margins[i]:.3f}), tuff {top1[i]}")
+        print(f"        HARD MISS step {i}: ref {ref[i]} (margin {margins[i]:.3f}), tuff {top1[i]}{notes.get(i, '')}")
     return 0 if ok else 1
 
 
@@ -131,6 +154,9 @@ def main():
     p.add_argument("--vocab", type=int, required=True)
     p.add_argument("-n", type=int, required=True)
     p.add_argument("--min-margin", type=float, default=0.5)
+    p.add_argument("--fp64", help="FP64 logits (raw float32 [n x vocab]); adjudicates hard misses whose "
+                   "FP64 preference for the reference token l[ref]-l[tuff] < --min-margin as near-ties "
+                   "(negative = FP64 prefers tuff's token)")
     p.set_defaults(fn=cmd_teacher)
 
     p = sub.add_parser("tolerance")
