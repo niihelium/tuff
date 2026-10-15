@@ -88,7 +88,17 @@ lfm25_engine_t* lfm25_engine_init(lfm25_model_t *model, int max_context_len) {
 
     // Host buffers
     CUDA_CHECK(cudaMallocHost((void**)&eng->h_logits, (size_t)vocab * sizeof(float)));
-    eng->h_embd = (float*)malloc((size_t)d * sizeof(float));
+    CUDA_CHECK(cudaMallocHost((void**)&eng->h_tokpos, 2 * sizeof(int)));
+    CUDA_CHECK(cudaMallocHost((void**)&eng->h_best, sizeof(int)));
+    CUDA_CHECK(cudaMalloc((void**)&eng->d_tokpos, 2 * sizeof(int)));
+
+    // CUDA graph: only when there is no host round-trip inside the forward pass (no expert cache).
+    {
+        const char *g = getenv("LFM25_CUDA_GRAPH");
+        int want = !(g && g[0] == '0');
+        eng->graph_enabled = want && !lfm25_expert_cache_wanted(model);
+        if (eng->graph_enabled) CUDA_CHECK(cudaStreamCreateWithFlags(&eng->stream, cudaStreamNonBlocking));
+    }
 
     // Expert cache: created last so its default size can take all VRAM left after trunk + KV + scratch.
     if (lfm25_expert_cache_wanted(model)) {
@@ -137,7 +147,12 @@ void lfm25_engine_free(lfm25_engine_t *eng) {
     if (eng->d_best_token) cudaFree(eng->d_best_token);
 
     if (eng->h_logits)     cudaFreeHost(eng->h_logits);
-    if (eng->h_embd)       free(eng->h_embd);
+    if (eng->h_tokpos)     cudaFreeHost(eng->h_tokpos);
+    if (eng->h_best)       cudaFreeHost(eng->h_best);
+    if (eng->d_tokpos)     cudaFree(eng->d_tokpos);
+    if (eng->graph_exec)   cudaGraphExecDestroy(eng->graph_exec);
+    if (eng->graph)        cudaGraphDestroy(eng->graph);
+    if (eng->stream)       cudaStreamDestroy(eng->stream);
 
     free(eng);
 }
@@ -156,15 +171,19 @@ static inline void lfm25_gpu_mat_vec(const lfm25_tensor_t *t, const void *d_xq8,
     }
 }
 
-int32_t lfm25_engine_forward_token(lfm25_engine_t *eng, int32_t token, int pos) {
-    if (!eng || !eng->model) return -1;
+// Enqueue one decode step on the stream selected via lfm25_gpu_set_stream(). Reads (token,pos) from eng->d_tokpos,
+// so nothing in here depends on per-token host values; the sequence is identical for every token and capturable.
+static void lfm25_enqueue_step(lfm25_engine_t *eng, cudaStream_t stream) {
     lfm25_model_t *m = eng->model;
     int dim = (int)m->embedding_length;
     float eps = m->rms_norm_eps;
     int ffn_dim = (int)m->ffn_dim;
 
-    // 1. Fetch token embedding for input token
-    lfm25_gpu_embed(token, eng->d_x, eng->h_embd, &m->token_embd, dim);
+    const int *d_pos = eng->d_tokpos + 1;
+
+    // 0. (token,pos) host -> device, then 1. dequantize the token embedding row on the GPU
+    CUDA_CHECK(cudaMemcpyAsync(eng->d_tokpos, eng->h_tokpos, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
+    lfm25_gpu_embed(eng->d_tokpos, eng->d_x, &m->token_embd, dim);
 
     int conv_idx = 0;
     int attn_idx = 0;
@@ -202,14 +221,14 @@ int32_t lfm25_engine_forward_token(lfm25_engine_t *eng, int32_t token, int pos) 
             // QK Norm + NeoX RoPE + K Cache Write
             lfm25_gpu_qk_norm_rope(eng->d_q, eng->d_k, (const float*)L->attn_q_norm.dev, (const float*)L->attn_k_norm.dev,
                                    eng->d_k_cache, (int)m->head_count, (int)m->head_count_kv, (int)m->head_dim,
-                                   pos, eng->max_context_len, m->rope_freq_base, eps, attn_idx);
+                                   d_pos, eng->max_context_len, m->rope_freq_base, eps, attn_idx);
 
             // V Cache Write
-            lfm25_gpu_v_cache_write(eng->d_v, eng->d_v_cache, (int)m->head_count_kv, (int)m->head_dim, pos, eng->max_context_len, attn_idx);
+            lfm25_gpu_v_cache_write(eng->d_v, eng->d_v_cache, (int)m->head_count_kv, (int)m->head_dim, d_pos, eng->max_context_len, attn_idx);
 
             // Flash-Decoding Attention + quantize to q8_1
             lfm25_gpu_attention(eng->d_q, eng->d_k_cache, eng->d_v_cache, eng->d_op_out, eng->d_q8_op_out,
-                                (int)m->head_count, (int)m->head_count_kv, (int)m->head_dim, pos, eng->max_context_len, attn_idx);
+                                (int)m->head_count, (int)m->head_count_kv, (int)m->head_dim, d_pos, eng->max_context_len, attn_idx);
 
             // out_proj: 2048 -> 2048 (Q4_K) with accum into residual d_x
             lfm25_gpu_mmvq_q4_K(L->attn_output.dev, eng->d_q8_op_out, eng->d_x, dim, dim, true);
@@ -240,9 +259,9 @@ int32_t lfm25_engine_forward_token(lfm25_engine_t *eng, int32_t token, int pos) 
                 int h_ids[4], h_slots[4];
                 CUDA_CHECK(cudaMemcpy(h_ids, eng->d_topk_ids, sizeof(h_ids), cudaMemcpyDeviceToHost));
                 lfm25_expert_cache_lookup(ec, (int)l, h_ids, 4, h_slots);
-                CUDA_CHECK(cudaMemcpyAsync(eng->d_slot_ids, h_slots, sizeof(h_slots), cudaMemcpyHostToDevice, 0));
+                CUDA_CHECK(cudaMemcpyAsync(eng->d_slot_ids, h_slots, sizeof(h_slots), cudaMemcpyHostToDevice, stream));
                 // h_slots is a stack array: the pageable async copy is staged before returning, but sync to be safe.
-                CUDA_CHECK(cudaStreamSynchronize(0));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
                 lfm25_gpu_moe_ffn(eng->d_q8_x, eng->d_slot_ids, eng->d_topk_w, lfm25_expert_cache_pool_gate(ec),
                                   lfm25_expert_cache_pool_up(ec), lfm25_expert_cache_pool_down(ec),
                                   (int)L->ffn_down_exps.info.type, eng->d_moe_act, eng->d_moe_act_q8,
@@ -257,18 +276,47 @@ int32_t lfm25_engine_forward_token(lfm25_engine_t *eng, int32_t token, int pos) 
         }
     }
 
-    // Output Head + argmax
-    int32_t next_tok = lfm25_gpu_output_norm_head_argmax(
+    // Output Head + argmax; logits stay on the device unless capture asks for them (see forward_token)
+    lfm25_gpu_output_norm_head_argmax(
         eng->d_x, (const float*)m->token_embd_norm.dev, m->output_weight.dev,
-        eng->d_q8_x, eng->d_logits, eng->h_logits,
+        eng->d_q8_x, eng->d_logits,
         eng->d_block_max, eng->d_block_idx, eng->d_best_token,
         dim, (int)m->vocab_size, eps);
+    CUDA_CHECK(cudaMemcpyAsync(eng->h_best, eng->d_best_token, sizeof(int), cudaMemcpyDeviceToHost, stream));
+}
 
-    if (tuff_logit_capture_is_enabled()) {
-        tuff_logit_capture(eng->h_logits, m->vocab_size);
+int32_t lfm25_engine_forward_token(lfm25_engine_t *eng, int32_t token, int pos) {
+    if (!eng || !eng->model) return -1;
+    eng->h_tokpos[0] = token;
+    eng->h_tokpos[1] = pos;
+
+    if (eng->graph_enabled) {
+        if (!eng->graph_exec) {
+            // First token: record the step into a graph (nothing executes during capture), then replay below.
+            lfm25_gpu_set_stream(eng->stream);
+            CUDA_CHECK(cudaStreamBeginCapture(eng->stream, cudaStreamCaptureModeThreadLocal));
+            lfm25_enqueue_step(eng, eng->stream);
+            CUDA_CHECK(cudaStreamEndCapture(eng->stream, &eng->graph));
+            CUDA_CHECK(cudaGraphInstantiate(&eng->graph_exec, eng->graph, 0));
+        }
+        CUDA_CHECK(cudaGraphLaunch(eng->graph_exec, eng->stream));
+        CUDA_CHECK(cudaStreamSynchronize(eng->stream));
+        if (tuff_logit_capture_is_enabled()) {
+            CUDA_CHECK(cudaMemcpy(eng->h_logits, eng->d_logits, (size_t)eng->model->vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
+        }
+    } else {
+        lfm25_gpu_set_stream(0);
+        lfm25_enqueue_step(eng, 0);
+        CUDA_CHECK(cudaStreamSynchronize(0));
+        if (tuff_logit_capture_is_enabled()) {
+            CUDA_CHECK(cudaMemcpy(eng->h_logits, eng->d_logits, (size_t)eng->model->vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
+        }
     }
 
-    return next_tok;
+    if (tuff_logit_capture_is_enabled()) {
+        tuff_logit_capture(eng->h_logits, eng->model->vocab_size);
+    }
+    return *eng->h_best;
 }
 
 // -----------------------------------------------------------------------------

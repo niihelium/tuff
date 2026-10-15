@@ -336,7 +336,8 @@ __global__ void lfm_fused_qk_norm_neox_rope_kernel(
     const float * __restrict__ k_norm_w,
     float * __restrict__ k_cache,
     int n_head, int n_head_kv, int head_dim,
-    int pos, int max_seq, float freq_base, float eps, int layer_idx) {
+    const int * __restrict__ d_pos, int max_seq, float freq_base, float eps, int layer_idx) {
+    const int pos = *d_pos;
     const int head_idx = blockIdx.x; // 0..39: 0..31 is Q, 32..39 is K
     const int j = threadIdx.x;        // 0..63
 
@@ -398,7 +399,8 @@ __global__ void lfm_fused_qk_norm_neox_rope_kernel(
 __global__ void lfm_v_cache_write_kernel(
     const float * __restrict__ v,
     float * __restrict__ v_cache,
-    int n_head_kv, int head_dim, int pos, int max_seq, int layer_idx) {
+    int n_head_kv, int head_dim, const int * __restrict__ d_pos, int max_seq, int layer_idx) {
+    const int pos = *d_pos;
     const int k = blockIdx.x; // 0..7
     const int j = threadIdx.x; // 0..63
     if (k >= n_head_kv || j >= head_dim) return;
@@ -419,7 +421,8 @@ __global__ void lfm_flash_decoding_kernel(
     const float * __restrict__ v_cache,
     float * __restrict__ out,
     block_q8_1_c * __restrict__ out_q8,
-    int n_head, int n_head_kv, int head_dim, int pos, int max_seq, int layer_idx) {
+    int n_head, int n_head_kv, int head_dim, const int * __restrict__ d_pos, int max_seq, int layer_idx) {
+    const int pos = *d_pos;
     const int h = blockIdx.x; // query head: 0..31
     const int j = threadIdx.x; // 0..63
     if (h >= n_head || j >= head_dim) return;
@@ -626,18 +629,50 @@ __global__ void lfm_argmax_reduction_kernel(
 }
 
 // -----------------------------------------------------------------------------
+// CUDA Kernel: Q6_K token-embedding row dequant (token id read from device memory)
+// Mirrors dequantize_q6_K (cpu_ops.c) element-for-element: y = (d * sc) * q, two separate fp32 multiplies.
+// One block per 256-element super-block, one thread per element.
+// -----------------------------------------------------------------------------
+__global__ void lfm_embed_q6_K_kernel(const uint8_t * __restrict__ base, const int * __restrict__ d_tokpos,
+                                      size_t row_bytes, float * __restrict__ y) {
+    const block_q6_K *x = (const block_q6_K *)(base + (size_t)d_tokpos[0] * row_bytes) + blockIdx.x;
+    const int e = threadIdx.x;       // 0..255
+    const int n = e >> 7;            // which 128-half
+    const int r = e & 127;
+    const int l = r & 31;
+    const int g = r >> 5;            // 0..3
+    const uint8_t *ql = x->ql + n * 64;
+    const uint8_t *qh = x->qh + n * 32;
+    const int8_t  *sc = x->scales + n * 8;
+    const uint8_t lo = (g & 1) ? ql[l + 32] : ql[l];
+    const int nib = (g < 2) ? (lo & 0xF) : (lo >> 4);
+    const int q = (int)(int8_t)(nib | (((qh[l] >> (2 * g)) & 3) << 4)) - 32;
+    const float d = h2f(x->d);
+    y[blockIdx.x * QK_K + e] = __fmul_rn(__fmul_rn(d, (float)sc[(l >> 4) + 2 * g]), (float)(int8_t)q);
+}
+
+// -----------------------------------------------------------------------------
 // Host Dispatch Routines
 // -----------------------------------------------------------------------------
 
-void lfm25_gpu_embed(int32_t token, float *d_x, float *h_embd, const lfm25_tensor_t *token_embd, int dim) {
-    size_t row_bytes = ggml_row_size((ggml_type_t)token_embd->info.type, dim);
-    const uint8_t *src_row = (const uint8_t*)token_embd->data + (size_t)token * row_bytes;
-    dequantize_row((ggml_type_t)token_embd->info.type, src_row, h_embd, dim);
-    CUDA_CHECK(cudaMemcpyAsync(d_x, h_embd, (size_t)dim * sizeof(float), cudaMemcpyHostToDevice, 0));
+// Stream every forward-path kernel/memcpy is enqueued on (0 = default stream, whichever the build selects).
+// The engine points this at its capture stream while recording / running the CUDA graph.
+static cudaStream_t g_lfm_stream = 0;
+extern "C" void lfm25_gpu_set_stream(cudaStream_t s) { g_lfm_stream = s; }
+
+void lfm25_gpu_embed(const int *d_tokpos, float *d_x, const lfm25_tensor_t *token_embd, int dim) {
+    if (token_embd->info.type != GGML_TYPE_Q6_K) {
+        fprintf(stderr, "[FATAL] lfm25_gpu_embed: token_embd type %d unsupported (only Q6_K)\n", (int)token_embd->info.type);
+        exit(EXIT_FAILURE);
+    }
+    if (dim % QK_K != 0) { fprintf(stderr, "[FATAL] lfm25_gpu_embed: dim %d not a multiple of %d\n", dim, QK_K); exit(EXIT_FAILURE); }
+    lfm_embed_q6_K_kernel<<<dim / QK_K, QK_K, 0, g_lfm_stream>>>((const uint8_t*)token_embd->dev, d_tokpos,
+                                                              (size_t)ggml_row_size(GGML_TYPE_Q6_K, dim), d_x);
+    CUDA_CHECK_LAST();
 }
 
 void lfm25_gpu_fused_rms_norm_quant(const float *d_src, const float *d_weight, float *d_dst_norm, void *d_dst_q8, int dim, float eps) {
-    lfm_fused_rms_norm_quant_kernel<<<1, 256>>>(d_src, d_weight, d_dst_norm, (block_q8_1_c*)d_dst_q8, dim, eps);
+    lfm_fused_rms_norm_quant_kernel<<<1, 256, 0, g_lfm_stream>>>(d_src, d_weight, d_dst_norm, (block_q8_1_c*)d_dst_q8, dim, eps);
     CUDA_CHECK_LAST();
 }
 
@@ -648,10 +683,10 @@ void lfm25_gpu_mmvq_q4_K(const void *dev_w, const void *d_xq8, float *d_dst, int
     dim3 block(32u, (unsigned)MMVQ_ROWS_PER_BLOCK, 1u);
 
     if (accum) {
-        lfm_mmvq_q4_K_dense_kernel<MMVQ_ROWS_PER_BLOCK, true><<<grid, block>>>(
+        lfm_mmvq_q4_K_dense_kernel<MMVQ_ROWS_PER_BLOCK, true><<<grid, block, 0, g_lfm_stream>>>(
             (const block_q4_K*)dev_w, (const block_q8_1_c*)d_xq8, d_dst, out_dim, nblk);
     } else {
-        lfm_mmvq_q4_K_dense_kernel<MMVQ_ROWS_PER_BLOCK, false><<<grid, block>>>(
+        lfm_mmvq_q4_K_dense_kernel<MMVQ_ROWS_PER_BLOCK, false><<<grid, block, 0, g_lfm_stream>>>(
             (const block_q4_K*)dev_w, (const block_q8_1_c*)d_xq8, d_dst, out_dim, nblk);
     }
     CUDA_CHECK_LAST();
@@ -664,10 +699,10 @@ void lfm25_gpu_mmvq_q6_K(const void *dev_w, const void *d_xq8, float *d_dst, int
     dim3 block(32u, (unsigned)MMVQ_ROWS_PER_BLOCK, 1u);
 
     if (accum) {
-        lfm_mmvq_q6_K_dense_kernel<MMVQ_ROWS_PER_BLOCK, true><<<grid, block>>>(
+        lfm_mmvq_q6_K_dense_kernel<MMVQ_ROWS_PER_BLOCK, true><<<grid, block, 0, g_lfm_stream>>>(
             (const block_q6_K*)dev_w, (const block_q8_1_c*)d_xq8, d_dst, out_dim, nblk);
     } else {
-        lfm_mmvq_q6_K_dense_kernel<MMVQ_ROWS_PER_BLOCK, false><<<grid, block>>>(
+        lfm_mmvq_q6_K_dense_kernel<MMVQ_ROWS_PER_BLOCK, false><<<grid, block, 0, g_lfm_stream>>>(
             (const block_q6_K*)dev_w, (const block_q8_1_c*)d_xq8, d_dst, out_dim, nblk);
     }
     CUDA_CHECK_LAST();
@@ -676,26 +711,26 @@ void lfm25_gpu_mmvq_q6_K(const void *dev_w, const void *d_xq8, float *d_dst, int
 void lfm25_gpu_shortconv_step(const float *d_in_proj, float *d_conv_state, const float *d_conv_w, float *d_conv_out, void *d_conv_out_q8, int d) {
     const int threads = 256;
     const int blocks = (d + threads - 1) / threads;
-    lfm_shortconv_step_kernel<<<blocks, threads>>>(
+    lfm_shortconv_step_kernel<<<blocks, threads, 0, g_lfm_stream>>>(
         d_in_proj, d_conv_state, d_conv_w, d_conv_out, (block_q8_1_c*)d_conv_out_q8, d);
     CUDA_CHECK_LAST();
 }
 
-void lfm25_gpu_qk_norm_rope(float *d_q, float *d_k, const float *d_q_norm, const float *d_k_norm, float *d_k_cache, int n_head, int n_head_kv, int head_dim, int pos, int max_seq, float freq_base, float eps, int layer_idx) {
+void lfm25_gpu_qk_norm_rope(float *d_q, float *d_k, const float *d_q_norm, const float *d_k_norm, float *d_k_cache, int n_head, int n_head_kv, int head_dim, const int *d_pos, int max_seq, float freq_base, float eps, int layer_idx) {
     const int total_heads = n_head + n_head_kv; // 32 + 8 = 40
-    lfm_fused_qk_norm_neox_rope_kernel<<<total_heads, head_dim>>>(
-        d_q, d_k, d_q_norm, d_k_norm, d_k_cache, n_head, n_head_kv, head_dim, pos, max_seq, freq_base, eps, layer_idx);
+    lfm_fused_qk_norm_neox_rope_kernel<<<total_heads, head_dim, 0, g_lfm_stream>>>(
+        d_q, d_k, d_q_norm, d_k_norm, d_k_cache, n_head, n_head_kv, head_dim, d_pos, max_seq, freq_base, eps, layer_idx);
     CUDA_CHECK_LAST();
 }
 
-void lfm25_gpu_v_cache_write(const float *d_v, float *d_v_cache, int n_head_kv, int head_dim, int pos, int max_seq, int layer_idx) {
-    lfm_v_cache_write_kernel<<<n_head_kv, head_dim>>>(d_v, d_v_cache, n_head_kv, head_dim, pos, max_seq, layer_idx);
+void lfm25_gpu_v_cache_write(const float *d_v, float *d_v_cache, int n_head_kv, int head_dim, const int *d_pos, int max_seq, int layer_idx) {
+    lfm_v_cache_write_kernel<<<n_head_kv, head_dim, 0, g_lfm_stream>>>(d_v, d_v_cache, n_head_kv, head_dim, d_pos, max_seq, layer_idx);
     CUDA_CHECK_LAST();
 }
 
-void lfm25_gpu_attention(const float *d_q, const float *d_k_cache, const float *d_v_cache, float *d_out, void *d_out_q8, int n_head, int n_head_kv, int head_dim, int pos, int max_seq, int layer_idx) {
-    lfm_flash_decoding_kernel<<<n_head, head_dim>>>(
-        d_q, d_k_cache, d_v_cache, d_out, (block_q8_1_c*)d_out_q8, n_head, n_head_kv, head_dim, pos, max_seq, layer_idx);
+void lfm25_gpu_attention(const float *d_q, const float *d_k_cache, const float *d_v_cache, float *d_out, void *d_out_q8, int n_head, int n_head_kv, int head_dim, const int *d_pos, int max_seq, int layer_idx) {
+    lfm_flash_decoding_kernel<<<n_head, head_dim, 0, g_lfm_stream>>>(
+        d_q, d_k_cache, d_v_cache, d_out, (block_q8_1_c*)d_out_q8, n_head, n_head_kv, head_dim, d_pos, max_seq, layer_idx);
     CUDA_CHECK_LAST();
 }
 
@@ -705,19 +740,19 @@ void lfm25_gpu_fused_swiglu(const void *dev_gate, const void *dev_up, const void
     dim3 grid((unsigned)grid_blocks, 1u, 1u);
     dim3 block(32u, (unsigned)MMVQ_ROWS_PER_BLOCK, 1u);
 
-    lfm_fused_swiglu_mmvq_q4_K_kernel<MMVQ_ROWS_PER_BLOCK><<<grid, block>>>(
+    lfm_fused_swiglu_mmvq_q4_K_kernel<MMVQ_ROWS_PER_BLOCK><<<grid, block, 0, g_lfm_stream>>>(
         (const block_q4_K*)dev_gate, (const block_q4_K*)dev_up, (const block_q8_1_c*)d_xq8, d_act, ffn_dim, nblk);
     CUDA_CHECK_LAST();
 
     if (d_act_q8) {
-        lfm_quantize_q8_1_kernel<<<(ffn_dim + 255) / 256, 256>>>(d_act, (block_q8_1_c*)d_act_q8, ffn_dim);
+        lfm_quantize_q8_1_kernel<<<(ffn_dim + 255) / 256, 256, 0, g_lfm_stream>>>(d_act, (block_q8_1_c*)d_act_q8, ffn_dim);
         CUDA_CHECK_LAST();
     }
 }
 
-int32_t lfm25_gpu_output_norm_head_argmax(
+void lfm25_gpu_output_norm_head_argmax(
     const float *d_res_x, const float *d_norm_w, const void *dev_output_w,
-    void *d_xq8, float *d_logits, float *h_logits,
+    void *d_xq8, float *d_logits,
     float *d_block_max, int *d_block_idx, int *d_best_token,
     int dim, int vocab_size, float eps) {
     // 1. RMSNorm on residual x -> quantize to q8_1
@@ -729,22 +764,13 @@ int32_t lfm25_gpu_output_norm_head_argmax(
     dim3 grid((unsigned)grid_blocks, 1u, 1u);
     dim3 block(32u, (unsigned)MMVQ_ROWS_PER_BLOCK, 1u);
 
-    lfm_mmvq_q6_K_head_argmax_kernel<MMVQ_ROWS_PER_BLOCK><<<grid, block>>>(
+    lfm_mmvq_q6_K_head_argmax_kernel<MMVQ_ROWS_PER_BLOCK><<<grid, block, 0, g_lfm_stream>>>(
         (const block_q6_K*)dev_output_w, (const block_q8_1_c*)d_xq8, d_logits, d_block_max, d_block_idx, vocab_size, nblk);
     CUDA_CHECK_LAST();
 
     // 3. Second reduction kernel for global argmax
-    lfm_argmax_reduction_kernel<<<1, 256>>>(d_block_max, d_block_idx, d_best_token, grid_blocks);
+    lfm_argmax_reduction_kernel<<<1, 256, 0, g_lfm_stream>>>(d_block_max, d_block_idx, d_best_token, grid_blocks);
     CUDA_CHECK_LAST();
-
-    int32_t best_id = 0;
-    CUDA_CHECK(cudaMemcpy(&best_id, d_best_token, sizeof(int32_t), cudaMemcpyDeviceToHost));
-
-    if (h_logits && d_logits) {
-        CUDA_CHECK(cudaMemcpy(h_logits, d_logits, (size_t)vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
-    }
-
-    return best_id;
 }
 
 // -----------------------------------------------------------------------------
@@ -951,9 +977,9 @@ void lfm25_gpu_router_top4(const float *d_x, const float *d_w_gate_inp, const fl
                            int *d_topk_ids, float *d_topk_w, float *d_logits,
                            int dim, int n_expert) {
     if (n_expert == 32) {
-        lfm_router_top4_kernel<32><<<1, 1024>>>(d_x, d_w_gate_inp, d_bias, d_topk_ids, d_topk_w, d_logits, dim);
+        lfm_router_top4_kernel<32><<<1, 1024, 0, g_lfm_stream>>>(d_x, d_w_gate_inp, d_bias, d_topk_ids, d_topk_w, d_logits, dim);
     } else if (n_expert == 64) {
-        lfm_router_top4_kernel<64><<<1, 1024>>>(d_x, d_w_gate_inp, d_bias, d_topk_ids, d_topk_w, d_logits, dim);
+        lfm_router_top4_kernel<64><<<1, 1024, 0, g_lfm_stream>>>(d_x, d_w_gate_inp, d_bias, d_topk_ids, d_topk_w, d_logits, dim);
     } else {
         fprintf(stderr, "lfm25_gpu_router_top4: n_expert=%d unsupported (only 32 or 64)\n", n_expert);
         abort();
@@ -965,7 +991,7 @@ void lfm25_gpu_router_top4(const float *d_x, const float *d_w_gate_inp, const fl
 // MoE expert FFN: gate/up (Q4_K) + SwiGLU, down (Q4_K or Q6_K), weighted ordered sum
 // -----------------------------------------------------------------------------
 void lfm25_gpu_quantize_q8_1(const float *d_x, void *d_q8, int n) {
-    lfm_quantize_q8_1_kernel<<<(n + 255) / 256, 256>>>(d_x, (block_q8_1_c*)d_q8, n);
+    lfm_quantize_q8_1_kernel<<<(n + 255) / 256, 256, 0, g_lfm_stream>>>(d_x, (block_q8_1_c*)d_q8, n);
     CUDA_CHECK_LAST();
 }
 
@@ -1085,7 +1111,7 @@ void lfm25_gpu_moe_ffn(const void *d_xq8, const int *d_topk_ids, const float *d_
 
     dim3 block(32u, (unsigned)MMVQ_ROWS_PER_BLOCK, 1u);
     dim3 grid_gu((unsigned)((ffn_dim + MMVQ_ROWS_PER_BLOCK - 1) / MMVQ_ROWS_PER_BLOCK), (unsigned)LFM_ROUTER_TOPK, 1u);
-    lfm_moe_gate_up_swiglu_q4_K_kernel<MMVQ_ROWS_PER_BLOCK><<<grid_gu, block>>>(
+    lfm_moe_gate_up_swiglu_q4_K_kernel<MMVQ_ROWS_PER_BLOCK><<<grid_gu, block, 0, g_lfm_stream>>>(
         (const block_q4_K*)dev_gate_exps, (const block_q4_K*)dev_up_exps, (const block_q8_1_c*)d_xq8,
         d_topk_ids, d_act, ffn_dim, nblk_in, gate_stride, up_stride);
     CUDA_CHECK_LAST();
@@ -1095,7 +1121,7 @@ void lfm25_gpu_moe_ffn(const void *d_xq8, const int *d_topk_ids, const float *d_
     dim3 grid_dn((unsigned)((dim + MMVQ_ROWS_PER_BLOCK - 1) / MMVQ_ROWS_PER_BLOCK), 1u, 1u);
     const block_q8_1_c *yq = (const block_q8_1_c*)d_act_q8;
 #define LFM_MOE_DOWN_LAUNCH(BT, ACC) \
-    lfm_moe_down_kernel<BT, MMVQ_ROWS_PER_BLOCK, ACC><<<grid_dn, block>>>( \
+    lfm_moe_down_kernel<BT, MMVQ_ROWS_PER_BLOCK, ACC><<<grid_dn, block, 0, g_lfm_stream>>>( \
         (const BT*)dev_down_exps, yq, d_topk_ids, d_topk_w, d_dst, dim, nblk_down, down_stride)
     if (down_type == GGML_TYPE_Q4_K) {
         if (accum) LFM_MOE_DOWN_LAUNCH(block_q4_K, true);

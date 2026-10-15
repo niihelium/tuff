@@ -6,6 +6,7 @@
 #include "lfm25_expert_cache.h"
 #include <stdint.h>
 #include <stddef.h>
+#include <cuda_runtime.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -54,8 +55,16 @@ typedef struct {
     int   *d_best_token;     // (1 int)
 
     // Host buffers
-    float *h_logits;         // (vocab_size)
-    float *h_embd;           // (embedding_length)
+    float *h_logits;         // (vocab_size), pinned; filled only when logit capture is enabled
+    int   *h_tokpos;         // pinned [token, pos] -> d_tokpos at the start of every step
+    int   *h_best;           // pinned argmax result
+    int   *d_tokpos;         // device [token, pos] read by the embed / RoPE / KV-write / attention kernels
+
+    // Whole-trunk CUDA graph (dense + fully resident MoE; not the expert-cache path)
+    cudaStream_t stream;     // explicit stream captured into the graph
+    cudaGraph_t graph;
+    cudaGraphExec_t graph_exec;
+    int graph_enabled;       // eligible and not disabled by LFM25_CUDA_GRAPH=0
 
     // Sampler
     sampler_params_t sampler;
@@ -66,16 +75,17 @@ int  lfm25_gpu_prepare(lfm25_model_t *model, int *max_context_len, int fill_ram)
 void lfm25_gpu_shutdown(lfm25_model_t *model);
 
 // GPU forward kernels
-void lfm25_gpu_embed(int32_t token, float *d_x, float *h_embd, const lfm25_tensor_t *token_embd, int dim);
+void lfm25_gpu_set_stream(cudaStream_t s);  // stream for all forward-path kernels (0 = default stream)
+void lfm25_gpu_embed(const int *d_tokpos /* [token,pos] on device */, float *d_x, const lfm25_tensor_t *token_embd, int dim);
 void lfm25_gpu_fused_rms_norm_quant(const float *d_src, const float *d_weight, float *d_dst_norm, void *d_dst_q8, int dim, float eps);
 void lfm25_gpu_mmvq_q4_K(const void *dev_w, const void *d_xq8, float *d_dst, int in_dim, int out_dim, bool accum);
 void lfm25_gpu_mmvq_q6_K(const void *dev_w, const void *d_xq8, float *d_dst, int in_dim, int out_dim, bool accum);
 void lfm25_gpu_shortconv_step(const float *d_in_proj, float *d_conv_state, const float *d_conv_w, float *d_conv_out, void *d_conv_out_q8, int d);
-void lfm25_gpu_qk_norm_rope(float *d_q, float *d_k, const float *d_q_norm, const float *d_k_norm, float *d_k_cache, int n_head, int n_head_kv, int head_dim, int pos, int max_seq, float freq_base, float eps, int layer_idx);
-void lfm25_gpu_v_cache_write(const float *d_v, float *d_v_cache, int n_head_kv, int head_dim, int pos, int max_seq, int layer_idx);
-void lfm25_gpu_attention(const float *d_q, const float *d_k_cache, const float *d_v_cache, float *d_out, void *d_out_q8, int n_head, int n_head_kv, int head_dim, int pos, int max_seq, int layer_idx);
+void lfm25_gpu_qk_norm_rope(float *d_q, float *d_k, const float *d_q_norm, const float *d_k_norm, float *d_k_cache, int n_head, int n_head_kv, int head_dim, const int *d_pos, int max_seq, float freq_base, float eps, int layer_idx);
+void lfm25_gpu_v_cache_write(const float *d_v, float *d_v_cache, int n_head_kv, int head_dim, const int *d_pos, int max_seq, int layer_idx);
+void lfm25_gpu_attention(const float *d_q, const float *d_k_cache, const float *d_v_cache, float *d_out, void *d_out_q8, int n_head, int n_head_kv, int head_dim, const int *d_pos, int max_seq, int layer_idx);
 void lfm25_gpu_fused_swiglu(const void *dev_gate, const void *dev_up, const void *d_xq8, float *d_act, void *d_act_q8, int in_dim, int ffn_dim);
-int32_t lfm25_gpu_output_norm_head_argmax(const float *d_res_x, const float *d_norm_w, const void *dev_output_w, void *d_xq8, float *d_logits, float *h_logits, float *d_block_max, int *d_block_idx, int *d_best_token, int dim, int vocab_size, float eps);
+void lfm25_gpu_output_norm_head_argmax(const float *d_res_x, const float *d_norm_w, const void *dev_output_w, void *d_xq8, float *d_logits, float *d_block_max, int *d_block_idx, int *d_best_token, int dim, int vocab_size, float eps);
 void lfm25_gpu_router_top4(const float *d_x, const float *d_w_gate_inp, const float *d_bias, int *d_topk_ids, float *d_topk_w, float *d_logits /* nullable */, int dim, int n_expert);
 void lfm25_gpu_quantize_q8_1(const float *d_x, void *d_q8, int n);
 void lfm25_gpu_moe_ffn(const void *d_xq8, const int *d_topk_ids, const float *d_topk_w, const void *dev_gate_exps, const void *dev_up_exps, const void *dev_down_exps, int down_type, float *d_act /* [4*ffn_dim] */, void *d_act_q8 /* [4*ffn_dim/32] block_q8_1 */, float *d_dst, bool accum, int dim, int ffn_dim, size_t gate_stride, size_t up_stride, size_t down_stride /* bytes per expert / slot */);

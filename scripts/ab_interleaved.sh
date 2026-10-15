@@ -32,6 +32,7 @@
 # Usage:  ./scripts/ab_interleaved.sh <treeA> <treeB> [rounds]
 #   treeA/treeB: directories each containing build/tuff
 # Env:  N (tokens, default 24)  WARMUP (default 16)  RUNS (default 3)
+#       MODEL (gguf path -> --model; unset = tuff default)  TUFF_ARGS (extra args, e.g. "-c 1024")
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -60,7 +61,7 @@ measure() {
     local tree="$1" st log tok
     st=$(gpu_state)
     log=$(mktemp)
-    ( cd "$tree" && ./build/tuff --prompt "${PROMPT:-Hello}" -n "$N" --warmup "$WARMUP" --runs "$RUNS" ) >"$log" 2>&1
+    ( cd "$tree" && ./build/tuff ${MODEL:+--model "$MODEL"} --prompt "${PROMPT:-Hello}" -n "$N" --warmup "$WARMUP" --runs "$RUNS" ${TUFF_ARGS:-} ) >"$log" 2>&1
     tok=$(awk '/Pipeline Generation Speed:/{print $4; exit}' "$log")
     rm -f "$log"
     printf '%s\t%s' "${tok:-ERR}" "$st"

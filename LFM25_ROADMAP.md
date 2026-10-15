@@ -201,6 +201,7 @@ Usable VRAM: **~7,880 MiB**
 - [ ] **Task 4.1: Whole-Trunk Static CUDA Graph (1.2B)**
   - Capture all 16 layers of LFM2.5-1.2B into a single static CUDA Graph.
   - Target: **$\ge 350 - 400$ tok/s** on RTX 3070 Laptop.
+  - Status: implemented (dense 1.2B + resident 8B MoE; 24B expert-cache path stays un-graphed). GPU Q6_K embedding, device `d_tokpos`, one explicit stream, logits D2H only when capture is on; `LFM25_CUDA_GRAPH=0` disables. Graph logits byte-identical to un-graphed. 1.2B ~346 tok/s graph vs ~328 off. Orchestrator check: graph logits byte-identical to the pre-change engine (`8bfb4ed` worktree) on 1.2B and 8B; all three gates unchanged; memcheck clean (1.2B, 8B). Open: formal `scripts/ab_interleaved.sh` A/B (refused: power profile `balanced`), and the 350 tok/s target (kernel-bound → Task 4.2). Runbook: [wiki/lfm25/devlog.md](wiki/lfm25/devlog.md).
 - [ ] **Task 4.2: Fused Depthwise Conv1D + Gating + `Q8_1` Requantization**
   - Single warp-cooperative kernel:
     * In-projection outputs $[b, c, x]$ kept in shared memory.
