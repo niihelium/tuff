@@ -411,16 +411,11 @@
   "per_thread_stream": "ON"
  },
  "provenance": {
-  "git_commit": "18ebb70dc31e38e429beaeba289ea7003e9dd27a",
-  "git_tracked_files_dirty": true,
-  "git_status_porcelain": [
-   " M tests/verify_lfm25_oracle.sh",
-   "?? tests/lfm25_gate_thresholds.txt",
-   "?? tests/verify_lfm25_golden.sh",
-   "?? tools/lfm25_golden.py"
-  ],
-  "date_utc": "2026-10-15T21:38:55Z",
-  "reason": "Task 4.2 validated state (18ebb70): byte-identical to e133b44, all gates pass",
+  "git_commit": "ce394befb2fc79f5668759aa2814f3056c638936",
+  "git_tracked_files_dirty": false,
+  "git_status_porcelain": [],
+  "date_utc": "2026-10-15T21:58:55Z",
+  "reason": "Provenance refresh at clean commit ce394be (tooling committed); numerics unchanged since 18ebb70",
   "configs_verified_identical": [
    "graph=1",
    "graph=0"
