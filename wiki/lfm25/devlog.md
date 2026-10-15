@@ -19,7 +19,7 @@ Last updated: 2026-10-16. Branch: `lfm25-phase1` (pushed to `origin`; not merged
 | 2.3 — 8B-A1B pipeline | done, **Gate 2 PASS** | `085f7e2` | 127/128 TF, robust median 0.96 |
 | 3.1a — 64-expert router, strided expert FFN | done | `7e49ac7` | router 304/304, moe_ffn 76/76 |
 | 3.1b/3.2 — VRAM expert cache, 24B | done, **Gate 3 PASS** | `8bfb4ed` | 8B forced-cache logits byte-identical |
-| 4.1 — whole-trunk CUDA graph (1.2B, 8B) | correctness validated; speed 346/350; formal A/B pending | see §11 | graph logits byte-identical to pre-change engine |
+| 4.1 — whole-trunk CUDA graph (1.2B, 8B) | correctness validated; A/B +6.69% (1.2B) / +7.00% (8B); 343/350 tok/s | `e133b44` | graph logits byte-identical to pre-change engine; A/B §11 |
 | 4.2 — fused conv+gate+Q8_1 | not started | | |
 | 4.3 — async prefetch / CPU misses (24B) | not started | | |
 | 5 — speculative decoding | not started | | |
@@ -60,6 +60,8 @@ Machine gotchas (each one cost time):
 - **FP64 references are CPU-heavy** (12–15 cores, up to ~23 GB RSS on the 24B); don't benchmark while one runs.
 - **Power profile**: `scripts/check_power_state.sh` FAILs on `balanced` and `ab_interleaved.sh` refuses to run ("machine
   throttled"). Fix (needs sudo, user action): `powerprofilesctl set performance`.
+  The user accepts `balanced` for benchmarks (2026-10-16): run with `FORCE=1` if the only FAILs are the profile lines, and
+  record the profile next to every number; A and B of one A/B must run in the same profile.
 - `pkill -f <pattern>` matches your own shell command line when the pattern appears in it — kill by PID instead.
 - `/tmp` is wiped on reboot (scratch work is lost) — anything worth keeping goes into `tools/` or `tools/debug/`.
 
@@ -317,8 +319,9 @@ $PY tools/lfm25_pack_moe_fixtures.py    /tmp/d24 tests/fixtures/lfm25_24b_moe_ff
 
 ## 11. Next steps (in order)
 
-1. **Finish Task 4.1**: set `powerprofilesctl set performance`, run the formal A/B (command in §5; baseline tree
-   `/home/nii/workspace/tuf-base` = `8bfb4ed`). Correctness is done: graph logits byte-identical to the pre-change
+1. **Task 4.1 A/B — done 2026-10-16** (balanced profile, accepted by the user; `FORCE=1`, all other power checks ok):
+   1.2B 321.8 → 343.4 tok/s, +6.69% ± 0.17 (95% CI [+6.34, +7.04]); 8B 214.2 → 229.2 tok/s, +7.00% ± 0.08
+   ([+6.85, +7.16]); 6 interleaved rounds, `8bfb4ed` vs `e133b44`. Gates re-run on clean `e133b44`: identical numbers to §4.2. Correctness is done: graph logits byte-identical to the pre-change
    engine on 1.2B and 8B, all three gates unchanged, memcheck clean (1.2B, 8B). Speed 346 tok/s vs target 350 — the
    remaining gap is kernel time → Task 4.2. Logits D2H is now only done when logit capture is on.
 2. **Strengthen the gate** (user request): golden self-regression (byte-identical tokens + logit hashes per model vs the
