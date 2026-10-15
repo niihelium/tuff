@@ -198,16 +198,20 @@ Usable VRAM: **~7,880 MiB**
 ### Phase 4: Fused Kernels & CUDA Graph Capture
 **Objective**: Eliminate global memory round-trips and drive launch latency to zero.
 
-- [ ] **Task 4.1: Whole-Trunk Static CUDA Graph (1.2B)**
+- [x] **Task 4.1: Whole-Trunk Static CUDA Graph (1.2B)**
   - Capture all 16 layers of LFM2.5-1.2B into a single static CUDA Graph.
   - Target: **$\ge 350 - 400$ tok/s** on RTX 3070 Laptop.
-  - Status: implemented (dense 1.2B + resident 8B MoE; 24B expert-cache path stays un-graphed). GPU Q6_K embedding, device `d_tokpos`, one explicit stream, logits D2H only when capture is on; `LFM25_CUDA_GRAPH=0` disables. Graph logits byte-identical to un-graphed. 1.2B ~346 tok/s graph vs ~328 off. Orchestrator check: graph logits byte-identical to the pre-change engine (`8bfb4ed` worktree) on 1.2B and 8B; all three gates unchanged; memcheck clean (1.2B, 8B). Formal A/B (2026-10-16, `ab_interleaved.sh`, `-c 1024 -n 128 --warmup 32 --runs 3`, 6 rounds, `8bfb4ed` vs `e133b44`, power profile `balanced` accepted by the user — run with `FORCE=1`; AC on, GPU limit 95 W, VRAM 6001 MHz): 1.2B 321.8 → 343.4 tok/s, **+6.69% ± 0.17** (95% CI +6.34..+7.04%); 8B 214.2 → 229.2 tok/s, **+7.00% ± 0.08** (CI +6.85..+7.16%). Open: the 350 tok/s target (kernel-bound → Task 4.2). Runbook: [wiki/lfm25/devlog.md](wiki/lfm25/devlog.md).
-- [ ] **Task 4.2: Fused Depthwise Conv1D + Gating + `Q8_1` Requantization**
+  - Status: implemented (dense 1.2B + resident 8B MoE; 24B expert-cache path stays un-graphed). GPU Q6_K embedding, device `d_tokpos`, one explicit stream, logits D2H only when capture is on; `LFM25_CUDA_GRAPH=0` disables. Graph logits byte-identical to un-graphed. 1.2B ~346 tok/s graph vs ~328 off. Orchestrator check: graph logits byte-identical to the pre-change engine (`8bfb4ed` worktree) on 1.2B and 8B; all three gates unchanged; memcheck clean (1.2B, 8B). Formal A/B (2026-10-16, `ab_interleaved.sh`, `-c 1024 -n 128 --warmup 32 --runs 3`, 6 rounds, `8bfb4ed` vs `e133b44`, power profile `balanced` accepted by the user — run with `FORCE=1`; AC on, GPU limit 95 W, VRAM 6001 MHz): 1.2B 321.8 → 343.4 tok/s, **+6.69% ± 0.17** (95% CI +6.34..+7.04%); 8B 214.2 → 229.2 tok/s, **+7.00% ± 0.08** (CI +6.85..+7.16%). The 350 tok/s target is reached together with Task 4.2 (361.7 tok/s). Runbook: [wiki/lfm25/devlog.md](wiki/lfm25/devlog.md).
+- [x] **Task 4.2: Fused Depthwise Conv1D + Gating + `Q8_1` Requantization**
   - Single warp-cooperative kernel:
     * In-projection outputs $[b, c, x]$ kept in shared memory.
     * Depthwise 3-tap dot product with rolling state buffer.
     * Inline output gating ($c \odot \text{conv\_out}$).
     * Direct shared-memory quantization to `Q8_1` for out-projection GEMV.
+  - Done (plus multi-block RMSNorm+Q8_1). `lfm_inproj_shortconv_kernel`: a block owns 32 channels, computes its 96 in_proj rows [b|c|x] with the exact per-row MMVQ code of `lfm_mmvq_q4_K_dense_kernel` (24 warps, 4 rows each) into shared memory, then warp 0 runs the unchanged conv/gate/Q8_1 math. `lfm_fused_rms_norm_quant_kernel` now runs on 8 blocks: each recomputes the identical sum of squares, then quantizes only its own Q8_1 blocks (it was one 256-thread block, latency-bound, ~10% of 1.2B decode).
+  - **Byte-identical** teacher-forced logits vs `e133b44` on 1.2B, 8B, 24B with graph on and `LFM25_CUDA_GRAPH=0`, and on the 8B forced through an 88-slot expert cache. All three gates unchanged to the printed digit; router 176/176 + 304/304, moe_ffn 44/44 + 76/76; memcheck 0 errors / 0 leaks (1.2B, 8B, 24B), racecheck 0 hazards, synccheck 0 errors.
+  - Negative controls (dense): b/c rows swapped → gate FAIL (prefix 0/10, 79 hard misses, ratio 19.8); norm blocks all writing the first share → FAIL (0/128 TF); x channel off by one → FAIL (101 hard misses); reversed warp-reduction order (bit-level only) → **byte-identity FAILS but the oracle gate PASSES** (ratio 0.80) — motivates the golden self-regression gate.
+  - A/B (`ab_interleaved.sh`, 6 rounds, `e133b44` vs 4.2, balanced profile, `FORCE=1`): 1.2B 342.9 → 361.7 tok/s **+5.46% ± 0.21**; 8B 228.7 → 241.6 **+5.65% ± 0.08**; 24B 110.2 → 115.5 **+4.79% ± 0.10**.
 - [ ] **Task 4.3: Async Prefetch & Dual-Stream MoE Execution (24B)**
   - Overlap layer $L$ expert computation with layer $L+1$ PCIe miss transfers.
   - Target: **$\ge 95 - 110$ tok/s** on RTX 3070 Laptop.

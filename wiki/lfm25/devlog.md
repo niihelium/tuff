@@ -19,18 +19,18 @@ Last updated: 2026-10-16. Branch: `lfm25-phase1` (pushed to `origin`; not merged
 | 2.3 — 8B-A1B pipeline | done, **Gate 2 PASS** | `085f7e2` | 127/128 TF, robust median 0.96 |
 | 3.1a — 64-expert router, strided expert FFN | done | `7e49ac7` | router 304/304, moe_ffn 76/76 |
 | 3.1b/3.2 — VRAM expert cache, 24B | done, **Gate 3 PASS** | `8bfb4ed` | 8B forced-cache logits byte-identical |
-| 4.1 — whole-trunk CUDA graph (1.2B, 8B) | correctness validated; A/B +6.69% (1.2B) / +7.00% (8B); 343/350 tok/s | `e133b44` | graph logits byte-identical to pre-change engine; A/B §11 |
-| 4.2 — fused conv+gate+Q8_1 | not started | | |
+| 4.1 — whole-trunk CUDA graph (1.2B, 8B) | done; A/B +6.69% (1.2B) / +7.00% (8B) | `e133b44` | graph logits byte-identical to pre-change engine; A/B §11 |
+| 4.2 — fused in_proj+conv+gate+Q8_1, multi-block RMSNorm | done; A/B +5.46% / +5.65% / +4.79% | see git log | logits byte-identical to `e133b44` (3 models, graph on/off, forced cache) |
 | 4.3 — async prefetch / CPU misses (24B) | not started | | |
 | 5 — speculative decoding | not started | | |
 
-Decode speed (RTX 3070 Laptop, `-c 1024 -n 128 --runs 3`, power profile NOT locked → indicative):
+Decode speed (RTX 3070 Laptop, `-c 1024 -n 128 --runs 3`, `balanced` profile, interleaved A/B means):
 
 | Model | tuff | llama.cpp (tg128) | Note |
 | :--- | :---: | :---: | :--- |
-| 1.2B dense | 322 → **346** (graph) | 331 | roadmap Phase-4 target ≥ 350 |
-| 8B-A1B | 216 → **230** (graph) | 218 | fully VRAM resident |
-| 24B-A2B | **110** | 34.8 (`-ot exps=CPU`) | expert cache, 95.5 % hit rate on a short repetitive run |
+| 1.2B dense | 322 → 343 (graph) → **362** (4.2) | 331 | Phase-4 target ≥ 350 met |
+| 8B-A1B | 214 → 229 (graph) → **242** (4.2) | 218 | fully VRAM resident |
+| 24B-A2B | 110 → **115** (4.2) | 34.8 (`-ot exps=CPU`) | expert cache, 95.5 % hit rate on a short repetitive run |
 
 ---
 
@@ -326,7 +326,10 @@ $PY tools/lfm25_pack_moe_fixtures.py    /tmp/d24 tests/fixtures/lfm25_24b_moe_ff
    remaining gap is kernel time → Task 4.2. Logits D2H is now only done when logit capture is on.
 2. **Strengthen the gate** (user request): golden self-regression (byte-identical tokens + logit hashes per model vs the
    last validated commit), thresholds locked in the roadmap, negative controls automated in the gate script.
-3. **Task 4.2** fused conv + gate + Q8_1 (byte-identity vs current path, then A/B).
+3. **Task 4.2 — done 2026-10-16**: fused in_proj+conv kernel + multi-block RMSNorm; byte-identical, A/B +5.46% (1.2B,
+   361.7 tok/s), +5.65% (8B), +4.79% (24B); evidence in the roadmap. Leftovers: `lfm25_gpu_shortconv_step` and
+   `eng->d_in_proj` are now unused (kept as the reference path; remove when convenient). Next speed candidate on the 1.2B:
+   Q6_K `ffn_down` matvec efficiency (~270 vs ~350 GB/s); re-profile first.
 4. **Task 4.3 / 24B speed**: pinned staging buffer for misses (cudaHostRegister on the mmap fails), async prefetch of
    next-layer experts, frequency-aware LFRU, measure hit rate on diverse text (not just "Hello"); optional CPU-miss
    evaluation with its own validation.

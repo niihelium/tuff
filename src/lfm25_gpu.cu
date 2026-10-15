@@ -21,6 +21,12 @@
 #define VDR_Q4_K_Q8_1_MMVQ 2
 #define VDR_Q6_K_Q8_1_MMVQ 1
 
+#ifndef LFM_NORM_BLOCKS
+#define LFM_NORM_BLOCKS 8
+#endif
+#ifndef LFM_CONV_WARPS
+#define LFM_CONV_WARPS 24
+#endif
 #ifndef MMVQ_ROWS_PER_BLOCK
 #define MMVQ_ROWS_PER_BLOCK 4
 #endif
@@ -229,7 +235,8 @@ __global__ void lfm_fused_rms_norm_quant_kernel(
 
     const float scale = s_scale;
     const int total_q_blocks = in_dim / QK8_1;
-    for (int b = warp_id; b < total_q_blocks; b += 8) {
+    // Multi-block: every block recomputes the identical sum above; each handles only its own share of Q8_1 blocks.
+    for (int b = blockIdx.x * 8 + warp_id; b < total_q_blocks; b += gridDim.x * 8) {
         const int idx = b * QK8_1 + lane_id;
         float norm_val = x[idx] * scale * (w ? w[idx] : 1.0f);
         if (dst_norm_x) dst_norm_x[idx] = norm_val;
@@ -321,6 +328,84 @@ __global__ void lfm_shortconv_step_kernel(
         const int8_t q = (amax == 0.0f) ? 0 : (int8_t)roundf(g / scale);
         conv_out_q8[b].qs[lane_id] = q;
         if (lane_id == 0) {
+            conv_out_q8[b].ds = make_half2(__float2half(scale), __float2half(sum));
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// CUDA Kernel: Fused in_proj (Q4_K MMVQ) + ShortConv1D step + gating + Q8_1 quant.
+// A block owns 32 channels; computes the 96 in_proj rows [b | c | x] it needs with the exact per-row MMVQ math
+// (bit-identical to lfm_mmvq_q4_K_dense_kernel), keeps them in shared memory, then runs the conv step unchanged.
+// -----------------------------------------------------------------------------
+template <int NW>
+__launch_bounds__(NW * 32, 1)
+__global__ void lfm_inproj_shortconv_kernel(
+    const block_q4_K * __restrict__ w,
+    const block_q8_1_c * __restrict__ y,
+    float * __restrict__ conv_state,
+    const float * __restrict__ conv_w,
+    float * __restrict__ conv_out,
+    block_q8_1_c * __restrict__ conv_out_q8,
+    int d, int nblk) {
+    constexpr int vdr = VDR_Q4_K_Q8_1_MMVQ;
+    constexpr int tpsb = QI4_K / vdr;
+    constexpr int blocks_per_iter = vdr * 32 / QI4_K;
+
+    __shared__ float s_proj[96];
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int i0 = blockIdx.x * 32;
+    const int kqs = vdr * (lane % tpsb);
+
+    for (int r = warp; r < 96; r += NW) {
+        const int row = (r >> 5) * d + i0 + (r & 31);
+        const block_q4_K * __restrict__ rw = w + (size_t)row * nblk;
+        float tmp = 0.0f;
+        for (int kbx = lane / tpsb; kbx < nblk; kbx += blocks_per_iter) {
+            tmp += vec_dot_q4_K_q8_1_c(rw + kbx, y + kbx * (QK_K / QK8_1), kqs);
+        }
+        tmp = warp_reduce_sum_f(tmp);
+        if (lane == 0) s_proj[r] = tmp;
+    }
+    __syncthreads();
+    if (warp != 0) return;
+
+    const int i = i0 + lane;
+    float b_val = s_proj[lane];
+    float c_val = s_proj[32 + lane];
+    float x_val = s_proj[64 + lane];
+
+    float u = b_val * x_val;
+
+    float s0 = conv_state[i];
+    float s1 = conv_state[d + i];
+
+    float k0 = conv_w[i * 3 + 0];
+    float k1 = conv_w[i * 3 + 1];
+    float k2 = conv_w[i * 3 + 2];
+
+    float y_conv = s0 * k0 + s1 * k1 + u * k2;
+
+    conv_state[i] = s1;
+    conv_state[d + i] = u;
+
+    float g = c_val * y_conv;
+    conv_out[i] = g;
+
+    if (conv_out_q8) {
+        const int b = i >> 5;
+        float amax = fabsf(g);
+        float sum  = g;
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, mask, 32));
+            sum += __shfl_xor_sync(0xffffffff, sum, mask, 32);
+        }
+        const float scale = amax / 127.0f;
+        const int8_t q = (amax == 0.0f) ? 0 : (int8_t)roundf(g / scale);
+        conv_out_q8[b].qs[lane] = q;
+        if (lane == 0) {
             conv_out_q8[b].ds = make_half2(__float2half(scale), __float2half(sum));
         }
     }
@@ -672,7 +757,10 @@ void lfm25_gpu_embed(const int *d_tokpos, float *d_x, const lfm25_tensor_t *toke
 }
 
 void lfm25_gpu_fused_rms_norm_quant(const float *d_src, const float *d_weight, float *d_dst_norm, void *d_dst_q8, int dim, float eps) {
-    lfm_fused_rms_norm_quant_kernel<<<1, 256, 0, g_lfm_stream>>>(d_src, d_weight, d_dst_norm, (block_q8_1_c*)d_dst_q8, dim, eps);
+    int nb = (dim / QK8_1 + 7) / 8;
+    if (nb > LFM_NORM_BLOCKS) nb = LFM_NORM_BLOCKS;
+    if (nb < 1) nb = 1;
+    lfm_fused_rms_norm_quant_kernel<<<nb, 256, 0, g_lfm_stream>>>(d_src, d_weight, d_dst_norm, (block_q8_1_c*)d_dst_q8, dim, eps);
     CUDA_CHECK_LAST();
 }
 
@@ -713,6 +801,19 @@ void lfm25_gpu_shortconv_step(const float *d_in_proj, float *d_conv_state, const
     const int blocks = (d + threads - 1) / threads;
     lfm_shortconv_step_kernel<<<blocks, threads, 0, g_lfm_stream>>>(
         d_in_proj, d_conv_state, d_conv_w, d_conv_out, (block_q8_1_c*)d_conv_out_q8, d);
+    CUDA_CHECK_LAST();
+}
+
+void lfm25_gpu_inproj_shortconv(const lfm25_tensor_t *in_proj, const void *d_xq8, float *d_conv_state, const float *d_conv_w, float *d_conv_out, void *d_conv_out_q8, int d) {
+    if (in_proj->info.type != GGML_TYPE_Q4_K) {
+        fprintf(stderr, "[FATAL] lfm25_gpu_inproj_shortconv: in_proj type %d unsupported (only Q4_K)\n", (int)in_proj->info.type);
+        exit(EXIT_FAILURE);
+    }
+    if (d % 32 != 0 || d % QK_K != 0) { fprintf(stderr, "[FATAL] lfm25_gpu_inproj_shortconv: d=%d unsupported\n", d); exit(EXIT_FAILURE); }
+    dim3 block(32u, (unsigned)LFM_CONV_WARPS, 1u);
+    lfm_inproj_shortconv_kernel<LFM_CONV_WARPS><<<d / 32, block, 0, g_lfm_stream>>>(
+        (const block_q4_K*)in_proj->dev, (const block_q8_1_c*)d_xq8, d_conv_state, d_conv_w, d_conv_out,
+        (block_q8_1_c*)d_conv_out_q8, d, d / QK_K);
     CUDA_CHECK_LAST();
 }
 

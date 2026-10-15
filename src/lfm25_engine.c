@@ -197,13 +197,10 @@ static void lfm25_enqueue_step(lfm25_engine_t *eng, cudaStream_t stream) {
 
         if (L->op_type == LFM25_OP_CONV) {
             // ShortConv1D
-            // in_proj: 2048 -> 6144 (Q4_K)
-            lfm25_gpu_mmvq_q4_K(L->shortconv_in_proj.dev, eng->d_q8_x, eng->d_in_proj, dim, 3 * dim, false);
-
-            // Fused conv modulation, rolling dot, state update, gating & quantize to q8_1
+            // Fused in_proj (Q4_K 2048 -> 6144) + conv modulation, rolling dot, state update, gating & q8_1 quant
             float *conv_state_ptr = eng->d_conv_state + (size_t)conv_idx * (2 * dim);
-            lfm25_gpu_shortconv_step(eng->d_in_proj, conv_state_ptr, (const float*)L->shortconv_conv.dev,
-                                     eng->d_conv_out, eng->d_q8_op_out, dim);
+            lfm25_gpu_inproj_shortconv(&L->shortconv_in_proj, eng->d_q8_x, conv_state_ptr, (const float*)L->shortconv_conv.dev,
+                                       eng->d_conv_out, eng->d_q8_op_out, dim);
 
             // out_proj: 2048 -> 2048 (Q4_K) with accum into residual d_x
             lfm25_gpu_mmvq_q4_K(L->shortconv_out_proj.dev, eng->d_q8_op_out, eng->d_x, dim, dim, true);
