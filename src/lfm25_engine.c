@@ -10,6 +10,13 @@
 
 lfm25_engine_t* lfm25_engine_init(lfm25_model_t *model, int max_context_len) {
     if (!model) return NULL;
+    // The router / expert kernels are compiled for 32 experts, top-4 (LFM2.5-8B-A1B). The 24B (64 experts)
+    // needs the Phase 3 kernels; fail at load instead of inside the first forward pass.
+    if (model->is_moe && (model->expert_count != 32 || model->expert_used_count != 4)) {
+        fprintf(stderr, "[LFM25] ERROR: MoE with %u experts / top-%u is not supported yet (only 32 / top-4)\n",
+                model->expert_count, model->expert_used_count);
+        return NULL;
+    }
     lfm25_engine_t *eng = (lfm25_engine_t*)calloc(1, sizeof(lfm25_engine_t));
     if (!eng) return NULL;
 
@@ -18,7 +25,7 @@ lfm25_engine_t* lfm25_engine_init(lfm25_model_t *model, int max_context_len) {
 
     uint32_t d = model->embedding_length;
     uint32_t vocab = model->vocab_size;
-    uint32_t ffn_dim = model->is_moe ? model->expert_ffn_dim : 8192;
+    uint32_t ffn_dim = model->ffn_dim;
     uint32_t n_head = model->head_count;
     uint32_t n_head_kv = model->head_count_kv;
     uint32_t head_dim = model->head_dim;
@@ -64,6 +71,14 @@ lfm25_engine_t* lfm25_engine_init(lfm25_model_t *model, int max_context_len) {
     CUDA_CHECK(cudaMalloc(&eng->d_q8_op_out, q8_x_bytes));
     CUDA_CHECK(cudaMalloc(&eng->d_q8_ffn_act, q8_ffn_bytes));
 
+    if (model->is_moe) {
+        size_t moe_n = (size_t)model->expert_used_count * model->expert_ffn_dim;
+        CUDA_CHECK(cudaMalloc((void**)&eng->d_topk_ids, 4 * sizeof(int)));
+        CUDA_CHECK(cudaMalloc((void**)&eng->d_topk_w, 4 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc((void**)&eng->d_moe_act, moe_n * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&eng->d_moe_act_q8, (moe_n / 32) * 36));
+    }
+
     // Device argmax buffers
     size_t grid_blocks = (vocab + 4 - 1) / 4;
     CUDA_CHECK(cudaMalloc((void**)&eng->d_block_max, grid_blocks * sizeof(float)));
@@ -102,6 +117,11 @@ void lfm25_engine_free(lfm25_engine_t *eng) {
     if (eng->d_q8_op_out)  cudaFree(eng->d_q8_op_out);
     if (eng->d_q8_ffn_act) cudaFree(eng->d_q8_ffn_act);
 
+    if (eng->d_topk_ids)   cudaFree(eng->d_topk_ids);
+    if (eng->d_topk_w)     cudaFree(eng->d_topk_w);
+    if (eng->d_moe_act)    cudaFree(eng->d_moe_act);
+    if (eng->d_moe_act_q8) cudaFree(eng->d_moe_act_q8);
+
     if (eng->d_block_max)  cudaFree(eng->d_block_max);
     if (eng->d_block_idx)  cudaFree(eng->d_block_idx);
     if (eng->d_best_token) cudaFree(eng->d_best_token);
@@ -131,7 +151,7 @@ int32_t lfm25_engine_forward_token(lfm25_engine_t *eng, int32_t token, int pos) 
     lfm25_model_t *m = eng->model;
     int dim = (int)m->embedding_length;
     float eps = m->rms_norm_eps;
-    int ffn_dim = (int)(m->is_moe ? m->expert_ffn_dim : 8192);
+    int ffn_dim = (int)m->ffn_dim;
 
     // 1. Fetch token embedding for input token
     lfm25_gpu_embed(token, eng->d_x, eng->h_embd, &m->token_embd, dim);
@@ -195,8 +215,15 @@ int32_t lfm25_engine_forward_token(lfm25_engine_t *eng, int32_t token, int pos) 
             // Fused SwiGLU: computes gate (Q4_K) and up (Q4_K), applies silu(gate)*up, quantizes to q8_1
             lfm25_gpu_fused_swiglu(L->ffn_gate.dev, L->ffn_up.dev, eng->d_q8_x, eng->d_ffn_act, eng->d_q8_ffn_act, dim, ffn_dim);
 
-            // down proj: 8192 -> 2048 (Q4_K or Q6_K depending on layer) with accum into residual d_x
+            // down proj: ffn_dim -> 2048 (Q4_K or Q6_K depending on layer) with accum into residual d_x
             lfm25_gpu_mat_vec(&L->ffn_down, eng->d_q8_ffn_act, eng->d_x, ffn_dim, dim, true);
+        } else {
+            // Sparse MoE: sigmoid top-4 router on the normed FP32 input, then in-VRAM expert FFN accumulated into d_x
+            lfm25_gpu_router_top4(eng->d_norm_x, (const float*)L->ffn_gate_inp.dev, (const float*)L->exp_probs_b.dev,
+                                  eng->d_topk_ids, eng->d_topk_w, NULL, dim, (int)m->expert_count);
+            lfm25_gpu_moe_ffn(eng->d_q8_x, eng->d_topk_ids, eng->d_topk_w, L->ffn_gate_exps.dev, L->ffn_up_exps.dev,
+                              L->ffn_down_exps.dev, (int)L->ffn_down_exps.info.type, eng->d_moe_act, eng->d_moe_act_q8,
+                              eng->d_x, true, dim, (int)m->expert_ffn_dim);
         }
     }
 
@@ -235,13 +262,13 @@ static gguf_context_t* vtable_lfm25_model_get_gguf(void *model) {
 }
 
 static int32_t vtable_lfm25_model_get_bos(void *model) {
-    (void)model;
-    return 1; // Default BOS
+    const lfm25_model_t *m = (const lfm25_model_t*)model;
+    return (int32_t)tuff_gguf_get_kv_u32(m->gguf, "tokenizer.ggml.bos_token_id", 1);
 }
 
 static int32_t vtable_lfm25_model_get_eos(void *model) {
-    (void)model;
-    return 2; // Default EOS
+    const lfm25_model_t *m = (const lfm25_model_t*)model;
+    return (int32_t)tuff_gguf_get_kv_u32(m->gguf, "tokenizer.ggml.eos_token_id", 2);
 }
 
 static uint32_t vtable_lfm25_model_get_vocab_size(void *model) {

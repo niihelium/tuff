@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tests/gen_lfm25_ref.sh - Regenerate the LFM2.5 oracle reference reproducibly.
 #
-# Writes, for MODE=dense:
+# Writes, for MODE=dense (MODE=moe8 writes the same set under tests/ref_lfm25_moe8_128.*):
 #   tests/ref_lfm25_dense_128.txt          greedy token IDs (one per line)
 #   tests/ref_lfm25_dense_128.margins.txt  "<step> <top1> <top1-top2 logit margin>" per step
 #   tests/ref_lfm25_dense_128.recipe       exact command, llama.cpp commit, model checksum
@@ -20,9 +20,12 @@ LLAMA_DIR="${LLAMA_DIR:-/home/nii/workspace/llama.cpp}"
 
 if [ "$MODE" = "dense" ]; then
     MODEL_PATH="${MODEL_PATH:-/run/media/nii/pohjola/models/unsloth/LFM2.5-1.2B-Thinking-GGUF/LFM2.5-1.2B-Thinking-Q4_K_M.gguf}"
+elif [ "$MODE" = "moe8" ]; then
+    # LFM2.5-8B-A1B: 4.8 GiB, fully GPU-resident in llama.cpp too, so the same recipe applies.
+    MODEL_PATH="${MODEL_PATH:-/run/media/nii/pohjola/models/LiquidAI/LFM2.5-8B-A1B-GGUF/LFM2.5-8B-A1B-Q4_K_M.gguf}"
 else
-    echo "Only MODE=dense is supported. The MoE reference (24B, split CPU/GPU) is defined with" >&2
-    echo "its gate in Phase 3 / Task 3.2 of LFM25_ROADMAP.md." >&2
+    echo "Supported modes: dense (1.2B), moe8 (8B-A1B). The 24B MoE reference (split CPU/GPU) is" >&2
+    echo "defined with its gate in Phase 3 / Task 3.2 of LFM25_ROADMAP.md." >&2
     exit 2
 fi
 

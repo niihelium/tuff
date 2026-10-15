@@ -102,6 +102,9 @@ lfm25_model_t* lfm25_model_load(const char *gguf_filepath) {
     m->conv_kernel_size = tuff_gguf_get_kv_u32(gguf, key, 3);
     m->conv_state_len = m->conv_kernel_size > 1 ? (m->conv_kernel_size - 1) : 2;
 
+    snprintf(key, sizeof(key), "%sfeed_forward_length", pfx);
+    m->ffn_dim = tuff_gguf_get_kv_u32(gguf, key, 8192);
+
     snprintf(key, sizeof(key), "%srope.freq_base", pfx);
     m->rope_freq_base = tuff_gguf_get_kv_f32(gguf, key, 1e7f);
 
@@ -218,6 +221,19 @@ lfm25_model_t* lfm25_model_load(const char *gguf_filepath) {
             snprintf(tname, sizeof(tname), "blk.%u.ffn_down.weight", l);
             bind_tensor(gguf, &L->ffn_down, tname, true);
         }
+    }
+
+    // Cross-check the dense FFN width against the first dense layer's ffn_gate dims (tensor wins).
+    for (uint32_t l = 0; l < m->block_count; ++l) {
+        const lfm25_layer_t *L = &m->layers[l];
+        if (L->ffn_type != LFM25_FFN_DENSE) continue;
+        uint32_t td = (uint32_t)L->ffn_gate.info.dims[1];
+        if (td != m->ffn_dim) {
+            fprintf(stderr, "[LFM25] WARNING: feed_forward_length=%u but blk.%u.ffn_gate has width %u; using tensor dims\n",
+                    m->ffn_dim, l, td);
+            m->ffn_dim = td;
+        }
+        break;
     }
 
     return m;

@@ -38,6 +38,12 @@ typedef struct {
     void  *d_q8_op_out;      // block_q8_1_c for conv_out or attn_out
     void  *d_q8_ffn_act;     // block_q8_1_c for ffn_act (ffn_dim / 32)
 
+    // MoE scratch (allocated only when model->is_moe)
+    int   *d_topk_ids;       // (4) selected expert ids
+    float *d_topk_w;         // (4) normalized routing weights
+    float *d_moe_act;        // (expert_used_count * expert_ffn_dim)
+    void  *d_moe_act_q8;     // block_q8_1_c for d_moe_act (expert_used_count * expert_ffn_dim / 32)
+
     // Device argmax scratch buffers
     float *d_block_max;      // (vocab_size / 4)
     int   *d_block_idx;      // (vocab_size / 4)

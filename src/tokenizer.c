@@ -591,7 +591,19 @@ tokenizer_t* tokenizer_init(const gguf_context_t *gguf) {
     }
 
     const gguf_kv_t *add_bos_kv = tuff_gguf_get_kv(gguf, "tokenizer.ggml.add_bos_token");
-    tok->add_bos = add_bos_kv && add_bos_kv->type == GGUF_TYPE_BOOL && add_bos_kv->val.b;
+    if (add_bos_kv) {
+        tok->add_bos = add_bos_kv->type == GGUF_TYPE_BOOL && add_bos_kv->val.b;
+    } else {
+        // Key absent: llama.cpp defaults add_bos = true for the llama3 pre-tokenizer group.
+        static const char *llama3_group[] = { "llama3", "llama-v3", "llama-bpe", "falcon3", "falcon-h1",
+                                              "pixtral", "midm-2.0", "lfm2", "jina-v5-nano" };
+        const gguf_kv_t *pre_kv = tuff_gguf_get_kv(gguf, "tokenizer.ggml.pre");
+        tok->add_bos = false;
+        if (pre_kv && pre_kv->type == GGUF_TYPE_STRING) {
+            for (size_t i = 0; i < sizeof(llama3_group) / sizeof(llama3_group[0]); i++)
+                if (strcmp(pre_kv->val.str, llama3_group[i]) == 0) { tok->add_bos = true; break; }
+        }
+    }
     const gguf_kv_t *add_eos_kv = tuff_gguf_get_kv(gguf, "tokenizer.ggml.add_eos_token");
     tok->add_eos = add_eos_kv && add_eos_kv->type == GGUF_TYPE_BOOL && add_eos_kv->val.b;
 

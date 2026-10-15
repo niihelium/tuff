@@ -77,6 +77,8 @@ typedef struct {
     uint32_t conv_kernel_size;         // K = 3
     uint32_t conv_state_len;           // K - 1 = 2 past tokens
 
+    uint32_t ffn_dim;                  // dense FFN width (8192 on 1.2B, 7168 on 8B layers 0-1)
+
     // MoE params
     bool     is_moe;                   // true for 8B and 24B
     uint32_t expert_count;             // 32 (8B), 64 (24B)

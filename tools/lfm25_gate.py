@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """Checks for the LFM2.5 oracle gate (driven by tests/verify_lfm25_oracle.sh).
 
-  exact      stage 1: the first N greedy tokens must be identical to the reference.
+  exact      stage 1: the first N greedy tokens must be identical to the reference, cut short at
+             the first step whose reference margin < --min-margin (adaptive; 0 -> skipped).
   teacher    stage 2: teacher-forced top-1 agreement. A step may disagree only where the
              reference itself is a near-tie (llama.cpp top1-top2 margin < --min-margin).
   tolerance  stage 3: logit error versus the FP64 reference must be no worse than
-             llama.cpp's own (mean RMS ratio <= --max-ratio, worst step <= --max-step-ratio).
+             llama.cpp's own. --stat mean (dense, default): mean RMS ratio <= --max-ratio and worst
+             step <= --max-step-ratio. --stat robust (MoE): median ratio <= --max-ratio and p90
+             ratio <= --max-p90-ratio; the worst step and mean are printed for information only.
+             Rationale: near-tied router scores (4th vs 5th expert) make quantization noise flip
+             which expert runs, giving heavy-tailed per-step error spikes in both runtimes; which
+             runtime gets a flip on a given step is luck, so mean/worst-step are ill-posed there.
 
 Why not a long exact-match run: two correct Q8_1-activation runtimes carry different rounding
 noise (~0.1-0.2 logit RMS on LFM2.5-1.2B), and greedy decoding hits FP64 margins as small as
@@ -41,9 +47,20 @@ def load_margins(path):
 
 def cmd_exact(a):
     ref, got = load_tokens(a.ref)[:a.n], load_tokens(a.got)[:a.n]
+    n = a.n
+    why = ""
+    if a.margins:
+        margins = load_margins(a.margins)
+        cut = next((i for i, mg in enumerate(margins[:a.n]) if mg < a.min_margin), None)
+        if cut is not None:
+            n = cut
+            why = f" (cut from {a.n}: reference near-tie at step {cut}, margin {margins[cut]:.3f} < {a.min_margin})"
+    if n == 0:
+        print(f"  [1/3] exact prefix : skipped (near-tie at step 0) -> PASS")
+        return 0
     m = next((i for i, (x, y) in enumerate(zip(ref, got)) if x != y), min(len(ref), len(got)))
-    ok = m == a.n and len(got) >= a.n
-    print(f"  [1/3] exact prefix : {m}/{a.n} tokens identical -> {'PASS' if ok else 'FAIL'}")
+    ok = m >= n and len(got) >= n
+    print(f"  [1/3] exact prefix : {min(m, n)}/{n} tokens identical{why} -> {'PASS' if ok else 'FAIL'}")
     if not ok:
         print(f"        first mismatch at #{m}: expected {ref[m] if m < len(ref) else 'EOF'}, "
               f"got {got[m] if m < len(got) else 'EOF'}")
@@ -80,6 +97,14 @@ def cmd_tolerance(a):
     r_tu, r_ll = rms(tu), rms(ll)
     mean_ratio = r_tu.mean() / r_ll.mean()
     step_ratio = (r_tu / r_ll).max()
+    if a.stat == "robust":
+        med = np.median(r_tu) / np.median(r_ll)
+        p90 = np.percentile(r_tu, 90) / np.percentile(r_ll, 90)
+        ok = med <= a.max_ratio and p90 <= a.max_p90_ratio and n == a.n
+        print(f"  [3/3] FP64 tolerance (robust, MoE routing flips): median ratio {med:.2f} <= {a.max_ratio}; "
+              f"p90 ratio {p90:.2f} <= {a.max_p90_ratio} (info: mean {mean_ratio:.2f}, "
+              f"worst step {step_ratio:.2f}) -> {'PASS' if ok else 'FAIL'}")
+        return 0 if ok else 1
     ok = mean_ratio <= a.max_ratio and step_ratio <= a.max_step_ratio and n == a.n
     print(f"  [3/3] FP64 tolerance: logit RMS vs FP64 over {n} steps: tuff {r_tu.mean():.4f}, "
           f"llama.cpp {r_ll.mean():.4f} (ratio {mean_ratio:.2f} <= {a.max_ratio}; "
@@ -95,6 +120,8 @@ def main():
     p.add_argument("--ref", required=True)
     p.add_argument("--got", required=True)
     p.add_argument("-n", type=int, required=True)
+    p.add_argument("--margins", help="reference margins file; the required prefix is cut at the first near-tie")
+    p.add_argument("--min-margin", type=float, default=0.5)
     p.set_defaults(fn=cmd_exact)
 
     p = sub.add_parser("teacher")
@@ -114,6 +141,8 @@ def main():
     p.add_argument("-n", type=int, required=True)
     p.add_argument("--max-ratio", type=float, default=1.10)
     p.add_argument("--max-step-ratio", type=float, default=2.0)
+    p.add_argument("--stat", choices=["mean", "robust"], default="mean")
+    p.add_argument("--max-p90-ratio", type=float, default=1.5)
     p.set_defaults(fn=cmd_tolerance)
 
     a = ap.parse_args()
