@@ -80,3 +80,19 @@ old: float o = topk_w[0] * yk[0];\n        o = o + topk_w[1] * yk[1];\n        o
 new: float o = yk[0];\n        o = o + yk[1];\n        o = o + yk[2];\n        o = o + yk[3];
 targets: tuff lfm25-moe-ffn-test
 checks: moeffn8 golden:moe8
+
+id: cache-no-wait
+desc: MoE FFN stream no longer waits for the expert-cache uploads of the slots it reads
+file: src/lfm25_expert_cache.c
+old: if (ev != last) CUDA_CHECK(cudaStreamWaitEvent(consumer, c->ring[ev].end, 0));
+new: (void)consumer;
+targets: tuff
+checks: golden:moe8
+
+id: cache-hits-unprotected
+desc: hits of a lookup are not protected from eviction by that lookup's own misses
+file: src/lfm25_expert_cache.c
+old: slots[i] = s; c->slot_use[s] = c->tick; c->slot_prot[s] = c->tick;
+new: slots[i] = s;
+targets: tuff
+checks: golden:moe8

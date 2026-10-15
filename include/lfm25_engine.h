@@ -48,6 +48,12 @@ typedef struct {
     void  *d_moe_act_q8;     // block_q8_1_c for d_moe_act (expert_used_count * expert_ffn_dim / 32)
     int   *d_slot_ids;       // (4) expert-cache slot indices (cache path only)
     lfm25_expert_cache_t *expert_cache; // non-NULL on the cache path
+    int   *h_moe_ids;        // pinned (8): [0..3] real top-4 ids of this layer, [4..7] predicted ids of the next MoE layer
+    int   *h_slot_ids;       // pinned (4): slot indices staged for the async H2D into d_slot_ids
+    int   *d_pred_ids;       // (4) predicted next-layer ids (prefetch only; never feeds the math)
+    float *d_pred_w;         // (4) their (unused) weights
+    int    prefetch_n;       // how many of the 4 predicted experts (in router selection order) are prefetched
+    int    prefetch;         // 1 = predict + prefetch the next MoE layer's experts (LFM25_PREFETCH=1; default off)
 
     // Device argmax scratch buffers
     float *d_block_max;      // (vocab_size / 4)

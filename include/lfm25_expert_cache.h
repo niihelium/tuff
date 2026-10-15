@@ -4,6 +4,7 @@
 #include "lfm25_model.h"
 #include <stddef.h>
 #include <stdint.h>
+#include <cuda_runtime.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -21,9 +22,16 @@ lfm25_expert_cache_t* lfm25_expert_cache_create(lfm25_model_t *model);
 // Prints stats (hit rate etc.) to stderr, releases pools and host registrations.
 void lfm25_expert_cache_free(lfm25_expert_cache_t *c);
 
-// Resolve the n_ids expert ids of `layer` to slot indices, uploading missing slabs host->device
-// (asynchronously on the default stream). All hits of this call are protected from eviction.
-void lfm25_expert_cache_lookup(lfm25_expert_cache_t *c, int layer, const int *ids, int n_ids, int *slots_out);
+// Resolve the n_ids expert ids of `layer` to slot indices, uploading missing slabs host->device asynchronously on the
+// cache's own copy stream. `consumer` (the stream that will run the MoE FFN) is made to wait for the uploads of every
+// returned slot (cudaStreamWaitEvent), so the host does not block. All slots of this call are protected from eviction
+// until the next lookup. Not thread-safe.
+void lfm25_expert_cache_lookup(lfm25_expert_cache_t *c, int layer, const int *ids, int n_ids, int *slots_out, cudaStream_t consumer);
+
+// Warm the cache for the PREDICTED experts of `layer` (the next MoE layer). Call right after the lookup of the
+// previous layer, once that layer's FFN is enqueued: its slots are protected, everything else may be evicted. Purely
+// a cache-warming hint; the real lookup of `layer` stays authoritative and nothing numerical depends on it.
+void lfm25_expert_cache_prefetch(lfm25_expert_cache_t *c, int layer, const int *ids, int n_ids);
 
 void* lfm25_expert_cache_pool_gate(const lfm25_expert_cache_t *c);
 void* lfm25_expert_cache_pool_up(const lfm25_expert_cache_t *c);

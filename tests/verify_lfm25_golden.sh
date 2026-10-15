@@ -79,11 +79,13 @@ mode_setup() {
             MODEL="/run/media/nii/pohjola/models/LiquidAI/LFM2.5-8B-A1B-GGUF/LFM2.5-8B-A1B-Q4_K_M.gguf"
             REF="tests/ref_lfm25_moe8_128.txt"
             CONFIGS=("graph=1|LFM25_CUDA_GRAPH=1" "graph=0|LFM25_CUDA_GRAPH=0"
-                     "expert-cache|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=600") ;;
+                     "expert-cache|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=600"
+                     "expert-cache-tiny|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300"
+                     "expert-cache-tiny-alt|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300;LFM25_PREFETCH=1;LFM25_PINNED_EXPERTS=0;LFM25_CACHE_POLICY=lru") ;;
         moe)
             MODEL="/run/media/nii/pohjola/models/LiquidAI/LFM2.5-24B-A2B-GGUF/LFM2.5-24B-A2B-Q4_K_M.gguf"
             REF="tests/ref_lfm25_moe_128.txt"
-            CONFIGS=("graph=1|LFM25_CUDA_GRAPH=1" "graph=0|LFM25_CUDA_GRAPH=0") ;;
+            CONFIGS=("graph=1|LFM25_CUDA_GRAPH=1" "graph=0|LFM25_CUDA_GRAPH=0" "prefetch|LFM25_PREFETCH=1") ;;
     esac
 }
 

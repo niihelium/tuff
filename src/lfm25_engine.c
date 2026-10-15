@@ -103,6 +103,16 @@ lfm25_engine_t* lfm25_engine_init(lfm25_model_t *model, int max_context_len) {
     // Expert cache: created last so its default size can take all VRAM left after trunk + KV + scratch.
     if (lfm25_expert_cache_wanted(model)) {
         CUDA_CHECK(cudaMalloc((void**)&eng->d_slot_ids, 4 * sizeof(int)));
+        CUDA_CHECK(cudaMalloc((void**)&eng->d_pred_ids, 4 * sizeof(int)));
+        CUDA_CHECK(cudaMalloc((void**)&eng->d_pred_w, 4 * sizeof(float)));
+        CUDA_CHECK(cudaMallocHost((void**)&eng->h_moe_ids, 8 * sizeof(int)));
+        CUDA_CHECK(cudaMallocHost((void**)&eng->h_slot_ids, 4 * sizeof(int)));
+        const char *pf = getenv("LFM25_PREFETCH");
+        eng->prefetch = pf && pf[0] == '1';   // default OFF: measured net loss on PCIe gen3 x8 (see devlog / Task 4.3)
+        const char *pn = getenv("LFM25_PREFETCH_TOPN");
+        eng->prefetch_n = pn && *pn ? atoi(pn) : 4;
+        if (eng->prefetch_n < 1) eng->prefetch_n = 1;
+        if (eng->prefetch_n > 4) eng->prefetch_n = 4;
         eng->expert_cache = lfm25_expert_cache_create(model);
         if (!eng->expert_cache) { lfm25_engine_free(eng); return NULL; }
     }
@@ -115,6 +125,10 @@ void lfm25_engine_free(lfm25_engine_t *eng) {
 
     lfm25_expert_cache_free(eng->expert_cache);
     if (eng->d_slot_ids)   cudaFree(eng->d_slot_ids);
+    if (eng->d_pred_ids)   cudaFree(eng->d_pred_ids);
+    if (eng->d_pred_w)     cudaFree(eng->d_pred_w);
+    if (eng->h_moe_ids)    cudaFreeHost(eng->h_moe_ids);
+    if (eng->h_slot_ids)   cudaFreeHost(eng->h_slot_ids);
     if (eng->d_conv_state) cudaFree(eng->d_conv_state);
     if (eng->d_k_cache)    cudaFree(eng->d_k_cache);
     if (eng->d_v_cache)    cudaFree(eng->d_v_cache);
@@ -251,20 +265,34 @@ static void lfm25_enqueue_step(lfm25_engine_t *eng, cudaStream_t stream) {
             const size_t us0 = (size_t)m->expert_ffn_dim * ggml_row_size(L->ffn_up_exps.info.type, dim);
             const size_t ds0 = (size_t)dim * ggml_row_size(L->ffn_down_exps.info.type, m->expert_ffn_dim);
             if (eng->expert_cache) {
-                // Cache path: ids -> host (sync, baseline), look up / fill slots, run the same kernels on the slot pools.
+                // Cache path. Optionally also run the NEXT MoE layer's router on this layer's normed activations to
+                // predict its experts (selection only), fetch both id sets with one sync, then resolve slots: misses are
+                // uploaded on the cache's copy stream and the FFN stream only waits for the slots it reads.
                 lfm25_expert_cache_t *ec = eng->expert_cache;
-                int h_ids[4], h_slots[4];
-                CUDA_CHECK(cudaMemcpy(h_ids, eng->d_topk_ids, sizeof(h_ids), cudaMemcpyDeviceToHost));
-                lfm25_expert_cache_lookup(ec, (int)l, h_ids, 4, h_slots);
-                CUDA_CHECK(cudaMemcpyAsync(eng->d_slot_ids, h_slots, sizeof(h_slots), cudaMemcpyHostToDevice, stream));
-                // h_slots is a stack array: the pageable async copy is staged before returning, but sync to be safe.
+                int pred_layer = -1;
+                if (eng->prefetch && l + 1 < m->block_count && m->layers[l + 1].ffn_type == LFM25_FFN_MOE) {
+                    const lfm25_layer_t *N = &m->layers[l + 1];
+                    lfm25_gpu_router_top4(eng->d_norm_x, (const float*)N->ffn_gate_inp.dev, (const float*)N->exp_probs_b.dev,
+                                          eng->d_pred_ids, eng->d_pred_w, NULL, dim, (int)m->expert_count);
+                    pred_layer = (int)l + 1;
+                }
+                CUDA_CHECK(cudaMemcpyAsync(eng->h_moe_ids, eng->d_topk_ids, 4 * sizeof(int), cudaMemcpyDeviceToHost, stream));
+                if (pred_layer >= 0)
+                    CUDA_CHECK(cudaMemcpyAsync(eng->h_moe_ids + 4, eng->d_pred_ids, 4 * sizeof(int), cudaMemcpyDeviceToHost, stream));
                 CUDA_CHECK(cudaStreamSynchronize(stream));
+                // After this sync every kernel enqueued before this layer's router has finished; only this layer's FFN
+                // (enqueued below) can read slots while the prefetch for the next layer is in flight.
+                lfm25_expert_cache_lookup(ec, (int)l, eng->h_moe_ids, 4, eng->h_slot_ids, stream);
+                // h_slot_ids is pinned and rewritten only after the next layer's sync, i.e. after this copy completed.
+                CUDA_CHECK(cudaMemcpyAsync(eng->d_slot_ids, eng->h_slot_ids, 4 * sizeof(int), cudaMemcpyHostToDevice, stream));
                 lfm25_gpu_moe_ffn(eng->d_q8_x, eng->d_slot_ids, eng->d_topk_w, lfm25_expert_cache_pool_gate(ec),
                                   lfm25_expert_cache_pool_up(ec), lfm25_expert_cache_pool_down(ec),
                                   (int)L->ffn_down_exps.info.type, eng->d_moe_act, eng->d_moe_act_q8,
                                   eng->d_x, true, dim, (int)m->expert_ffn_dim,
                                   lfm25_expert_cache_gate_slot_bytes(ec), lfm25_expert_cache_up_slot_bytes(ec),
                                   lfm25_expert_cache_down_slot_bytes(ec));
+                // Enqueued after the FFN so host-side staging work overlaps the GPU compute.
+                if (pred_layer >= 0) lfm25_expert_cache_prefetch(ec, pred_layer, eng->h_moe_ids + 4, eng->prefetch_n);
             } else {
                 lfm25_gpu_moe_ffn(eng->d_q8_x, eng->d_topk_ids, eng->d_topk_w, L->ffn_gate_exps.dev, L->ffn_up_exps.dev,
                                   L->ffn_down_exps.dev, (int)L->ffn_down_exps.info.type, eng->d_moe_act, eng->d_moe_act_q8,
