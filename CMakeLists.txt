@@ -137,3 +137,24 @@ set_target_properties(lfm25-llama-ref PROPERTIES
     BUILD_WITH_INSTALL_RPATH TRUE
 )
 target_link_libraries(lfm25-llama-ref PRIVATE llama)
+
+# MoE router kernel test (Task 2.1): checks lfm25_gpu_router_top4 against llama.cpp fixtures.
+# Does not call lfm25_gpu_prepare; uploads only the router tensors.
+add_executable(lfm25-router-test
+    src/gguf_parser.c
+    src/cpu_ops.c
+    src/lfm25_model.c
+    src/lfm25_gpu.cu
+    tests/test_lfm25_router.cu
+)
+set_target_properties(lfm25-router-test PROPERTIES
+    COMPILE_FLAGS "${OpenMP_C_FLAGS}"
+    LINK_FLAGS "${OpenMP_C_FLAGS} -Wl,--disable-new-dtags"
+    INSTALL_RPATH "/home/nii/workspace/llama.cpp/build/bin"
+    BUILD_WITH_INSTALL_RPATH TRUE
+)
+target_compile_options(lfm25-router-test PRIVATE
+    $<$<COMPILE_LANGUAGE:C>:-g -O2 -Wall -Wextra -march=native -mfma -mavx2 -mf16c>
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3 ${TUFF_CUDA_STREAM_FLAG}>
+)
+target_link_libraries(lfm25-router-test PRIVATE CUDA::cudart OpenMP::OpenMP_C m)

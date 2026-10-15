@@ -871,3 +871,69 @@ void lfm25_gpu_shutdown(lfm25_model_t *model) {
     }
     CUDA_CHECK(cudaDeviceSynchronize());
 }
+
+// -----------------------------------------------------------------------------
+// MoE Router: sigmoid gating, bias-for-selection-only, top-4 of 32, normalized weights
+// -----------------------------------------------------------------------------
+#define LFM_ROUTER_N_EXPERT 32
+#define LFM_ROUTER_TOPK 4
+
+// One block, 32 warps. Warp e computes logit e = dot(W[e,:], x) in FP32; warp 0 then holds
+// expert e in lane e and does sigmoid, bias add, 4 rounds of warp arg-max and normalization.
+// p = sigmoid(logit) is unbiased; the bias only steers selection, weights use p alone.
+__global__ void lfm_router_top4_kernel(
+        const float * __restrict__ x, const float * __restrict__ w_gate_inp,
+        const float * __restrict__ bias, int *topk_ids, float *topk_w, float *logits_out, int dim) {
+    __shared__ float s_logit[LFM_ROUTER_N_EXPERT];
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    const float *wrow = w_gate_inp + (size_t)warp * dim;
+    float acc = 0.0f;
+    for (int i = lane; i < dim; i += 32) acc = fmaf(wrow[i], x[i], acc);
+    acc = warp_reduce_sum_f(acc);
+    if (lane == 0) s_logit[warp] = acc;
+    __syncthreads();
+
+    if (warp != 0) return;
+
+    const float logit = s_logit[lane];
+    if (logits_out) logits_out[lane] = logit;
+    const float p = 1.0f / (1.0f + expf(-logit));
+    float sel = p + bias[lane];
+
+    int   my_id = -1;
+    float my_p  = 0.0f;
+    float psum  = 0.0f;
+#pragma unroll
+    for (int k = 0; k < LFM_ROUTER_TOPK; k++) {
+        float bv = sel;
+        int   bi = lane;
+#pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            float ov = __shfl_xor_sync(0xffffffff, bv, mask, 32);
+            int   oi = __shfl_xor_sync(0xffffffff, bi, mask, 32);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        const float wp = __shfl_sync(0xffffffff, p, bi, 32);
+        if (lane == k) { my_id = bi; my_p = wp; }
+        psum += wp;
+        if (lane == bi) sel = -INFINITY;   // mark as taken
+    }
+    const float denom = fmaxf(psum, 6.103515625e-5f);
+    if (lane < LFM_ROUTER_TOPK) {
+        topk_ids[lane] = my_id;
+        topk_w[lane]   = my_p / denom;
+    }
+}
+
+void lfm25_gpu_router_top4(const float *d_x, const float *d_w_gate_inp, const float *d_bias,
+                           int *d_topk_ids, float *d_topk_w, float *d_logits,
+                           int dim, int n_expert) {
+    if (n_expert != LFM_ROUTER_N_EXPERT) {
+        fprintf(stderr, "lfm25_gpu_router_top4: n_expert=%d unsupported (only %d)\n", n_expert, LFM_ROUTER_N_EXPERT);
+        abort();
+    }
+    lfm_router_top4_kernel<<<1, 32 * LFM_ROUTER_N_EXPERT>>>(d_x, d_w_gate_inp, d_bias, d_topk_ids, d_topk_w, d_logits, dim);
+    CUDA_CHECK_LAST();
+}

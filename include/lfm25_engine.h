@@ -66,6 +66,7 @@ void lfm25_gpu_v_cache_write(const float *d_v, float *d_v_cache, int n_head_kv, 
 void lfm25_gpu_attention(const float *d_q, const float *d_k_cache, const float *d_v_cache, float *d_out, void *d_out_q8, int n_head, int n_head_kv, int head_dim, int pos, int max_seq, int layer_idx);
 void lfm25_gpu_fused_swiglu(const void *dev_gate, const void *dev_up, const void *d_xq8, float *d_act, void *d_act_q8, int in_dim, int ffn_dim);
 int32_t lfm25_gpu_output_norm_head_argmax(const float *d_res_x, const float *d_norm_w, const void *dev_output_w, void *d_xq8, float *d_logits, float *h_logits, float *d_block_max, int *d_block_idx, int *d_best_token, int dim, int vocab_size, float eps);
+void lfm25_gpu_router_top4(const float *d_x, const float *d_w_gate_inp, const float *d_bias, int *d_topk_ids, float *d_topk_w, float *d_logits /* nullable */, int dim, int n_expert);
 
 // Engine lifecycle
 lfm25_engine_t* lfm25_engine_init(lfm25_model_t *model, int max_context_len);

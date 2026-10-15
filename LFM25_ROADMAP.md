@@ -152,10 +152,14 @@ Usable VRAM: **~7,880 MiB**
 ### Phase 2: In-VRAM MoE Baseline (LFM2.5-8B-A1B)
 **Objective**: Implement top-4 routing and expert accumulation in 100% VRAM without caching noise.
 
-- [ ] **Task 2.1: Router Kernel (Top-4 over 32 Experts)**
+- [x] **Task 2.1: Router Kernel (Top-4 over 32 Experts)**
   - Implement `lfm_router_top4`:
-    * Linear projection + bias: $z = x \cdot W_{\text{gate\_inp}} + b_{\text{exp\_probs}} \in \mathbb{R}^{32}$.
-    * Warp-reduction top-4 selection and normalized softmax weights.
+    * Gating is SIGMOID (`expert_gating_func = 2`), not softmax: $p = \sigma(x \cdot W_{\text{gate\_inp}}) \in \mathbb{R}^{32}$ on the FP32 FFN-norm output.
+    * Selection score $s = p + b_{\text{exp\_probs}}$ (bias used for selection ONLY); top-4 by $s$, ties to the lower expert index.
+    * Weights are the unbiased probs, normalized: $w_k = p_{id_k} / \max(\sum_k p_{id_k}, 6.1035\text{e-}5)$, no extra scale; output in descending-$s$ order.
+    * Warp-reduction top-4 selection (single block, one warp per expert logit).
+  - Done: `lfm_router_top4_kernel` / `lfm25_gpu_router_top4` in `src/lfm25_gpu.cu`. `build/lfm25-router-test` checks it against 176 llama.cpp cases (22 MoE layers × 8 decode steps of LFM2.5-8B-A1B, `tests/fixtures/lfm25_8b_router_cases.bin`, regenerated with `tools/lfm25_router_fixtures.c` + `tools/lfm25_pack_router_fixtures.py`): 176/176 identical top-4 sets and order, max |Δw| 1.2e-7, max |Δlogit| 1.9e-6. memcheck/racecheck/synccheck clean. Negative controls caught: biased weights (0/176), missing selection bias (57/176).
+  - Known gap: the tie rule (lower index wins) is not exercised by real data and not yet confirmed against ggml's CUDA `argsort_top_k`; exact FP32 ties in `sigmoid + bias` are not expected in practice.
 - [ ] **Task 2.2: In-VRAM Expert SwiGLU & Weighted Accumulation**
   - Dispatch the 4 active experts per token directly from resident VRAM slots.
   - Accumulate weighted outputs: $x_{\text{moe}} = \sum_{k=1}^4 w_k \cdot y_k$.
