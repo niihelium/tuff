@@ -34,9 +34,23 @@ Reference Documentation:
    * **Zero Performance Tradeoff**: Exactly one indirect function call per token ($\sim 1 - 2$ ns overhead vs. a $2.5$ ms decode step, or $<0.0001\%$).
 
 3. **The Tuff Correctness Contract**:
-   * **Oracle Ground Truth**: Every stage must produce greedy token-identical continuations against `llama.cpp` up to $N = 128$ tokens (`tests/verify_lfm25_oracle.sh`).
+   * **Oracle Ground Truth**: Every stage must pass the three-stage oracle gate `tests/verify_lfm25_oracle.sh` against a reproducible `llama.cpp` reference (see *Gate Design* below).
    * **Zero Unchecked CUDA Calls**: All kernel launches, graph captures, and memory allocations are wrapped in `CUDA_CHECK` and `CUDA_CHECK_LAST()`.
    * **Strict Interleaved A/B Benchmarking**: All optimizations must be validated using `scripts/ab_interleaved.sh` (paired, order-balanced, 32 warmup + 128 timed, AC power locked via `scripts/check_power_state.sh`).
+
+### Gate Design (why not 128/128 exact match)
+
+A long greedy exact-match run is not a meaningful correctness test across runtimes. Measured on LFM2.5-1.2B Q4_K_M (prompt `Hello`):
+* tuff and llama.cpp both use Q8_1-quantized activations, but carry different rounding noise: logit RMS vs an FP64 reference is **0.094 for tuff, 0.133 for llama.cpp**.
+* The FP64 top-1/top-2 logit margin is **0.014 at step 19**, a coin flip under that noise. After the first such near-tie the streams fork and every later token is noise.
+* llama.cpp disagrees with itself: GPU vs CPU diverge at token 5, and the original reference (recipe unrecorded) could not be regenerated even at the same commit.
+
+The gate therefore has three stages, all required:
+1. **Exact prefix**: first 16 greedy tokens identical to the reference.
+2. **Teacher-forced top-1**: all 128 reference steps are fed to tuff; a disagreement is allowed only where the reference itself is a near-tie (llama.cpp margin < 0.5).
+3. **FP64 tolerance**: over 32 teacher-forced steps, tuff's logit RMS error vs an FP64 numpy reference (`tools/lfm25_fp64_ref.py`) must be ≤ 1.10× llama.cpp's own, worst step ≤ 2.0×.
+
+The reference is produced by `tests/gen_lfm25_ref.sh` (`build/lfm25-llama-ref`: libllama, all layers on GPU, single-token decode, greedy). It is byte-reproducible; the command, llama.cpp commit and model SHA-256 are recorded in `tests/ref_lfm25_dense_128.recipe`. Negative control: swapping two conv taps fails all three stages (1/16 prefix, 55 hard misses, 17.9× FP64 error).
 
 ---
 
@@ -96,9 +110,9 @@ Usable VRAM: **~7,880 MiB**
   - Identified critical Liquid AI naming quirk: final output RMSNorm is keyed as **`token_embd_norm.weight`**.
 - [x] **Task 0.2: Oracle Ground Truth Harness**
   - Generated greedy ($T=0, N=128$) reference token sequences:
-    * `tests/ref_lfm25_dense_128.txt` (from LFM2.5-1.2B)
-    * `tests/ref_lfm25_moe_128.txt` (from LFM2.5-24B-A2B)
-  - Created automated test harness `tests/verify_lfm25_oracle.sh` enforcing exact 128/128 token parity.
+    * `tests/ref_lfm25_dense_128.txt` (from LFM2.5-1.2B), **regenerated reproducibly in Phase 1** via `tests/gen_lfm25_ref.sh` with `.margins.txt` and `.recipe` alongside
+    * `tests/ref_lfm25_moe_128.txt` (from LFM2.5-24B-A2B), *legacy, recipe unknown; to be regenerated in Task 3.2*
+  - Created automated test harness `tests/verify_lfm25_oracle.sh` (now the three-stage gate, see *Gate Design*).
 - [x] **Task 0.3: Architecture VTable & Source Tree Structure**
   - Create `include/tuff_vtable.h` defining `engine_vtable_t`.
   - Create dedicated LFM headers and translation units:
@@ -111,7 +125,7 @@ Usable VRAM: **~7,880 MiB**
 ### Phase 1: Dense Baseline Implementation (LFM2.5-1.2B)
 **Objective**: Implement an un-optimized but bit-exact decode pipeline for LFM2.5-1.2B.
 
-- [ ] **Task 1.1: 1D Causal Short-Convolution Decode Kernel**
+- [x] **Task 1.1: 1D Causal Short-Convolution Decode Kernel**
   - Implement CUDA kernel `lfm_conv1d_decode`:
     * Maintain rolling state ring-buffer $S_l \in \mathbb{R}^{2 \times 2048}$ per layer.
     * In-projection splits $y_{in} \in \mathbb{R}^{6144} \to [b, c, v]$.
@@ -119,15 +133,19 @@ Usable VRAM: **~7,880 MiB**
     * Depthwise 3-tap dot product: $\text{conv\_out}[i] = S[0, i] \cdot K[0, i] + S[1, i] \cdot K[1, i] + u[i] \cdot K[2, i]$.
     * Update state: $S[0, i] \leftarrow S[1, i], S[1, i] \leftarrow u[i]$.
     * Output gating: $g = c \odot \text{conv\_out}$.
-- [ ] **Task 1.2: GQA Attention Kernel Integration**
+  - Done: `lfm_shortconv_step_kernel` in `src/lfm25_gpu.cu` (fused $u = b \odot x$, 3-tap conv, state roll, gating, Q8_1 quantization for out_proj). Layer-0 output matches llama.cpp to 2e-4 relative; dense pipeline passes the oracle gate.
+- [x] **Task 1.2: GQA Attention Kernel Integration**
   - Wire the 6 attention layers to `tuf`'s GQA attention kernel.
   - Implement per-head QK-RMSNorm (`attn_q_norm`, `attn_k_norm`, head dim 64) and RoPE ($\theta = 10^7$).
-- [ ] **Task 1.3: Dense SwiGLU FFN Kernel**
+- [x] **Task 1.3: Dense SwiGLU FFN Kernel**
   - Implement fused SwiGLU: $\text{DownProj}(\text{SiLU}(\text{GateProj}(x)) \odot \text{UpProj}(x))$.
-- [ ] **Task 1.4: Dense Pipeline Assembly & Oracle Gate 1**
+- [x] **Task 1.4: Dense Pipeline Assembly & Oracle Gate 1**
   - Assemble `lfm25_engine_forward_token()`.
   - Run `./tests/verify_lfm25_oracle.sh dense`.
-  - **Validation Gate 1**: Achieve **128/128 exact token match**; `compute-sanitizer` clean (0 errors).
+  - **Validation Gate 1**: `verify_lfm25_oracle.sh dense` passes all three stages; `compute-sanitizer` clean (0 errors).
+  - **Gate 1 passed**: 16/16 prefix, 124/128 teacher-forced (4 near-tie misses, 0 hard), FP64 error ratio 0.71; `compute-sanitizer --tool memcheck --leak-check full` 0 errors, 0 bytes leaked (found and fixed a double `cudaFree` of the tied LM head in `lfm25_gpu_shutdown`).
+  - Sanitizer runs need `cmake -S . -B build-sanitize -DTUFF_PER_THREAD_STREAM=OFF`: the distro compute-sanitizer 2024.1 (CUDA 12.4) deadlocks on kernel launch + blocking `cudaMemcpy` under `--default-stream per-thread`. A newer CUDA toolkit should remove the need.
+  - Oracle and eval runs pass `-c 1024`; tuff's default context (131072) allocates ~3.1 GiB of FP32 KV cache on the 1.2B model.
 
 ---
 
@@ -143,7 +161,7 @@ Usable VRAM: **~7,880 MiB**
   - Accumulate weighted outputs: $x_{\text{moe}} = \sum_{k=1}^4 w_k \cdot y_k$.
 - [ ] **Task 2.3: MoE Pipeline Assembly & Oracle Gate 2**
   - Assemble LFM2.5-8B-A1B decode pipeline.
-  - **Validation Gate 2**: Greedy generation exact match on 8B; benchmark un-optimized baseline speed.
+  - **Validation Gate 2**: Three-stage oracle gate on 8B (MoE FP64 reference to be added to `tools/lfm25_fp64_ref.py`); benchmark un-optimized baseline speed.
 
 ---
 
@@ -156,8 +174,8 @@ Usable VRAM: **~7,880 MiB**
   - Cache misses: AVX2 CPU worker thread pool evaluation from mmap memory or PCIe stream.
 - [ ] **Task 3.2: MoE Assembly & Oracle Gate 3**
   - Assemble full 24B decode loop.
-  - Run `./tests/verify_lfm25_oracle.sh moe`.
-  - **Validation Gate 3**: Achieve **128/128 exact token match** on LFM2.5-24B-A2B.
+  - Regenerate the MoE reference reproducibly (`tests/gen_lfm25_ref.sh moe`, needs a split CPU/GPU recipe), then run `./tests/verify_lfm25_oracle.sh moe`.
+  - **Validation Gate 3**: Three-stage oracle gate passes on LFM2.5-24B-A2B.
 
 ---
 
@@ -214,6 +232,6 @@ Before merging each iteration into `main`:
 1. [ ] **Clean Compilation**: Zero compiler warnings under `-Wall -Wextra -Werror` for C, C++, and CUDA (`sm_86`).
 2. [ ] **Memory & Pointer Safety**: Full run under `compute-sanitizer --tool memcheck` with **0 errors**.
 3. [ ] **Determinism**: 5 identical generations of $\ge 64$ tokens on fixed prompt and seed.
-4. [ ] **Oracle Verification**: Token-identical match with reference text (`tests/verify_lfm25_oracle.sh`).
+4. [ ] **Oracle Verification**: Three-stage oracle gate passes (`tests/verify_lfm25_oracle.sh`): exact prefix, margin-aware teacher-forced top-1, FP64 tolerance.
 5. [ ] **Thermal / Power State Check**: `scripts/check_power_state.sh` verified AC connected and GPU clocks locked at 6001 MHz VRAM.
 6. [ ] **Paired A/B Measurement**: Interleaved runs via `scripts/ab_interleaved.sh` confirming statistically significant speedup without regressions.

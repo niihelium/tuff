@@ -47,6 +47,8 @@ static void print_usage(const char *prog) {
         "  --bench-dense-batch         time dense Q8_0 projections\n"
         "  --dump-tokens               oracle mode: print token IDs to stdout\n"
         "  --dump-logits <path>        numeric-gate mode: dump final logit vectors\n"
+        "  --teacher-force <file>      feed reference token IDs, report per-step top-1 agreement\n"
+        "                              (with --dump-logits: also dump every step's logits)\n"
         "\n"
         "Environment:\n"
         "  TUFF_KV_QUANT=<mode>     KV cache quant: f32, q8_0 (default), q4_0\n"
@@ -505,31 +507,62 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[Tuff] --teacher-force: testing %d steps against %s\n",
                 target_steps, teacher_force_path);
 
+        // With --dump-logits, the teacher-forced pass also writes the logit vector of every
+        // step (same CLBRLGT1 format as the free-running dump). Because every step is fed the
+        // reference token, vector i lines up 1:1 with reference token i, so the dump can be
+        // compared numerically against llama.cpp / an FP64 reference past the first divergence.
+        FILE *tf_dump = NULL;
+        uint32_t tf_vocab = vtable->model_get_vocab_size(model);
+        uint32_t tf_written = 0;
+        if (dump_logits_path) {
+            tf_dump = fopen(dump_logits_path, "wb");
+            uint32_t zero = 0;
+            if (!tf_dump || fwrite("CLBRLGT1", 1, 8, tf_dump) != 8 ||
+                fwrite(&zero, sizeof(uint32_t), 1, tf_dump) != 1 ||
+                fwrite(&tf_vocab, sizeof(uint32_t), 1, tf_dump) != 1) {
+                fprintf(stderr, "[Tuff] FATAL: cannot write %s\n", dump_logits_path);
+                if (tf_dump) fclose(tf_dump);
+                tokenizer_free(tok);
+                vtable->gpu_shutdown(model);
+                vtable->model_free(model);
+                return 3;
+            }
+        }
+
         void *eng = vtable->engine_init(model, max_context_len);
         vtable->engine_set_sampler(eng, &sampler_params);
+
+        // Armed before the prompt so the vector that selected step 0 is captured too.
+        tuff_logit_capture_enable(1);
         int pos = 0;
         int32_t pred_token = prompt_tokens[0];
         for (int i = 0; i < n_prompt; ++i) {
             pred_token = vtable->engine_forward_token(eng, prompt_tokens[i], pos++);
         }
 
-        tuff_logit_capture_enable(1);
-
         int matches = 0;
         int first_divergence = -1;
+        int dump_ok = 1;
         for (int i = 0; i < target_steps; ++i) {
             int32_t expected = ref_tokens[i];
+            uint32_t vn = 0;
+            const float *lg = tuff_logit_capture_take(&vn);
+            if (tf_dump && dump_ok) {
+                if (!lg || vn != tf_vocab || fwrite(lg, sizeof(float), vn, tf_dump) != vn) dump_ok = 0;
+                else tf_written++;
+            }
             int match = (pred_token == expected);
             if (match) {
                 matches++;
             } else {
                 if (first_divergence < 0) first_divergence = i;
-                uint32_t vn = 0;
-                const float *lg = tuff_logit_capture_take(&vn);
                 float exp_logit = (lg && expected < (int32_t)vn) ? lg[expected] : 0.0f;
                 float got_logit = (lg && pred_token < (int32_t)vn) ? lg[pred_token] : 0.0f;
+                // tokenizer_decode returns a shared buffer: copy the first piece before the second call.
+                char exp_piece[128];
+                snprintf(exp_piece, sizeof exp_piece, "%s", tokenizer_decode(tok, expected));
                 fprintf(stderr, "[TEACHER-FORCING] Mismatch at step %d: expected %d (%s, logit=%.4f), got %d (%s, logit=%.4f), diff=%.6f\n",
-                        i, expected, tokenizer_decode(tok, expected), exp_logit,
+                        i, expected, exp_piece, exp_logit,
                         pred_token, tokenizer_decode(tok, pred_token), got_logit,
                         got_logit - exp_logit);
             }
@@ -537,6 +570,24 @@ int main(int argc, char **argv) {
             pred_token = vtable->engine_forward_token(eng, expected, pos++);
         }
         tuff_logit_capture_enable(0);
+
+        if (tf_dump) {
+            if (dump_ok && (fseek(tf_dump, 8, SEEK_SET) != 0 ||
+                            fwrite(&tf_written, sizeof(uint32_t), 1, tf_dump) != 1)) dump_ok = 0;
+            if (fclose(tf_dump) != 0) dump_ok = 0;
+            if (!dump_ok) {
+                fprintf(stderr, "[Tuff] FATAL: failed writing teacher-forced logits to %s; removing it\n",
+                        dump_logits_path);
+                remove(dump_logits_path);
+                vtable->engine_free(eng);
+                tokenizer_free(tok);
+                vtable->gpu_shutdown(model);
+                vtable->model_free(model);
+                return 3;
+            }
+            fprintf(stderr, "[Tuff] wrote %u x %u teacher-forced logits to %s\n",
+                    tf_written, tf_vocab, dump_logits_path);
+        }
 
         fprintf(stderr, "\n========================================================================\n");
         fprintf(stderr, " Teacher-Forced Verification Result: %d / %d (%.2f%%) top-1 agreement\n",

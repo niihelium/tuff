@@ -3,3 +3,5 @@ build/
 *.d
 *.log
 test_chat.md
+build-sanitize/
+__pycache__/

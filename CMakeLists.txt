@@ -11,6 +11,18 @@ set(CMAKE_CUDA_STANDARD 17)
 # "__dp4a is undefined" errors that look like a broken kernel port but are a build-config bug.
 set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING "CUDA architectures to build for" FORCE)
 
+# compute-sanitizer 2024.1 (distro CUDA 12.4) deadlocks when a kernel launch is followed by a
+# blocking cudaMemcpy under --default-stream per-thread (reproduced with a 10-line program on
+# driver 595.99). For memcheck runs, configure a separate tree with
+#   cmake -S . -B build-sanitize -DTUFF_PER_THREAD_STREAM=OFF
+# The LFM2.5 path is single-threaded on stream 0, so legacy-stream semantics are equivalent there.
+option(TUFF_PER_THREAD_STREAM "Compile CUDA with --default-stream per-thread" ON)
+if(TUFF_PER_THREAD_STREAM)
+    set(TUFF_CUDA_STREAM_FLAG --default-stream per-thread)
+else()
+    set(TUFF_CUDA_STREAM_FLAG --default-stream legacy)
+endif()
+
 include_directories(include /home/nii/workspace/llama.cpp/include /home/nii/workspace/llama.cpp/ggml/include)
 link_directories(/home/nii/workspace/llama.cpp/build/bin)
 
@@ -45,7 +57,7 @@ set_target_properties(tuff PROPERTIES
 
 target_compile_options(tuff PRIVATE
     $<$<COMPILE_LANGUAGE:C>:-g -O2 -Wall -Wextra -march=native -mfma -mavx2 -mf16c>
-    $<$<COMPILE_LANGUAGE:CUDA>:-O3 --default-stream per-thread>
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3 ${TUFF_CUDA_STREAM_FLAG}>
 )
 
 # Iteration-48 item 5: the AVX2 int8 expert kernels in cpu_ops.c run at -O2 while the CUDA side
@@ -80,7 +92,7 @@ set_target_properties(tuff-server PROPERTIES
 
 target_compile_options(tuff-server PRIVATE
     $<$<COMPILE_LANGUAGE:C>:-g -O2 -Wall -Wextra -march=native -mfma -mavx2 -mf16c>
-    $<$<COMPILE_LANGUAGE:CUDA>:-O3 --default-stream per-thread>
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3 ${TUFF_CUDA_STREAM_FLAG}>
 )
 
 target_link_libraries(tuff-server PRIVATE CUDA::cudart CUDA::cuda_driver OpenMP::OpenMP_C Threads::Threads llama ggml ggml-cpu ggml-base m)
@@ -111,6 +123,17 @@ add_executable(microbench-gpu
 )
 target_compile_options(microbench-gpu PRIVATE
     $<$<COMPILE_LANGUAGE:C>:-g -O2 -Wall -Wextra -march=native -mfma -mavx2 -mf16c>
-    $<$<COMPILE_LANGUAGE:CUDA>:-O3 --default-stream per-thread>
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3 ${TUFF_CUDA_STREAM_FLAG}>
 )
 target_link_libraries(microbench-gpu PRIVATE CUDA::cudart CUDA::cuda_driver CUDA::cupti OpenMP::OpenMP_C llama ggml ggml-cpu ggml-base m)
+
+# LFM2.5 oracle: reproducible llama.cpp reference generator (tests/gen_lfm25_ref.sh,
+# tests/verify_lfm25_oracle.sh). Single-token decode on GPU, mirroring tuff's decode path.
+add_executable(lfm25-llama-ref tools/lfm25_llama_ref.c)
+target_compile_options(lfm25-llama-ref PRIVATE -g -O2 -Wall -Wextra -Werror)
+set_target_properties(lfm25-llama-ref PROPERTIES
+    LINK_FLAGS "-Wl,--disable-new-dtags"
+    INSTALL_RPATH "/home/nii/workspace/llama.cpp/build/bin"
+    BUILD_WITH_INSTALL_RPATH TRUE
+)
+target_link_libraries(lfm25-llama-ref PRIVATE llama)
