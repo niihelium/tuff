@@ -180,6 +180,7 @@ Usable VRAM: **~7,880 MiB**
 **Objective**: Scale MoE routing to 64 experts with host mmap fallback and VRAM caching.
 
 - [ ] **Task 3.1: 64-Expert LFRU VRAM Cache**
+  - Status: 3.1a done (router 32/64 experts, strided expert FFN kernels, tests incl. slot-pool mode); 3.1b (expert cache) pending.
   - Allocate ~6,200 MiB VRAM for expert cache slots (holding ~47% of all expert slices).
   - Cache hits: GPU mmvq dispatch.
   - Cache misses: AVX2 CPU worker thread pool evaluation from mmap memory or PCIe stream.

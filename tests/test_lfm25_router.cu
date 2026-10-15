@@ -25,7 +25,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "bad fixture header/magic\n"); return 2;
     }
     const uint32_t n_cases = hdr[0], dim = hdr[1], n_expert = hdr[2], K = hdr[3];
-    if (dim != 2048 || n_expert != 32 || K != 4) {
+    if (dim != 2048 || (n_expert != 32 && n_expert != 64) || K != 4) {
         fprintf(stderr, "unexpected fixture dims: dim=%u n_expert=%u k=%u\n", dim, n_expert, K); return 2;
     }
 

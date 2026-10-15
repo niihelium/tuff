@@ -13,9 +13,15 @@
 //   --logits-out  raw float32 [n x vocab] logits, step i = the vector that selected token i
 //   stderr        "prompt tokens (N): ..." so the gate can check tuff tokenized identically
 //
+// --cpu-experts keeps the MoE expert tensors (ffn_{gate,up,down}_exps) in host memory and runs them
+// on llama.cpp's CPU backend while everything else stays on the GPU -- the only way the 24B model
+// fits an 8 GB card. CPU expert matmuls use different activation quantization than CUDA, so this is
+// a different (equally valid) reference stream; the gate's FP64 stage judges both runtimes alike.
+//
 // With --teacher <file>, step i is fed token i of <file> instead of the argmax (logits/margins
 // then describe llama.cpp's view of that fixed stream).
 #include "llama.h"
+#include "ggml-backend.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,15 +30,16 @@ static void usage(void) {
     fprintf(stderr,
         "usage: lfm25-llama-ref --model <gguf> [--prompt <text>] [-n <steps>] [--ngl <layers>]\n"
         "                       [--teacher <tokens.txt>] [--tokens-out <f>] [--margins-out <f>]\n"
-        "                       [--logits-out <f>]\n");
+        "                       [--logits-out <f>] [--cpu-experts]\n");
 }
 
 int main(int argc, char **argv) {
     const char *model_path = NULL, *prompt = "Hello", *teacher = NULL;
     const char *tok_out = NULL, *margin_out = NULL, *logit_out = NULL;
-    int n = 128, ngl = 99;
+    int n = 128, ngl = 99, cpu_experts = 0;
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
+        if (!strcmp(a, "--cpu-experts")) { cpu_experts = 1; continue; }
         const char *v = (i + 1 < argc) ? argv[i + 1] : NULL;
         if (!v) { usage(); return 2; }
         if      (!strcmp(a, "--model"))       model_path = v;
@@ -62,6 +69,12 @@ int main(int argc, char **argv) {
     llama_backend_init();
     struct llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = ngl;
+    struct llama_model_tensor_buft_override ovr[2] = {{NULL, NULL}, {NULL, NULL}};
+    if (cpu_experts) {
+        ovr[0].pattern = "ffn_(up|down|gate)_exps";
+        ovr[0].buft = ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+        mp.tensor_buft_overrides = ovr;
+    }
     struct llama_model *model = llama_model_load_from_file(model_path, mp);
     if (!model) { fprintf(stderr, "failed to load %s\n", model_path); return 1; }
     const struct llama_vocab *vocab = llama_model_get_vocab(model);

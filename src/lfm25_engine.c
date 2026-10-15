@@ -3,6 +3,7 @@
 #include "tuff_vtable.h"
 #include "tuff_exact.h"
 #include "cuda_check.h"
+#include "ggml_types.h"
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,11 +11,15 @@
 
 lfm25_engine_t* lfm25_engine_init(lfm25_model_t *model, int max_context_len) {
     if (!model) return NULL;
-    // The router / expert kernels are compiled for 32 experts, top-4 (LFM2.5-8B-A1B). The 24B (64 experts)
-    // needs the Phase 3 kernels; fail at load instead of inside the first forward pass.
-    if (model->is_moe && (model->expert_count != 32 || model->expert_used_count != 4)) {
-        fprintf(stderr, "[LFM25] ERROR: MoE with %u experts / top-%u is not supported yet (only 32 / top-4)\n",
+    // Router / expert kernels support 32 or 64 experts, top-4. The 64-expert model (LFM2.5-24B-A2B) additionally
+    // needs the VRAM expert cache (Task 3.1b) because its experts do not fit in VRAM.
+    if (model->is_moe && ((model->expert_count != 32 && model->expert_count != 64) || model->expert_used_count != 4)) {
+        fprintf(stderr, "[LFM25] ERROR: MoE with %u experts / top-%u is not supported (only 32 or 64 / top-4)\n",
                 model->expert_count, model->expert_used_count);
+        return NULL;
+    }
+    if (model->is_moe && model->expert_count == 64) {
+        fprintf(stderr, "[LFM25] ERROR: MoE with 64 experts requires the VRAM expert cache (Task 3.1b), not implemented yet\n");
         return NULL;
     }
     lfm25_engine_t *eng = (lfm25_engine_t*)calloc(1, sizeof(lfm25_engine_t));
@@ -223,7 +228,10 @@ int32_t lfm25_engine_forward_token(lfm25_engine_t *eng, int32_t token, int pos) 
                                   eng->d_topk_ids, eng->d_topk_w, NULL, dim, (int)m->expert_count);
             lfm25_gpu_moe_ffn(eng->d_q8_x, eng->d_topk_ids, eng->d_topk_w, L->ffn_gate_exps.dev, L->ffn_up_exps.dev,
                               L->ffn_down_exps.dev, (int)L->ffn_down_exps.info.type, eng->d_moe_act, eng->d_moe_act_q8,
-                              eng->d_x, true, dim, (int)m->expert_ffn_dim);
+                              eng->d_x, true, dim, (int)m->expert_ffn_dim,
+                              (size_t)m->expert_ffn_dim * ggml_row_size(L->ffn_gate_exps.info.type, dim),
+                              (size_t)m->expert_ffn_dim * ggml_row_size(L->ffn_up_exps.info.type, dim),
+                              (size_t)dim * ggml_row_size(L->ffn_down_exps.info.type, m->expert_ffn_dim));
         }
     }
 

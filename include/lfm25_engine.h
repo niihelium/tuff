@@ -4,6 +4,7 @@
 #include "lfm25_model.h"
 #include "sampler.h"
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -74,7 +75,7 @@ void lfm25_gpu_fused_swiglu(const void *dev_gate, const void *dev_up, const void
 int32_t lfm25_gpu_output_norm_head_argmax(const float *d_res_x, const float *d_norm_w, const void *dev_output_w, void *d_xq8, float *d_logits, float *h_logits, float *d_block_max, int *d_block_idx, int *d_best_token, int dim, int vocab_size, float eps);
 void lfm25_gpu_router_top4(const float *d_x, const float *d_w_gate_inp, const float *d_bias, int *d_topk_ids, float *d_topk_w, float *d_logits /* nullable */, int dim, int n_expert);
 void lfm25_gpu_quantize_q8_1(const float *d_x, void *d_q8, int n);
-void lfm25_gpu_moe_ffn(const void *d_xq8, const int *d_topk_ids, const float *d_topk_w, const void *dev_gate_exps, const void *dev_up_exps, const void *dev_down_exps, int down_type, float *d_act /* [4*ffn_dim] */, void *d_act_q8 /* [4*ffn_dim/32] block_q8_1 */, float *d_dst, bool accum, int dim, int ffn_dim);
+void lfm25_gpu_moe_ffn(const void *d_xq8, const int *d_topk_ids, const float *d_topk_w, const void *dev_gate_exps, const void *dev_up_exps, const void *dev_down_exps, int down_type, float *d_act /* [4*ffn_dim] */, void *d_act_q8 /* [4*ffn_dim/32] block_q8_1 */, float *d_dst, bool accum, int dim, int ffn_dim, size_t gate_stride, size_t up_stride, size_t down_stride /* bytes per expert / slot */);
 
 // Engine lifecycle
 lfm25_engine_t* lfm25_engine_init(lfm25_model_t *model, int max_context_len);

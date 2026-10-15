@@ -873,52 +873,72 @@ void lfm25_gpu_shutdown(lfm25_model_t *model) {
 }
 
 // -----------------------------------------------------------------------------
-// MoE Router: sigmoid gating, bias-for-selection-only, top-4 of 32, normalized weights
+// MoE Router: sigmoid gating, bias-for-selection-only, top-4 of 32 or 64, normalized weights
 // -----------------------------------------------------------------------------
-#define LFM_ROUTER_N_EXPERT 32
 #define LFM_ROUTER_TOPK 4
 
-// One block, 32 warps. Warp e computes logit e = dot(W[e,:], x) in FP32; warp 0 then holds
-// expert e in lane e and does sigmoid, bias add, 4 rounds of warp arg-max and normalization.
+// One block, 32 warps. Warp w computes logits w and (for 64 experts) w+32 in FP32; warp 0 then holds
+// experts lane and lane+32 and does sigmoid, bias add, 4 rounds of warp arg-max and normalization.
 // p = sigmoid(logit) is unbiased; the bias only steers selection, weights use p alone.
+// Ties -> lower expert index.
+template <int NE>
 __global__ void lfm_router_top4_kernel(
         const float * __restrict__ x, const float * __restrict__ w_gate_inp,
         const float * __restrict__ bias, int *topk_ids, float *topk_w, float *logits_out, int dim) {
-    __shared__ float s_logit[LFM_ROUTER_N_EXPERT];
+    constexpr int NC = NE / 32;   // candidates per lane
+    __shared__ float s_logit[NE];
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
 
-    const float *wrow = w_gate_inp + (size_t)warp * dim;
-    float acc = 0.0f;
-    for (int i = lane; i < dim; i += 32) acc = fmaf(wrow[i], x[i], acc);
-    acc = warp_reduce_sum_f(acc);
-    if (lane == 0) s_logit[warp] = acc;
+#pragma unroll
+    for (int c = 0; c < NC; c++) {
+        const int e = warp + 32 * c;
+        const float *wrow = w_gate_inp + (size_t)e * dim;
+        float acc = 0.0f;
+        for (int i = lane; i < dim; i += 32) acc = fmaf(wrow[i], x[i], acc);
+        acc = warp_reduce_sum_f(acc);
+        if (lane == 0) s_logit[e] = acc;
+    }
     __syncthreads();
 
     if (warp != 0) return;
 
-    const float logit = s_logit[lane];
-    if (logits_out) logits_out[lane] = logit;
-    const float p = 1.0f / (1.0f + expf(-logit));
-    float sel = p + bias[lane];
+    float p[NC], sel[NC];
+#pragma unroll
+    for (int c = 0; c < NC; c++) {
+        const float logit = s_logit[lane + 32 * c];
+        if (logits_out) logits_out[lane + 32 * c] = logit;
+        p[c] = 1.0f / (1.0f + expf(-logit));
+        sel[c] = p[c] + bias[lane + 32 * c];
+    }
 
     int   my_id = -1;
     float my_p  = 0.0f;
     float psum  = 0.0f;
 #pragma unroll
     for (int k = 0; k < LFM_ROUTER_TOPK; k++) {
-        float bv = sel;
+        float bv = sel[0];
         int   bi = lane;
+#pragma unroll
+        for (int c = 1; c < NC; c++) {
+            if (sel[c] > bv) { bv = sel[c]; bi = lane + 32 * c; }
+        }
 #pragma unroll
         for (int mask = 16; mask > 0; mask >>= 1) {
             float ov = __shfl_xor_sync(0xffffffff, bv, mask, 32);
             int   oi = __shfl_xor_sync(0xffffffff, bi, mask, 32);
             if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
         }
-        const float wp = __shfl_sync(0xffffffff, p, bi, 32);
+        float wp = __shfl_sync(0xffffffff, p[0], bi & 31, 32);
+#pragma unroll
+        for (int c = 1; c < NC; c++) {
+            const float wc = __shfl_sync(0xffffffff, p[c], bi & 31, 32);
+            if ((bi >> 5) == c) wp = wc;
+        }
         if (lane == k) { my_id = bi; my_p = wp; }
         psum += wp;
-        if (lane == bi) sel = -INFINITY;   // mark as taken
+#pragma unroll
+        for (int c = 0; c < NC; c++) if (bi == lane + 32 * c) sel[c] = -INFINITY;   // mark as taken
     }
     const float denom = fmaxf(psum, 6.103515625e-5f);
     if (lane < LFM_ROUTER_TOPK) {
@@ -930,11 +950,14 @@ __global__ void lfm_router_top4_kernel(
 void lfm25_gpu_router_top4(const float *d_x, const float *d_w_gate_inp, const float *d_bias,
                            int *d_topk_ids, float *d_topk_w, float *d_logits,
                            int dim, int n_expert) {
-    if (n_expert != LFM_ROUTER_N_EXPERT) {
-        fprintf(stderr, "lfm25_gpu_router_top4: n_expert=%d unsupported (only %d)\n", n_expert, LFM_ROUTER_N_EXPERT);
+    if (n_expert == 32) {
+        lfm_router_top4_kernel<32><<<1, 1024>>>(d_x, d_w_gate_inp, d_bias, d_topk_ids, d_topk_w, d_logits, dim);
+    } else if (n_expert == 64) {
+        lfm_router_top4_kernel<64><<<1, 1024>>>(d_x, d_w_gate_inp, d_bias, d_topk_ids, d_topk_w, d_logits, dim);
+    } else {
+        fprintf(stderr, "lfm25_gpu_router_top4: n_expert=%d unsupported (only 32 or 64)\n", n_expert);
         abort();
     }
-    lfm_router_top4_kernel<<<1, 32 * LFM_ROUTER_N_EXPERT>>>(d_x, d_w_gate_inp, d_bias, d_topk_ids, d_topk_w, d_logits, dim);
     CUDA_CHECK_LAST();
 }
 
@@ -947,7 +970,7 @@ void lfm25_gpu_quantize_q8_1(const float *d_x, void *d_q8, int n) {
 }
 
 // grid (ceil(ffn_dim/rows), 4): blockIdx.y = k selects expert topk_ids[k] (read on device).
-// Expert e starts at e * ffn_dim * nblk blocks. Writes act[k * ffn_dim + row].
+// Expert e starts at e * gate_stride / up_stride bytes. Writes act[k * ffn_dim + row].
 template <int rows_per_block>
 __launch_bounds__(rows_per_block * 32, 1)
 __global__ void lfm_moe_gate_up_swiglu_q4_K_kernel(
@@ -956,7 +979,7 @@ __global__ void lfm_moe_gate_up_swiglu_q4_K_kernel(
         const block_q8_1_c * __restrict__ y,
         const int * __restrict__ topk_ids,
         float * __restrict__ d_act,
-        int ffn_dim, int nblk) {
+        int ffn_dim, int nblk, size_t gate_stride, size_t up_stride) {
     constexpr int vdr = VDR_Q4_K_Q8_1_MMVQ;
     constexpr int tpsb = QI4_K / vdr;
     constexpr int blocks_per_iter = vdr * 32 / QI4_K;
@@ -964,9 +987,10 @@ __global__ void lfm_moe_gate_up_swiglu_q4_K_kernel(
     const int row = blockIdx.x * rows_per_block + threadIdx.y;
     if (row >= ffn_dim) return;
     const int k = blockIdx.y;
-    const size_t eoff = ((size_t)topk_ids[k] * ffn_dim + row) * nblk;
-    const block_q4_K * __restrict__ rwg = wg + eoff;
-    const block_q4_K * __restrict__ rwu = wu + eoff;
+    const size_t roff = (size_t)row * nblk;
+    const size_t eid = (size_t)topk_ids[k];
+    const block_q4_K * __restrict__ rwg = (const block_q4_K*)((const char*)wg + eid * gate_stride) + roff;
+    const block_q4_K * __restrict__ rwu = (const block_q4_K*)((const char*)wu + eid * up_stride) + roff;
 
     const int kqs = vdr * (threadIdx.x % tpsb);
     float tg = 0.0f;
@@ -1012,7 +1036,7 @@ __global__ void lfm_moe_down_kernel(
         const int * __restrict__ topk_ids,
         const float * __restrict__ topk_w,
         float * __restrict__ dst,
-        int out_dim, int nblk) {
+        int out_dim, int nblk, size_t down_stride) {
     constexpr int vdr = lfm_moe_down_traits<block_t>::vdr;
     constexpr int tpsb = lfm_moe_down_traits<block_t>::qi / vdr;
     constexpr int blocks_per_iter = vdr * 32 / lfm_moe_down_traits<block_t>::qi;
@@ -1024,7 +1048,7 @@ __global__ void lfm_moe_down_kernel(
     float yk[LFM_ROUTER_TOPK];
 #pragma unroll
     for (int k = 0; k < LFM_ROUTER_TOPK; k++) {
-        const block_t * __restrict__ rw = w + ((size_t)topk_ids[k] * out_dim + row) * nblk;
+        const block_t * __restrict__ rw = (const block_t*)((const char*)w + (size_t)topk_ids[k] * down_stride) + (size_t)row * nblk;
         const block_q8_1_c *yk8 = y + (size_t)k * nblk * (QK_K / QK8_1);
         float tmp = 0.0f;
         for (int kbx = threadIdx.x / tpsb; kbx < nblk; kbx += blocks_per_iter) {
@@ -1046,7 +1070,8 @@ void lfm25_gpu_moe_ffn(const void *d_xq8, const int *d_topk_ids, const float *d_
                        const void *dev_gate_exps, const void *dev_up_exps,
                        const void *dev_down_exps, int down_type,
                        float *d_act, void *d_act_q8,
-                       float *d_dst, bool accum, int dim, int ffn_dim) {
+                       float *d_dst, bool accum, int dim, int ffn_dim,
+                       size_t gate_stride, size_t up_stride, size_t down_stride) {
     if (down_type != GGML_TYPE_Q4_K && down_type != GGML_TYPE_Q6_K) {
         fprintf(stderr, "lfm25_gpu_moe_ffn: unsupported down_type=%d (only Q4_K/Q6_K)\n", down_type);
         abort();
@@ -1062,7 +1087,7 @@ void lfm25_gpu_moe_ffn(const void *d_xq8, const int *d_topk_ids, const float *d_
     dim3 grid_gu((unsigned)((ffn_dim + MMVQ_ROWS_PER_BLOCK - 1) / MMVQ_ROWS_PER_BLOCK), (unsigned)LFM_ROUTER_TOPK, 1u);
     lfm_moe_gate_up_swiglu_q4_K_kernel<MMVQ_ROWS_PER_BLOCK><<<grid_gu, block>>>(
         (const block_q4_K*)dev_gate_exps, (const block_q4_K*)dev_up_exps, (const block_q8_1_c*)d_xq8,
-        d_topk_ids, d_act, ffn_dim, nblk_in);
+        d_topk_ids, d_act, ffn_dim, nblk_in, gate_stride, up_stride);
     CUDA_CHECK_LAST();
 
     lfm25_gpu_quantize_q8_1(d_act, d_act_q8, LFM_ROUTER_TOPK * ffn_dim);
@@ -1071,7 +1096,7 @@ void lfm25_gpu_moe_ffn(const void *d_xq8, const int *d_topk_ids, const float *d_
     const block_q8_1_c *yq = (const block_q8_1_c*)d_act_q8;
 #define LFM_MOE_DOWN_LAUNCH(BT, ACC) \
     lfm_moe_down_kernel<BT, MMVQ_ROWS_PER_BLOCK, ACC><<<grid_dn, block>>>( \
-        (const BT*)dev_down_exps, yq, d_topk_ids, d_topk_w, d_dst, dim, nblk_down)
+        (const BT*)dev_down_exps, yq, d_topk_ids, d_topk_w, d_dst, dim, nblk_down, down_stride)
     if (down_type == GGML_TYPE_Q4_K) {
         if (accum) LFM_MOE_DOWN_LAUNCH(block_q4_K, true);
         else       LFM_MOE_DOWN_LAUNCH(block_q4_K, false);

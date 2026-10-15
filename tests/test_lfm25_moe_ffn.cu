@@ -10,6 +10,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <vector>
+#include <algorithm>
 
 // Link stub: cpu_ops.c references tuff_exact(), which normally lives in main.c.
 extern "C" int tuff_exact(void) { return 0; }
@@ -36,7 +37,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "bad fixture header/magic\n"); return 2;
     }
     const uint32_t n_cases = hdr[0], dim = hdr[1], ffn = hdr[2], K = hdr[3];
-    if (dim != 2048 || ffn != 1792 || K != 4) {
+    if (dim != 2048 || (ffn != 1792 && ffn != 1536) || K != 4) {
         fprintf(stderr, "unexpected fixture dims: dim=%u ffn_dim=%u k=%u\n", dim, ffn, K); return 2;
     }
 
@@ -45,8 +46,26 @@ int main(int argc, char **argv) {
     if (model->embedding_length != dim || model->expert_ffn_dim != ffn) {
         fprintf(stderr, "model/fixture mismatch: dim=%u expert_ffn_dim=%u\n", model->embedding_length, model->expert_ffn_dim); return 2;
     }
+    const bool pool_mode = model->expert_count > 32;
     int ctx = 256;
     if (lfm25_gpu_prepare(model, &ctx, 0) != 0) { fprintf(stderr, "lfm25_gpu_prepare failed\n"); return 2; }
+
+    // Pool mode (64 experts): 4 slots each for gate / up / down; down slot sized for the larger of Q4_K/Q6_K.
+    auto row_b = [](const lfm25_tensor_t &t, int64_t n) { return ggml_row_size((ggml_type_t)t.info.type, n); };
+    size_t gate_slot = 0, up_slot = 0, down_slot = 0;
+    char *d_pg = nullptr, *d_pu = nullptr, *d_pd = nullptr;
+    if (pool_mode) {
+        for (uint32_t l = 0; l < model->block_count; l++) {
+            const lfm25_layer_t *L = &model->layers[l];
+            if (L->ffn_type != LFM25_FFN_MOE) continue;
+            gate_slot = std::max(gate_slot, (size_t)ffn * row_b(L->ffn_gate_exps, dim));
+            up_slot   = std::max(up_slot,   (size_t)ffn * row_b(L->ffn_up_exps, dim));
+            down_slot = std::max(down_slot, (size_t)dim * row_b(L->ffn_down_exps, ffn));
+        }
+        CUDA_CHECK(cudaMalloc(&d_pg, 4 * gate_slot));
+        CUDA_CHECK(cudaMalloc(&d_pu, 4 * up_slot));
+        CUDA_CHECK(cudaMalloc(&d_pd, 4 * down_slot));
+    }
 
     float *d_x, *d_act, *d_dst, *d_tw; int *d_ids; void *d_xq8, *d_actq8;
     CUDA_CHECK(cudaMalloc(&d_x, dim * 4));
@@ -81,8 +100,28 @@ int main(int argc, char **argv) {
         CUDA_CHECK(cudaMemcpy(d_ids, idref, K * 4, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_tw, wref.data(), K * 4, cudaMemcpyHostToDevice));
         lfm25_gpu_quantize_q8_1(d_x, d_xq8, (int)dim);
-        lfm25_gpu_moe_ffn(d_xq8, d_ids, d_tw, L->ffn_gate_exps.dev, L->ffn_up_exps.dev, L->ffn_down_exps.dev,
-                          down_type, d_act, d_actq8, d_dst, false, (int)dim, (int)ffn);
+        const void *g_ptr, *u_ptr, *d_ptr; size_t gs, us, ds; const int *ids_used = d_ids;
+        if (!pool_mode) {
+            g_ptr = L->ffn_gate_exps.dev; u_ptr = L->ffn_up_exps.dev; d_ptr = L->ffn_down_exps.dev;
+            gs = (size_t)ffn * row_b(L->ffn_gate_exps, dim);
+            us = (size_t)ffn * row_b(L->ffn_up_exps, dim);
+            ds = (size_t)dim * row_b(L->ffn_down_exps, ffn);
+        } else {
+            const size_t gb = (size_t)ffn * row_b(L->ffn_gate_exps, dim);
+            const size_t ub = (size_t)ffn * row_b(L->ffn_up_exps, dim);
+            const size_t db = (size_t)dim * row_b(L->ffn_down_exps, ffn);
+            for (int k = 0; k < 4; k++) {
+                const size_t e = (size_t)idref[k];
+                CUDA_CHECK(cudaMemcpy(d_pg + k * gate_slot, (const char*)L->ffn_gate_exps.data + e * gb, gb, cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpy(d_pu + k * up_slot,   (const char*)L->ffn_up_exps.data + e * ub, ub, cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpy(d_pd + k * down_slot, (const char*)L->ffn_down_exps.data + e * db, db, cudaMemcpyHostToDevice));
+            }
+            const int slots[4] = {0, 1, 2, 3};
+            CUDA_CHECK(cudaMemcpy(d_ids, slots, K * 4, cudaMemcpyHostToDevice));
+            g_ptr = d_pg; u_ptr = d_pu; d_ptr = d_pd; gs = gate_slot; us = up_slot; ds = down_slot;
+        }
+        lfm25_gpu_moe_ffn(d_xq8, ids_used, d_tw, g_ptr, u_ptr, d_ptr,
+                          down_type, d_act, d_actq8, d_dst, false, (int)dim, (int)ffn, gs, us, ds);
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaMemcpy(actgot.data(), d_act, (size_t)K * ffn * 4, cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(outgot.data(), d_dst, dim * 4, cudaMemcpyDeviceToHost));
@@ -97,8 +136,8 @@ int main(int argc, char **argv) {
             std::vector<float> r(dim), acc(dim);
             for (uint32_t i = 0; i < dim; i++) r[i] = 0.25f * sinf(0.01f * (float)i) + 0.1f;
             CUDA_CHECK(cudaMemcpy(d_dst, r.data(), dim * 4, cudaMemcpyHostToDevice));
-            lfm25_gpu_moe_ffn(d_xq8, d_ids, d_tw, L->ffn_gate_exps.dev, L->ffn_up_exps.dev, L->ffn_down_exps.dev,
-                              down_type, d_act, d_actq8, d_dst, true, (int)dim, (int)ffn);
+            lfm25_gpu_moe_ffn(d_xq8, ids_used, d_tw, g_ptr, u_ptr, d_ptr,
+                              down_type, d_act, d_actq8, d_dst, true, (int)dim, (int)ffn, gs, us, ds);
             CUDA_CHECK(cudaDeviceSynchronize());
             CUDA_CHECK(cudaMemcpy(acc.data(), d_dst, dim * 4, cudaMemcpyDeviceToHost));
             std::vector<float> expect(dim);
@@ -115,6 +154,7 @@ int main(int argc, char **argv) {
 
     CUDA_CHECK(cudaFree(d_x)); CUDA_CHECK(cudaFree(d_act)); CUDA_CHECK(cudaFree(d_dst));
     CUDA_CHECK(cudaFree(d_tw)); CUDA_CHECK(cudaFree(d_ids)); CUDA_CHECK(cudaFree(d_xq8)); CUDA_CHECK(cudaFree(d_actq8));
+    if (pool_mode) { cudaFree(d_pg); cudaFree(d_pu); cudaFree(d_pd); }
     lfm25_gpu_shutdown(model);
     lfm25_model_free(model);
     return (pass == n_cases && accum_ok) ? 0 : 1;

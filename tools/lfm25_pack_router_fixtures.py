@@ -2,6 +2,7 @@
 """Pack tools/lfm25_router_fixtures.c output into tests/fixtures/lfm25_8b_router_cases.bin.
 
 usage: lfm25_pack_router_fixtures.py <dumpdir> <out.bin> [--layers 2-23] [--steps 8]
+       (24B: --layers 2-39; n_expert is taken from the dumped logits)
 
 Format (little-endian): char[8] "LFMRTR01", u32 n_cases, u32 dim, u32 n_expert, u32 k;
 per case: u32 layer, u32 step, f32 x[dim], i32 topk[k], f32 weights[k], f32 logits[n_expert].
@@ -24,7 +25,8 @@ def main():
     D = a.dumpdir
     with open(a.out, "wb") as f:
         f.write(b"LFMRTR01")
-        f.write(struct.pack("<4I", len(cases), 2048, 32, 4))
+        n_expert = np.fromfile(f"{D}/ffn_moe_logits-{cases[0][0]}-t{cases[0][1]}.f32", np.float32).size
+        f.write(struct.pack("<4I", len(cases), 2048, n_expert, 4))
         for l, t in cases:
             f.write(struct.pack("<2I", l, t))
             f.write(np.fromfile(f"{D}/router_in-{l}-t{t}.f32", np.float32).tobytes())

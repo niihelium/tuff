@@ -8,7 +8,8 @@
 //
 // build: gcc -O2 tools/lfm25_router_fixtures.c -I$LLAMA/include -I$LLAMA/ggml/include
 //            -L$LLAMA/build/bin -lllama -lggml -lggml-base -Wl,-rpath,$LLAMA/build/bin -o lfm25_router_fixtures
-// usage: lfm25_router_fixtures <8b-model.gguf> <outdir> <n_steps>     (fixtures use n_steps = 8)
+// usage: lfm25_router_fixtures <model.gguf> <outdir> <n_steps> [--cpu-experts]   (fixtures use n_steps = 8;
+//        --cpu-experts keeps expert tensors on llama.cpp's CPU backend, needed for the 24B)
 #include "llama.h"
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -50,6 +51,12 @@ int main(int argc, char **argv) {
     llama_backend_init();
     struct llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 99;
+    struct llama_model_tensor_buft_override ovr[2] = {{NULL, NULL}, {NULL, NULL}};
+    if (argc > 4 && !strcmp(argv[4], "--cpu-experts")) {
+        ovr[0].pattern = "ffn_(up|down|gate)_exps";
+        ovr[0].buft = ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+        mp.tensor_buft_overrides = ovr;
+    }
     struct llama_model *model = llama_model_load_from_file(argv[1], mp);
     struct llama_context_params cp = llama_context_default_params();
     cp.n_ctx = 512; cp.n_batch = 1; cp.n_ubatch = 1;

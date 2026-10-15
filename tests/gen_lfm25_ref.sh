@@ -17,15 +17,20 @@ MODE="${1:-dense}"
 N="${N:-128}"
 PROMPT="${PROMPT:-Hello}"
 LLAMA_DIR="${LLAMA_DIR:-/home/nii/workspace/llama.cpp}"
+EXTRA_ARGS=()
 
 if [ "$MODE" = "dense" ]; then
     MODEL_PATH="${MODEL_PATH:-/run/media/nii/pohjola/models/unsloth/LFM2.5-1.2B-Thinking-GGUF/LFM2.5-1.2B-Thinking-Q4_K_M.gguf}"
 elif [ "$MODE" = "moe8" ]; then
     # LFM2.5-8B-A1B: 4.8 GiB, fully GPU-resident in llama.cpp too, so the same recipe applies.
     MODEL_PATH="${MODEL_PATH:-/run/media/nii/pohjola/models/LiquidAI/LFM2.5-8B-A1B-GGUF/LFM2.5-8B-A1B-Q4_K_M.gguf}"
+elif [ "$MODE" = "moe" ]; then
+    # LFM2.5-24B-A2B: 13.5 GiB does not fit 8 GB, so llama.cpp keeps the expert tensors on its CPU
+    # backend (--cpu-experts); trunk, router and attention stay on the GPU.
+    MODEL_PATH="${MODEL_PATH:-/run/media/nii/pohjola/models/LiquidAI/LFM2.5-24B-A2B-GGUF/LFM2.5-24B-A2B-Q4_K_M.gguf}"
+    EXTRA_ARGS=(--cpu-experts)
 else
-    echo "Supported modes: dense (1.2B), moe8 (8B-A1B). The 24B MoE reference (split CPU/GPU) is" >&2
-    echo "defined with its gate in Phase 3 / Task 3.2 of LFM25_ROADMAP.md." >&2
+    echo "Supported modes: dense (1.2B), moe8 (8B-A1B), moe (24B-A2B, experts on llama.cpp's CPU)." >&2
     exit 2
 fi
 
@@ -35,7 +40,7 @@ REF_BIN="${REF_BIN:-./build/lfm25-llama-ref}"
 
 BASE="tests/ref_lfm25_${MODE}_${N}"
 CMD=("$REF_BIN" --model "$MODEL_PATH" --prompt "$PROMPT" -n "$N"
-     --tokens-out "$BASE.txt" --margins-out "$BASE.margins.txt")
+     --tokens-out "$BASE.txt" --margins-out "$BASE.margins.txt" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"})
 
 echo "Generating $BASE.{txt,margins.txt} ..."
 "${CMD[@]}" 2> /tmp/gen_lfm25_ref.log || { tail -20 /tmp/gen_lfm25_ref.log >&2; exit 1; }

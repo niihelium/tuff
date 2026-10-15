@@ -136,7 +136,7 @@ set_target_properties(lfm25-llama-ref PROPERTIES
     INSTALL_RPATH "/home/nii/workspace/llama.cpp/build/bin"
     BUILD_WITH_INSTALL_RPATH TRUE
 )
-target_link_libraries(lfm25-llama-ref PRIVATE llama)
+target_link_libraries(lfm25-llama-ref PRIVATE llama ggml ggml-base)
 
 # MoE router kernel test (Task 2.1): checks lfm25_gpu_router_top4 against llama.cpp fixtures.
 # Does not call lfm25_gpu_prepare; uploads only the router tensors.
