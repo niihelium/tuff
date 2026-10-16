@@ -17,6 +17,9 @@ typedef struct lfm25_expert_cache lfm25_expert_cache_t;
 // True when the model must (or is forced to) use the cache: expert_count > 32 or LFM25_FORCE_EXPERT_CACHE=1.
 int lfm25_expert_cache_wanted(const lfm25_model_t *model);
 
+// Frees the process-wide pinned expert store (it is keyed by model pointer: call before the model is freed).
+void lfm25_expert_store_release(void);
+
 // Call after all other device allocations (trunk, KV, scratch). Returns NULL on failure (message printed).
 lfm25_expert_cache_t* lfm25_expert_cache_create(lfm25_model_t *model);
 // Prints stats (hit rate etc.) to stderr, releases pools and host registrations.
@@ -27,6 +30,17 @@ void lfm25_expert_cache_free(lfm25_expert_cache_t *c);
 // returned slot (cudaStreamWaitEvent), so the host does not block. All slots of this call are protected from eviction
 // until the next lookup. Not thread-safe.
 void lfm25_expert_cache_lookup(lfm25_expert_cache_t *c, int layer, const int *ids, int n_ids, int *slots_out, cudaStream_t consumer);
+
+// Hybrid CPU-miss mode. Like lfm25_expert_cache_lookup, but a miss gets NO slot and NO upload: slots_out[i] = -1 and bit i
+// of the returned mask is set; the caller evaluates those experts on the CPU from lfm25_expert_cache_host_slab. Hits
+// behave exactly as in lookup (protected, consumer waits for their pending uploads).
+unsigned lfm25_expert_cache_lookup_cpu(lfm25_expert_cache_t *c, int layer, const int *ids, int n_ids, int *slots_out, cudaStream_t consumer);
+// Host address of expert `expert`'s slab of tensor 0/1/2 (gate/up/down) in `layer` (pinned store or the GGUF mmap).
+const void* lfm25_expert_cache_host_slab(const lfm25_expert_cache_t *c, int layer, int tensor, int expert);
+int lfm25_expert_cache_host_pinned(const lfm25_expert_cache_t *c);
+// After this layer's FFN is enqueued: asynchronously upload the CPU-evaluated experts so later tokens hit. At most
+// `max_inflight` admission batches may be incomplete (0 disables admission). Call after lookup_cpu of the same layer.
+void lfm25_expert_cache_admit(lfm25_expert_cache_t *c, int layer, const int *experts, int n, int max_inflight);
 
 // Warm the cache for the PREDICTED experts of `layer` (the next MoE layer). Call right after the lookup of the
 // previous layer, once that layer's FFN is enqueued: its slots are protected, everything else may be evicted. Purely

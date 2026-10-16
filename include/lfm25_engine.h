@@ -4,6 +4,7 @@
 #include "lfm25_model.h"
 #include "sampler.h"
 #include "lfm25_expert_cache.h"
+#include "lfm25_cpu_expert.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <cuda_runtime.h>
@@ -53,6 +54,8 @@ typedef struct {
     int   *d_pred_ids;       // (4) predicted next-layer ids (prefetch only; never feeds the math)
     float *d_pred_w;         // (4) their (unused) weights
     int    prefetch_n;       // how many of the 4 predicted experts (in router selection order) are prefetched
+    lfm25_cpu_expert_t *cpu_expert;   // non-NULL = evaluate cache misses on the CPU (LFM25_CPU_MISS)
+    int    cpu_admit;        // max in-flight admission upload batches for CPU-evaluated misses (0 = never admit)
     int    prefetch;         // 1 = predict + prefetch the next MoE layer's experts (LFM25_PREFETCH=1; default off)
 
     // Device argmax scratch buffers
@@ -122,6 +125,11 @@ void lfm25_gpu_shortconv_seq(const float *d_in_proj, float *d_conv_state, float 
 void lfm25_gpu_conv_state_restore(float *d_conv_state, const float *d_snap, int n_layers, int slot, int d, size_t snap_layer_stride);
 void lfm25_gpu_output_norm_head_argmax_batch(const float *d_res_x, const float *d_norm_w, const void *dev_output_w, void *d_xq8, float *d_logits, float *d_block_max, int *d_block_idx, int *d_best_token, int dim, int vocab_size, float eps, int nb);
 void lfm25_gpu_moe_ffn(const void *d_xq8, const int *d_topk_ids, const float *d_topk_w, const void *dev_gate_exps, const void *dev_up_exps, const void *dev_down_exps, int down_type, float *d_act /* [4*ffn_dim] */, void *d_act_q8 /* [4*ffn_dim/32] block_q8_1 */, float *d_dst, bool accum, int dim, int ffn_dim, size_t gate_stride, size_t up_stride, size_t down_stride /* bytes per expert / slot */);
+
+// Split MoE FFN stages (hybrid CPU-miss path). skip_mask: experts k whose blocks return at once; pre_mask: experts k whose raw
+// gate/up row dots ([k][gate|up][ffn_dim]) / down row results ([k][dim]) come from device buffers computed on the CPU.
+void lfm25_gpu_moe_gate_up(const void *d_xq8, const int *d_topk_ids, const void *dev_gate_exps, const void *dev_up_exps, float *d_act, int dim, int ffn_dim, size_t gate_stride, size_t up_stride, unsigned skip_mask, unsigned pre_mask, const float *d_pre_gu);
+void lfm25_gpu_moe_down(const void *d_act_q8, const int *d_topk_ids, const float *d_topk_w, const void *dev_down_exps, int down_type, float *d_dst, bool accum, int dim, int ffn_dim, size_t down_stride, unsigned pre_mask, const float *d_pre_y);
 
 // Engine lifecycle
 lfm25_engine_t* lfm25_engine_init(lfm25_model_t *model, int max_context_len);

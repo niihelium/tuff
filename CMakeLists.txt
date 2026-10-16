@@ -43,6 +43,7 @@ set(SOURCES
     src/lfm25_gpu.cu
     src/lfm25_engine.c
     src/lfm25_expert_cache.c
+    src/lfm25_cpu_expert.c
     src/chat.c
     src/main.c
 )
@@ -66,6 +67,8 @@ target_compile_options(tuff PRIVATE
 # are explicit _mm256 intrinsics, and no -ffast-math is present), so this is gated by the same
 # oracle + determinism checks as any other change.
 set_source_files_properties(src/cpu_ops.c PROPERTIES COMPILE_OPTIONS "-O3")
+# The CPU expert kernels must reproduce the GPU's float operation sequence bit for bit: no compiler-made contractions.
+set_source_files_properties(src/lfm25_cpu_expert.c PROPERTIES COMPILE_OPTIONS "-O3;-ffp-contract=off")
 
 find_package(CUDAToolkit REQUIRED)
 target_link_libraries(tuff PRIVATE CUDA::cudart CUDA::cuda_driver CUDA::cupti OpenMP::OpenMP_C llama ggml ggml-cpu ggml-base m)
@@ -180,3 +183,24 @@ target_compile_options(lfm25-moe-ffn-test PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3 ${TUFF_CUDA_STREAM_FLAG}>
 )
 target_link_libraries(lfm25-moe-ffn-test PRIVATE CUDA::cudart OpenMP::OpenMP_C m)
+
+# Hybrid CPU-miss MoE FFN byte-identity test (vs the all-GPU lfm25_gpu_moe_ffn, every miss mask).
+add_executable(lfm25-cpu-expert-test
+    src/gguf_parser.c
+    src/cpu_ops.c
+    src/lfm25_model.c
+    src/lfm25_gpu.cu
+    src/lfm25_cpu_expert.c
+    tests/test_lfm25_cpu_expert.cu
+)
+set_target_properties(lfm25-cpu-expert-test PROPERTIES
+    COMPILE_FLAGS "${OpenMP_C_FLAGS}"
+    LINK_FLAGS "${OpenMP_C_FLAGS} -Wl,--disable-new-dtags"
+    INSTALL_RPATH "/home/nii/workspace/llama.cpp/build/bin"
+    BUILD_WITH_INSTALL_RPATH TRUE
+)
+target_compile_options(lfm25-cpu-expert-test PRIVATE
+    $<$<COMPILE_LANGUAGE:C>:-g -O2 -Wall -Wextra -march=native -mfma -mavx2 -mf16c>
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3 ${TUFF_CUDA_STREAM_FLAG}>
+)
+target_link_libraries(lfm25-cpu-expert-test PRIVATE CUDA::cudart OpenMP::OpenMP_C Threads::Threads m)

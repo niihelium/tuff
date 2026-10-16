@@ -91,6 +91,8 @@ struct lfm25_expert_cache {
     double   up_sec;
     int      timing;
     uint64_t pf_slabs, pf_hits, pf_hidden, pf_wasted;
+    uint64_t cpu_evals, adm_slabs, adm_skipped;   // CPU-evaluated misses; admitted slabs; slabs not admitted (budget)
+    int      adm_fifo[64], adm_n;                  // ring indices of admission batches possibly still in flight (oldest first)
     uint64_t pred_total, pred_correct;
     int      pred_layer, pred_ids[8], pred_n;
 };
@@ -159,6 +161,9 @@ static void store_release(void) {
     free(g_store.off);
     memset(&g_store, 0, sizeof(g_store));
 }
+
+// Frees the pinned store (called when the model it was built from goes away; also at exit).
+void lfm25_expert_store_release(void) { store_release(); }
 
 // Returns 1 if the store for `m` is available (built now or earlier in this process).
 static int store_acquire(const lfm25_model_t *m, int force) {
@@ -469,6 +474,7 @@ static void wait_slots(lfm25_expert_cache_t *c, const int *slots, int n, cudaStr
     int last = -1;
     for (int i = 0; i < n; ++i) {
         int s = slots[i];
+        if (s < 0) continue;     // CPU-evaluated miss: no slot
         int ev = c->slot_ev[s];
         if (ev < 0) continue;
         if (ev != last) CUDA_CHECK(cudaStreamWaitEvent(consumer, c->ring[ev].end, 0));
@@ -477,7 +483,8 @@ static void wait_slots(lfm25_expert_cache_t *c, const int *slots, int n, cudaStr
     }
 }
 
-void lfm25_expert_cache_lookup(lfm25_expert_cache_t *c, int layer, const int *ids, int n, int *slots, cudaStream_t consumer) {
+static unsigned lookup_impl(lfm25_expert_cache_t *c, int layer, const int *ids, int n, int *slots, cudaStream_t consumer, int cpu_miss) {
+    unsigned miss_mask = 0;
     // Prediction accuracy bookkeeping (prediction never influences anything below).
     if (c->pred_layer == layer) {
         for (int i = 0; i < n; ++i)
@@ -503,6 +510,12 @@ void lfm25_expert_cache_lookup(lfm25_expert_cache_t *c, int layer, const int *id
             }
         } else { slots[i] = -1; miss[nmiss++] = i; }
     }
+    if (cpu_miss) {
+        // CPU-evaluated misses: no slot, no upload, nothing evicted. The caller evaluates them from host memory and may
+        // admit them later with lfm25_expert_cache_admit.
+        for (int j = 0; j < nmiss; ++j) { miss_mask |= 1u << miss[j]; c->misses++; c->cpu_evals++; }
+        nmiss = 0;
+    }
     c->since_decay += (uint64_t)n;
     if (c->policy == 1 && c->since_decay >= c->decay_period) {
         c->since_decay = 0;
@@ -522,6 +535,49 @@ void lfm25_expert_cache_lookup(lfm25_expert_cache_t *c, int layer, const int *id
         batch_end(c, ev);
     }
     wait_slots(c, slots, n, consumer);
+    return miss_mask;
+}
+
+void lfm25_expert_cache_lookup(lfm25_expert_cache_t *c, int layer, const int *ids, int n, int *slots, cudaStream_t consumer) {
+    (void)lookup_impl(c, layer, ids, n, slots, consumer, 0);
+}
+
+unsigned lfm25_expert_cache_lookup_cpu(lfm25_expert_cache_t *c, int layer, const int *ids, int n, int *slots, cudaStream_t consumer) {
+    return lookup_impl(c, layer, ids, n, slots, consumer, 1);
+}
+
+const void* lfm25_expert_cache_host_slab(const lfm25_expert_cache_t *c, int layer, int tensor, int expert) {
+    const lfm25_layer_t *L = &c->model->layers[layer];
+    const lfm25_tensor_t *x = exps_tensor(L, tensor);
+    size_t sz = x->info.size_bytes / (size_t)c->n_experts;
+    if (c->host_mode == 1) return g_store.base + g_store.off[layer * 3 + tensor] + (size_t)expert * sz;
+    return (const char*)x->data + (size_t)expert * sz;
+}
+
+int lfm25_expert_cache_host_pinned(const lfm25_expert_cache_t *c) { return c->host_mode == 1; }
+
+// Warm the cache with CPU-evaluated misses: asynchronous uploads on the copy stream, issued after the layer's own work
+// and never waited on by it. Victims are never slots stamped with the current tick (= every slot this layer reads); a new
+// slot carries slot_ev, so the consumer waits for it before any kernel reads it. Skipped when `max_inflight` earlier
+// admission batches have not completed yet (bounds the PCIe queue).
+void lfm25_expert_cache_admit(lfm25_expert_cache_t *c, int layer, const int *experts, int n, int max_inflight) {
+    int w = 0;
+    for (int i = 0; i < c->adm_n; ++i) {
+        if (cudaEventQuery(c->ring[c->adm_fifo[i]].end) == cudaSuccess) continue;
+        c->adm_fifo[w++] = c->adm_fifo[i];
+    }
+    (void)cudaGetLastError();
+    c->adm_n = w;
+    if (c->adm_n >= max_inflight || c->adm_n >= 64) { c->adm_skipped += (uint64_t)n; return; }
+    int ev = batch_begin(c);
+    int issued = 0;
+    for (int i = 0; i < n; ++i) {
+        if (c->map[layer * c->n_experts + experts[i]] >= 0) continue;
+        if (fill_slot(c, layer, experts[i], ev, 0) < 0) break;
+        c->adm_slabs++; issued++;
+    }
+    batch_end(c, ev);
+    if (issued) c->adm_fifo[c->adm_n++] = ev;
 }
 
 void lfm25_expert_cache_prefetch(lfm25_expert_cache_t *c, int layer, const int *ids, int n) {
@@ -556,6 +612,9 @@ void lfm25_expert_cache_free(lfm25_expert_cache_t *c) {
             (unsigned long long)tot, (unsigned long long)c->hits, (unsigned long long)c->misses,
             tot ? 100.0 * (double)c->hits / (double)tot : 0.0, c->n_slots, mode_short[c->host_mode],
             c->policy ? "LFRU" : "LRU");
+    if (c->cpu_evals)
+        fprintf(stderr, "[LFM25 CACHE] cpu-evaluated misses: %llu expert slabs; admitted %llu to the cache, %llu not admitted (budget)\n",
+                (unsigned long long)c->cpu_evals, (unsigned long long)c->adm_slabs, (unsigned long long)c->adm_skipped);
     if (c->timing) {
         if (c->up_sec > 0)
             fprintf(stderr, "[LFM25 CACHE] uploaded %.1f MiB (%.1f MiB prefetched) in %.3f s of copy-stream time -> %.2f GB/s (%s)\n",

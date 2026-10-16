@@ -11,7 +11,7 @@
 #   file:    path relative to the repo root
 #   old/new: text to replace; "\n" is a newline, "\\" a backslash. Whitespace after "old: " is significant.
 #   targets: cmake targets to rebuild (space separated): tuff lfm25-router-test lfm25-moe-ffn-test
-#   checks:  golden:<mode> oracle:<mode> spec router8 router24 moeffn8 moeffn24   (all must FAIL on the mutant)
+#   checks:  golden:<mode> oracle:<mode> spec router8 router24 moeffn8 moeffn24 cpuexp8 cpuexp24   (all must FAIL on the mutant)
 
 id: conv-taps-swap
 tags: quick
@@ -128,3 +128,19 @@ old:     while (m < k && d[m] == am[m]) m++;\n
 new:     while (m < k && d[m] == am[m]) m++;\n    if (m < k) m++;\n
 targets: tuff
 checks: golden:dense spec
+
+id: cpu-down-wrong-act
+desc: CPU-evaluated down projection reads the next expert's Q8_1 activations
+file: src/lfm25_cpu_expert.c
+old: (const q8blk *)ce->h_act_q8 + (size_t)k * (ffn_dim / 32)
+new: (const q8blk *)ce->h_act_q8 + (size_t)((k + 1) & 3) * (ffn_dim / 32)
+targets: tuff lfm25-cpu-expert-test
+checks: golden:moe8 cpuexp8
+
+id: cpu-reduce-order
+desc: CPU lane reduction tree changed (neighbour lanes first instead of the xor-butterfly 16,8,4,2,1 order; bit-level only)
+file: src/lfm25_cpu_expert.c
+old: __m128 t0 = _mm_add_ps(r0, r2), t1 = _mm_add_ps(r1, r3);
+new: __m128 t0 = _mm_add_ps(r0, r1), t1 = _mm_add_ps(r2, r3);
+targets: tuff lfm25-cpu-expert-test
+checks: golden:moe8 cpuexp8

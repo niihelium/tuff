@@ -1,5 +1,6 @@
 #include "lfm25_engine.h"
 #include "lfm25_model.h"
+#include "lfm25_cpu_expert.h"
 #include "tuff_vtable.h"
 #include "tuff_exact.h"
 #include "cuda_check.h"
@@ -9,6 +10,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#ifndef LFM25_CPU_MISS_DEFAULT
+#define LFM25_CPU_MISS_DEFAULT 0
+#endif
+#ifndef LFM25_CPU_MISS_ADMIT_DEFAULT
+#define LFM25_CPU_MISS_ADMIT_DEFAULT 4
+#endif
 
 static void lfm25_bench_batch(lfm25_engine_t *eng);
 
@@ -149,6 +157,22 @@ lfm25_engine_t* lfm25_engine_init(lfm25_model_t *model, int max_context_len) {
         eng->prefetch_n = pn && *pn ? atoi(pn) : 4;
         if (eng->prefetch_n < 1) eng->prefetch_n = 1;
         if (eng->prefetch_n > 4) eng->prefetch_n = 4;
+        // CPU evaluation of cache misses (hybrid path). Allocated before the cache: the cache takes all remaining VRAM.
+        {
+            const char *cm = getenv("LFM25_CPU_MISS");
+            int on = cm && *cm ? cm[0] == '1' : LFM25_CPU_MISS_DEFAULT;
+            const char *ad = getenv("LFM25_CPU_MISS_ADMIT");
+            eng->cpu_admit = ad && *ad ? atoi(ad) : LFM25_CPU_MISS_ADMIT_DEFAULT;
+            if (eng->cpu_admit < 0) eng->cpu_admit = 0;
+            if (on) {
+                eng->cpu_expert = lfm25_cpu_expert_create(0, (int)model->embedding_length, (int)model->expert_ffn_dim);
+                if (!eng->cpu_expert) { lfm25_engine_free(eng); return NULL; }
+                fprintf(stderr, "[LFM25 CACHE] cpu-miss: ON (%d threads, admission budget %d in-flight upload batches)\n",
+                        lfm25_cpu_expert_threads(eng->cpu_expert), eng->cpu_admit);
+            } else {
+                fprintf(stderr, "[LFM25 CACHE] cpu-miss: OFF\n");
+            }
+        }
         eng->expert_cache = lfm25_expert_cache_create(model);
         if (!eng->expert_cache) { lfm25_engine_free(eng); return NULL; }
     }
@@ -164,6 +188,7 @@ void lfm25_engine_free(lfm25_engine_t *eng) {
     if (eng->stream) { cudaStreamSynchronize(eng->stream); lfm25_gpu_set_stream(0); }
 
     lfm25_expert_cache_free(eng->expert_cache);
+    lfm25_cpu_expert_free(eng->cpu_expert);
     if (eng->d_slot_ids)   cudaFree(eng->d_slot_ids);
     if (eng->d_pred_ids)   cudaFree(eng->d_pred_ids);
     if (eng->d_pred_w)     cudaFree(eng->d_pred_w);
@@ -272,18 +297,45 @@ static void lfm25_enqueue_moe_ffn(lfm25_engine_t *eng, cudaStream_t stream, uint
         CUDA_CHECK(cudaMemcpyAsync(eng->h_moe_ids, eng->d_topk_ids, 4 * sizeof(int), cudaMemcpyDeviceToHost, stream));
         if (pred_layer >= 0)
             CUDA_CHECK(cudaMemcpyAsync(eng->h_moe_ids + 4, eng->d_pred_ids, 4 * sizeof(int), cudaMemcpyDeviceToHost, stream));
+        // CPU-miss mode: the host needs the layer input in Q8_1 in case an expert has to be evaluated on the CPU.
+        if (eng->cpu_expert)
+            CUDA_CHECK(cudaMemcpyAsync(lfm25_cpu_expert_host_xq8(eng->cpu_expert), d_q8_x, (size_t)(dim / 32) * 36,
+                                       cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         // After this sync every kernel enqueued before this layer's router has finished; only this layer's FFN
         // (enqueued below) can read slots while the prefetch for the next layer is in flight.
-        lfm25_expert_cache_lookup(ec, (int)l, eng->h_moe_ids, 4, eng->h_slot_ids, stream);
+        unsigned miss_mask = 0;
+        if (eng->cpu_expert) miss_mask = lfm25_expert_cache_lookup_cpu(ec, (int)l, eng->h_moe_ids, 4, eng->h_slot_ids, stream);
+        else lfm25_expert_cache_lookup(ec, (int)l, eng->h_moe_ids, 4, eng->h_slot_ids, stream);
+        for (int i = 0; i < 4; ++i) if (eng->h_slot_ids[i] < 0) eng->h_slot_ids[i] = 0;   // CPU-evaluated: slot never dereferenced
         // h_slot_ids is pinned and rewritten only after the next layer's sync, i.e. after this copy completed.
         CUDA_CHECK(cudaMemcpyAsync(eng->d_slot_ids, eng->h_slot_ids, 4 * sizeof(int), cudaMemcpyHostToDevice, stream));
-        lfm25_gpu_moe_ffn(d_q8_x, eng->d_slot_ids, eng->d_topk_w, lfm25_expert_cache_pool_gate(ec),
-                          lfm25_expert_cache_pool_up(ec), lfm25_expert_cache_pool_down(ec),
-                          (int)L->ffn_down_exps.info.type, eng->d_moe_act, eng->d_moe_act_q8,
-                          d_x, true, dim, (int)m->expert_ffn_dim,
-                          lfm25_expert_cache_gate_slot_bytes(ec), lfm25_expert_cache_up_slot_bytes(ec),
-                          lfm25_expert_cache_down_slot_bytes(ec));
+        if (miss_mask == 0) {
+            lfm25_gpu_moe_ffn(d_q8_x, eng->d_slot_ids, eng->d_topk_w, lfm25_expert_cache_pool_gate(ec),
+                              lfm25_expert_cache_pool_up(ec), lfm25_expert_cache_pool_down(ec),
+                              (int)L->ffn_down_exps.info.type, eng->d_moe_act, eng->d_moe_act_q8,
+                              d_x, true, dim, (int)m->expert_ffn_dim,
+                              lfm25_expert_cache_gate_slot_bytes(ec), lfm25_expert_cache_up_slot_bytes(ec),
+                              lfm25_expert_cache_down_slot_bytes(ec));
+        } else {
+            const void *hg[4] = {0}, *hu[4] = {0}, *hd[4] = {0};
+            int miss_ids[4], nmiss = 0;
+            for (int i = 0; i < 4; ++i) {
+                if (!((miss_mask >> i) & 1u)) continue;
+                hg[i] = lfm25_expert_cache_host_slab(ec, (int)l, 0, eng->h_moe_ids[i]);
+                hu[i] = lfm25_expert_cache_host_slab(ec, (int)l, 1, eng->h_moe_ids[i]);
+                hd[i] = lfm25_expert_cache_host_slab(ec, (int)l, 2, eng->h_moe_ids[i]);
+                miss_ids[nmiss++] = eng->h_moe_ids[i];
+            }
+            lfm25_cpu_expert_moe_ffn(eng->cpu_expert, stream, d_q8_x, lfm25_cpu_expert_host_xq8(eng->cpu_expert),
+                                     eng->d_slot_ids, eng->d_topk_w, lfm25_expert_cache_pool_gate(ec),
+                                     lfm25_expert_cache_pool_up(ec), lfm25_expert_cache_pool_down(ec),
+                                     (int)L->ffn_down_exps.info.type, eng->d_moe_act, eng->d_moe_act_q8,
+                                     d_x, true, dim, (int)m->expert_ffn_dim,
+                                     lfm25_expert_cache_gate_slot_bytes(ec), lfm25_expert_cache_up_slot_bytes(ec),
+                                     lfm25_expert_cache_down_slot_bytes(ec), miss_mask, hg, hu, hd);
+            lfm25_expert_cache_admit(ec, (int)l, miss_ids, nmiss, eng->cpu_admit);
+        }
         // Enqueued after the FFN so host-side staging work overlaps the GPU compute.
         if (pred_layer >= 0) lfm25_expert_cache_prefetch(ec, pred_layer, eng->h_moe_ids + 4, eng->prefetch_n);
     } else {
