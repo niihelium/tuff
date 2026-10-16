@@ -380,7 +380,10 @@ lfm25_expert_cache_t* lfm25_expert_cache_create(lfm25_model_t *m) {
         size_t reserve = env_mb("LFM25_VRAM_RESERVE_MB", 512) << 20;
         budget = fr > reserve ? fr - reserve : 0;
     }
-    size_t max_slots = (size_t)m->block_count * m->expert_count;
+    // Slots are only ever keyed by MoE (layer, expert): cap by n_moe_layers (the leading dense layers have no experts).
+    // The key -> slot map keeps its block_count x n_experts size because keys use the absolute layer index.
+    size_t max_slots = (size_t)m->n_moe_layers * m->expert_count;
+    const size_t map_size = (size_t)m->block_count * m->expert_count;
     size_t ns = budget / slot_bytes;
     if (ns > max_slots) ns = max_slots;
     if (ns < 8) {
@@ -411,8 +414,8 @@ lfm25_expert_cache_t* lfm25_expert_cache_create(lfm25_model_t *m) {
     CUDA_CHECK(cudaMalloc((void**)&c->d_up, ns * c->up_slot));
     CUDA_CHECK(cudaMalloc((void**)&c->d_down, ns * c->down_slot));
 
-    c->map = (int*)malloc(max_slots * sizeof(int));
-    for (size_t i = 0; i < max_slots; ++i) c->map[i] = -1;
+    c->map = (int*)malloc(map_size * sizeof(int));
+    for (size_t i = 0; i < map_size; ++i) c->map[i] = -1;
     c->slot_key = (int*)malloc(ns * sizeof(int));
     c->slot_ev = (int*)malloc(ns * sizeof(int));
     c->slot_use = (uint64_t*)calloc(ns, sizeof(uint64_t));

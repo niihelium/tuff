@@ -687,7 +687,8 @@ __global__ void lfm_argmax_reduction_kernel(
     for (int mask = 16; mask > 0; mask >>= 1) {
         float other_max = __shfl_xor_sync(0xffffffff, max_val, mask, 32);
         int other_idx = __shfl_xor_sync(0xffffffff, best_idx, mask, 32);
-        if (other_max > max_val) {
+        // exact ties -> lowest index (matches llama.cpp / the golden tool)
+        if (other_max > max_val || (other_max == max_val && other_idx < best_idx)) {
             max_val = other_max;
             best_idx = other_idx;
         }
@@ -706,7 +707,7 @@ __global__ void lfm_argmax_reduction_kernel(
         float gm = s_max[0];
         int gi = s_idx[0];
         for (int w = 1; w < 8; ++w) {
-            if (s_max[w] > gm) {
+            if (s_max[w] > gm || (s_max[w] == gm && s_idx[w] < gi)) {
                 gm = s_max[w];
                 gi = s_idx[w];
             }
@@ -1361,6 +1362,7 @@ static void free_tensor(lfm25_tensor_t *t) {
 int lfm25_gpu_prepare(lfm25_model_t *model, int *max_context_len, int fill_ram) {
     (void)fill_ram;
     if (!model) return -1;
+    if (lfm25_model_validate(model) != 0) return -1;   // fail fast, before any device allocation / weight upload
     if (max_context_len && *max_context_len <= 0) {
         *max_context_len = model->context_length > 0 ? (int)model->context_length : 4096;
     }

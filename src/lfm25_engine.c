@@ -14,6 +14,7 @@ static void lfm25_bench_batch(lfm25_engine_t *eng);
 
 lfm25_engine_t* lfm25_engine_init(lfm25_model_t *model, int max_context_len) {
     if (!model) return NULL;
+    if (lfm25_model_validate(model) != 0) return NULL;   // before any allocation
     // Router / expert kernels support 32 or 64 experts, top-4. Models with >32 experts (LFM2.5-24B-A2B) use the
     // VRAM expert cache (src/lfm25_expert_cache.c) because their experts do not fit in VRAM.
     if (model->is_moe && ((model->expert_count != 32 && model->expert_count != 64) || model->expert_used_count != 4)) {
@@ -130,7 +131,9 @@ lfm25_engine_t* lfm25_engine_init(lfm25_model_t *model, int max_context_len) {
         const char *g = getenv("LFM25_CUDA_GRAPH");
         int want = !(g && g[0] == '0');
         eng->graph_enabled = want && !lfm25_expert_cache_wanted(model);
-        if (eng->graph_enabled) CUDA_CHECK(cudaStreamCreateWithFlags(&eng->stream, cudaStreamNonBlocking));
+        // One explicit engine-owned stream for every forward-path launch/copy (graphed or not): no code relies on the
+        // implicit legacy <-> per-thread default-stream barriers, so the build flag --default-stream does not matter.
+        CUDA_CHECK(cudaStreamCreateWithFlags(&eng->stream, cudaStreamNonBlocking));
     }
 
     // Expert cache: created last so its default size can take all VRAM left after trunk + KV + scratch.
@@ -150,12 +153,15 @@ lfm25_engine_t* lfm25_engine_init(lfm25_model_t *model, int max_context_len) {
         if (!eng->expert_cache) { lfm25_engine_free(eng); return NULL; }
     }
 
+    // Everything above (memsets, async host copies) must be complete before the non-blocking engine stream starts.
+    CUDA_CHECK(cudaDeviceSynchronize());
     { const char *bb = getenv("LFM25_BENCH_BATCH"); if (bb && bb[0] == '1') lfm25_bench_batch(eng); }
     return eng;
 }
 
 void lfm25_engine_free(lfm25_engine_t *eng) {
     if (!eng) return;
+    if (eng->stream) { cudaStreamSynchronize(eng->stream); lfm25_gpu_set_stream(0); }
 
     lfm25_expert_cache_free(eng->expert_cache);
     if (eng->d_slot_ids)   cudaFree(eng->d_slot_ids);
@@ -375,6 +381,14 @@ static void lfm25_enqueue_step(lfm25_engine_t *eng, cudaStream_t stream) {
 
 int32_t lfm25_engine_forward_token(lfm25_engine_t *eng, int32_t token, int pos) {
     if (!eng || !eng->model) return -1;
+    if (pos < 0 || pos >= eng->max_context_len) {
+        fprintf(stderr, "[LFM25] ERROR: position %d is outside the context window [0, %d) (raise -c)\n", pos, eng->max_context_len);
+        return -1;
+    }
+    if (token < 0 || (uint32_t)token >= eng->model->vocab_size) {
+        fprintf(stderr, "[LFM25] ERROR: token id %d is outside the vocabulary [0, %u)\n", token, eng->model->vocab_size);
+        return -1;
+    }
     eng->batch_n = 0;   // a single-token step invalidates the rollback snapshots
     eng->h_tokpos[0] = token;
     eng->h_tokpos[1] = pos;
@@ -394,9 +408,9 @@ int32_t lfm25_engine_forward_token(lfm25_engine_t *eng, int32_t token, int pos) 
             CUDA_CHECK(cudaMemcpy(eng->h_logits, eng->d_logits, (size_t)eng->model->vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
         }
     } else {
-        lfm25_gpu_set_stream(0);
-        lfm25_enqueue_step(eng, 0);
-        CUDA_CHECK(cudaStreamSynchronize(0));
+        lfm25_gpu_set_stream(eng->stream);
+        lfm25_enqueue_step(eng, eng->stream);
+        CUDA_CHECK(cudaStreamSynchronize(eng->stream));
         if (tuff_logit_capture_is_enabled()) {
             CUDA_CHECK(cudaMemcpy(eng->h_logits, eng->d_logits, (size_t)eng->model->vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
         }
@@ -429,7 +443,17 @@ static void lfm25_gpu_mat_vec_batch(const lfm25_tensor_t *t, const void *d_xq8, 
 
 int lfm25_engine_forward_batch(lfm25_engine_t *eng, const int32_t *tokens, int n, int pos0, int32_t *argmax_out, float *logits_out) {
     if (!eng || !eng->model || !tokens || !argmax_out || n < 1 || n > LFM25_MAX_BATCH || pos0 < 0 ||
-        pos0 + n > eng->max_context_len) return -1;
+        pos0 + n > eng->max_context_len) {
+        if (eng && eng->model && tokens && n >= 1 && n <= LFM25_MAX_BATCH)
+            fprintf(stderr, "[LFM25] ERROR: batch positions [%d, %d) are outside the context window [0, %d) (raise -c)\n",
+                    pos0, pos0 + n, eng->max_context_len);
+        return -1;
+    }
+    for (int j = 0; j < n; ++j)
+        if (tokens[j] < 0 || (uint32_t)tokens[j] >= eng->model->vocab_size) {
+            fprintf(stderr, "[LFM25] ERROR: token id %d is outside the vocabulary [0, %u)\n", tokens[j], eng->model->vocab_size);
+            return -1;
+        }
     lfm25_model_t *m = eng->model;
     const int dim = (int)m->embedding_length;
     const float eps = m->rms_norm_eps;
@@ -438,7 +462,7 @@ int lfm25_engine_forward_batch(lfm25_engine_t *eng, const int32_t *tokens, int n
     const int kvdim = (int)m->head_count_kv * (int)m->head_dim;
     const int vocab = (int)m->vocab_size;
     const size_t q8x_tok = (size_t)(dim / 32) * LFM25_Q8_BLOCK_BYTES;
-    cudaStream_t stream = eng->graph_enabled ? eng->stream : 0;
+    cudaStream_t stream = eng->stream;
     lfm25_gpu_set_stream(stream);
     eng->batch_n = 0;
 
@@ -527,7 +551,7 @@ int lfm25_engine_rollback(lfm25_engine_t *eng, int n_keep) {
     // The live conv state already is "after all batch_n tokens" (the sequential kernel leaves it there); only a
     // shorter keep needs the snapshot after token n_keep-1 copied back (one 2D copy over all conv layers).
     if (n_keep < eng->batch_n && eng->model->n_conv_layers > 0) {
-        cudaStream_t stream = eng->graph_enabled ? eng->stream : 0;
+        cudaStream_t stream = eng->stream;   // same stream as the batch that produced the snapshots; ordered, then synced
         lfm25_gpu_set_stream(stream);
         const int dim = (int)eng->model->embedding_length;
         lfm25_gpu_conv_state_restore(eng->d_conv_state, eng->d_conv_snap, (int)eng->model->n_conv_layers, n_keep - 1, dim,

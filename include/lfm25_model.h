@@ -104,6 +104,8 @@ typedef struct {
 } lfm25_model_t;
 
 lfm25_model_t* lfm25_model_load(const char *gguf_filepath);
+// Checks every tensor type / dim and shape constant the kernels assume. 0 = ok, -1 = unsupported (message on stderr).
+int            lfm25_model_validate(const lfm25_model_t *model);
 void           lfm25_model_print_inspection(const lfm25_model_t *model);
 void           lfm25_model_free(lfm25_model_t *model);
 

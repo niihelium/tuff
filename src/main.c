@@ -188,53 +188,69 @@ static int spec_cmp_double(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
-// Measure the verify-cost table on a scratch engine (the real engine's state stays untouched).
-static void spec_measure_costs(const engine_vtable_t *vt, void *model, int ctx, const sampler_params_t *sp,
-                               const int32_t *prompt, int n_prompt, int kmax, int do_measure) {
-    // Static table: batch(n) = 0.9 n single-token times (the measured 8B/24B MoE verify cost, where experts run per
-    // token and only the trunk is shared), single = 1 unit. Dense engines measure the real table; MoE engines keep
-    // this table (measuring on a scratch engine perturbs the 24B expert cache) and rely on the live cost scale.
+// Static cost table (also the fallback whenever measuring fails): batch(n) = 0.9 n single-token times (the measured
+// 8B/24B MoE verify cost, where experts run per token and only the trunk is shared), single = 1 unit, scaled to a
+// nominal ~30 ms/token (only ratios matter; the live cost scale corrects the absolute level).
+static void spec_static_costs(void) {
     for (int n = 1; n <= SPEC_KMAX + 1; ++n) g_spec_cost[n] = 0.9 * n;
     g_spec_cost[1] = 1.0;
-    if (!do_measure) {
-        for (int n = 1; n <= SPEC_KMAX + 1; ++n) g_spec_cost[n] *= 0.030;   // arbitrary unit -> ~30 ms/token (only ratios matter)
-        g_spec_cost_measured = 0;
-        return;
-    }
+    for (int n = 1; n <= SPEC_KMAX + 1; ++n) g_spec_cost[n] *= 0.030;
+    g_spec_cost_measured = 0;
+}
+
+// Measure the verify-cost table on a scratch engine (the real engine's state stays untouched). Dense engines measure
+// the real table; MoE engines keep the static one (measuring on a scratch engine perturbs the 24B expert cache) and
+// rely on the live cost scale. Any failure (context too small, engine init / forward error, non-positive timing)
+// falls back to the static table, so no cost is ever zero (the policy divides by them).
+static void spec_measure_costs(const engine_vtable_t *vt, void *model, int ctx, const sampler_params_t *sp,
+                               const int32_t *prompt, int n_prompt, int kmax, int do_measure) {
+    spec_static_costs();
+    if (!do_measure) return;
     int sum_n = 0;
     for (int n = 2; n <= kmax + 1; ++n) sum_n += n;
     int reps = 5;
     while (reps >= 1 && n_prompt + 12 + (reps + 1) * sum_n + 8 > ctx) reps--;
     if (reps < 1) {
-        fprintf(stderr, "[Tuff] spec: context too small to measure the cost table; using the default table\n");
-        g_spec_cost_measured = 1;
+        fprintf(stderr, "[Tuff] spec: context too small to measure the cost table; using the static table\n");
         return;
     }
     void *e = vt->engine_init(model, ctx);
+    if (!e) {
+        fprintf(stderr, "[Tuff] spec: scratch engine init failed; using the static cost table\n");
+        return;
+    }
     vt->engine_set_sampler(e, sp);
+    double cost[SPEC_KMAX + 2] = {0};
+    int ok = 1;
     int pos = 0;
     int32_t t = prompt[0];
-    for (int i = 0; i < n_prompt; ++i) t = vt->engine_forward_token(e, prompt[i], pos++);
+    for (int i = 0; ok && i < n_prompt; ++i) { t = vt->engine_forward_token(e, prompt[i], pos++); if (t < 0) ok = 0; }
     int32_t toks[SPEC_KMAX + 1], am[SPEC_KMAX + 1];
-    for (int i = 0; i < 3; ++i) t = vt->engine_forward_token(e, prompt[i % n_prompt], pos++);   // untimed warm-up
+    for (int i = 0; ok && i < 3; ++i) { t = vt->engine_forward_token(e, prompt[i % n_prompt], pos++); if (t < 0) ok = 0; }   // untimed warm-up
     double t0 = omp_get_wtime();
-    for (int i = 0; i < 8; ++i) t = vt->engine_forward_token(e, prompt[i % n_prompt], pos++);
-    g_spec_cost[1] = (omp_get_wtime() - t0) / 8.0;
-    for (int n = 2; n <= kmax + 1; ++n) {
+    for (int i = 0; ok && i < 8; ++i) { t = vt->engine_forward_token(e, prompt[i % n_prompt], pos++); if (t < 0) ok = 0; }
+    cost[1] = (omp_get_wtime() - t0) / 8.0;
+    for (int n = 2; ok && n <= kmax + 1; ++n) {
         double ts[5] = {0};
-        for (int r = 0; r < reps + 1; ++r) {
+        for (int r = 0; ok && r < reps + 1; ++r) {
             for (int j = 0; j < n; ++j) toks[j] = prompt[(r + j) % n_prompt];
             double a = omp_get_wtime();
-            if (vt->engine_forward_batch(e, toks, n, pos, am, NULL) != 0) break;
+            if (vt->engine_forward_batch(e, toks, n, pos, am, NULL) != 0) { ok = 0; break; }
             double b = omp_get_wtime();
             pos += n;
             if (r > 0) ts[r - 1] = b - a;   // first call per n is untimed
         }
+        if (!ok) break;
         qsort(ts, (size_t)reps, sizeof(double), spec_cmp_double);
-        g_spec_cost[n] = ts[reps / 2];
+        cost[n] = ts[reps / 2];
     }
-    (void)t;
     vt->engine_free(e);
+    for (int n = 1; ok && n <= kmax + 1; ++n) if (!(cost[n] > 0.0)) ok = 0;
+    if (!ok) {
+        fprintf(stderr, "[Tuff] spec: cost-table measurement failed; using the static cost table\n");
+        return;
+    }
+    for (int n = 1; n <= kmax + 1; ++n) g_spec_cost[n] = cost[n];
     g_spec_cost_measured = 1;
 }
 
@@ -351,11 +367,16 @@ static int spec_step(spec_t *s, int32_t t, int pos, int rem, int32_t *out) {
     const double t0 = omp_get_wtime();
     if (k == 0) {
         out[0] = vt->engine_forward_token(s->eng, t, pos);
+        if (out[0] < 0) {
+            fprintf(stderr, "[Tuff] FATAL: engine_forward_token failed at position %d\n", pos);
+            exit(3);
+        }
         spec_push(s, out[0]);
         if (!s->k_fixed) {
             const double x = (omp_get_wtime() - t0) / g_spec_cost[1];
             if (!g_spec_cost_measured && s->n_single == 0) s->m1 = x;   // static table is in nominal units: adopt the first reading
             else { const double a = s->n_single < 19 ? 1.0 / (double)(s->n_single + 1) : 0.05; s->m1 += a * (x - s->m1); }
+            if (s->m1 < 1e-9) s->m1 = 1e-9;   // the policy divides by it
             s->n_single++;
         }
         return 1;
@@ -396,6 +417,24 @@ static void spec_print_stats(const spec_t *s, unsigned long long tokens) {
     fprintf(stderr, "\n");
 }
 
+static int arch_is_lfm(tuff_arch_t a) { return a == TUFF_ARCH_LFM2 || a == TUFF_ARCH_LFM2MOE; }
+
+// The context window must hold every position a run will feed: `need` positions into a window of `ctx`.
+static int ctx_fits(const char *what, long need, int ctx) {
+    if (need <= (long)ctx) return 1;
+    fprintf(stderr, "[Tuff] ERROR: %s needs %ld context positions but the context window (-c) is %d; "
+                    "raise -c to at least %ld or reduce the prompt/-n\n", what, need, ctx, need);
+    return 0;
+}
+
+// A forward step that returned an error (-1) must abort the run, never feed garbage tokens onward.
+static void fwd_check(int is_lfm, int32_t t, int pos) {
+    if (is_lfm && t < 0) {
+        fprintf(stderr, "[Tuff] FATAL: engine_forward_token failed at position %d\n", pos);
+        exit(3);
+    }
+}
+
 int main(int argc, char **argv) {
     const char *model_path = "/run/media/nii/pohjola/models/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_S.gguf";
     const char *prompt = "Hello";
@@ -420,6 +459,7 @@ int main(int argc, char **argv) {
     int n_runs = 3;
     int n_gpu_expert_layers = 0; // 0 => auto (computed below); set g_n_gpu_expert_layers in gpu.h
     sampler_params_t sampler_params = sampler_params_default();
+    const float default_temp = sampler_params.temp;
 
     const char *teacher_force_path = NULL; // non-NULL => --teacher-force mode
     int tf_batch = 1;                      // --tf-batch B: teacher-force in chunks of B tokens through engine_forward_batch
@@ -628,6 +668,10 @@ int main(int argc, char **argv) {
     }
 
     if (n_predict < 0) n_predict = (dump_tokens_mode || dump_logits_path) ? 32 : 128;
+    if (n_runs < 1 || n_warmup < 0) {
+        fprintf(stderr, "Error: --runs must be >= 1 and --warmup >= 0 (got --runs %d --warmup %d)\n", n_runs, n_warmup);
+        return 2;
+    }
     if (n_predict <= 0) {
         fprintf(stderr, "Error: -n must be >= 1 (got %d)\n", n_predict);
         return 2;
@@ -655,13 +699,23 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[Tuff] Detected architecture: %s (%s engine)\n",
             tuff_arch_to_string(arch), vtable->name);
 
+    const int is_lfm = arch_is_lfm(arch);
+
+    // The LFM2.5 engines decode greedily only (the sampler is stored but never consulted).
+    if (is_lfm && sampler_params.temp > 0.0f) {
+        if (default_temp <= 0.0f) {
+            fprintf(stderr, "[Tuff] ERROR: sampling not implemented for LFM2.5 (--temp %g); use --temp 0\n", (double)sampler_params.temp);
+            return 2;
+        }
+        fprintf(stderr, "[Tuff] WARNING: LFM2.5 decodes greedily; --temp %g (default %g) is ignored\n",
+                (double)sampler_params.temp, (double)default_temp);
+    }
+
     // LFM engines: lossless n-gram speculation is opt-in via an explicit --spec-draft ngram (greedy only).
     bool lfm_spec = false;
     int spec_nmax = g_spec_ngram_n, spec_nmin = g_spec_ngram_min, spec_kfix = 0;
     if (spec_ngram_requested && vtable->engine_forward_batch && vtable->engine_rollback) {
-        if (sampler_params.temp > 0.0f) {
-            fprintf(stderr, "[Tuff] spec: speculation disabled (temp > 0; the LFM speculative path is greedy-only)\n");
-        } else {
+        {
             lfm_spec = true;
             if (spec_nmin > spec_nmax) spec_nmin = spec_nmax;
             const char *ks = getenv("LFM25_SPEC_K");
@@ -702,7 +756,11 @@ int main(int argc, char **argv) {
     }
 
     // M2: upload dense weights to VRAM once, before any decode.
-    vtable->gpu_prepare(model, &max_context_len, fill_ram ? 1 : 0);
+    if (vtable->gpu_prepare(model, &max_context_len, fill_ram ? 1 : 0) != 0) {
+        fprintf(stderr, "[Tuff] ERROR: GPU preparation failed for %s (model not supported by the %s engine)\n", model_path, vtable->name);
+        vtable->model_free(model);
+        return 1;
+    }
 
     if (arch == TUFF_ARCH_QWEN35MOE) {
         model_t *qm = (model_t*)model;
@@ -770,6 +828,23 @@ int main(int argc, char **argv) {
     for (int i = 0; i < n_prompt; ++i) fprintf(stderr, "%d ", prompt_tokens[i]);
     fprintf(stderr, "\n");
 
+    // LFM engines index a fixed KV window: refuse up front a run that would feed positions beyond -c (the engine also
+    // rejects out-of-range positions, but failing here is immediate and covers every mode).
+    if (is_lfm && !teacher_force_path) {
+        long need;
+        const char *what;
+        if (dump_logits_path) { need = (long)n_prompt + n_predict; what = "--dump-logits (prompt + -n)"; }
+        else if (dump_tokens_mode) { need = (long)n_prompt + n_predict; what = "--dump-tokens (prompt + -n)"; }
+        else { need = (long)n_prompt + n_warmup + n_predict; what = "generation/bench (prompt + --warmup + -n)"; }
+        if (!ctx_fits(what, need, max_context_len)) {
+            free(prompt_tokens);
+            tokenizer_free(tok);
+            vtable->gpu_shutdown(model);
+            vtable->model_free(model);
+            return 2;
+        }
+    }
+
     if (teacher_force_path) {
         FILE *tf = fopen(teacher_force_path, "r");
         if (!tf) {
@@ -779,18 +854,45 @@ int main(int argc, char **argv) {
             vtable->model_free(model);
             return 2;
         }
-        int32_t ref_tokens[65536];
-        int n_ref = 0;
+        // At most max_context_len reference tokens are ever used; heap-allocated (the default window is 131072).
+        int32_t *ref_tokens = (int32_t*)malloc((size_t)max_context_len * sizeof(int32_t));
+        const uint32_t tf_vocab_chk = vtable->model_get_vocab_size(model);
+        int n_ref = 0, tf_bad = 0, tf_lineno = 0;
         char line[256];
-        while (fgets(line, sizeof(line), tf) && n_ref < max_context_len) {
+        while (ref_tokens && fgets(line, sizeof(line), tf) && n_ref < max_context_len) {
             int t = 0;
+            tf_lineno++;
             if (sscanf(line, "%d", &t) == 1) {
+                if (t < 0 || (uint32_t)t >= tf_vocab_chk) {
+                    fprintf(stderr, "[Tuff] FATAL: teacher-force file %s line %d: token id %d is outside the vocabulary [0, %u)\n",
+                            teacher_force_path, tf_lineno, t, tf_vocab_chk);
+                    tf_bad = 1;
+                    break;
+                }
                 ref_tokens[n_ref++] = (int32_t)t;
             }
         }
         fclose(tf);
+        if (!ref_tokens) {
+            fprintf(stderr, "[Tuff] FATAL: out of memory for the teacher-force reference\n");
+            free(prompt_tokens);
+            tokenizer_free(tok);
+            vtable->gpu_shutdown(model);
+            vtable->model_free(model);
+            return 2;
+        }
+        if (tf_bad) {
+            free(ref_tokens);
+            free(prompt_tokens);
+            tokenizer_free(tok);
+            vtable->gpu_shutdown(model);
+            vtable->model_free(model);
+            return 2;
+        }
         if (n_ref == 0) {
             fprintf(stderr, "[Tuff] FATAL: teacher-force file contained 0 tokens\n");
+            free(ref_tokens);
+            free(prompt_tokens);
             tokenizer_free(tok);
             vtable->gpu_shutdown(model);
             vtable->model_free(model);
@@ -800,6 +902,14 @@ int main(int argc, char **argv) {
         int target_steps = (n_predict > 0 && n_predict < n_ref) ? n_predict : n_ref;
         fprintf(stderr, "[Tuff] --teacher-force: testing %d steps against %s\n",
                 target_steps, teacher_force_path);
+        if (is_lfm && !ctx_fits("--teacher-force (prompt + reference steps)", (long)n_prompt + target_steps, max_context_len)) {
+            free(ref_tokens);
+            free(prompt_tokens);
+            tokenizer_free(tok);
+            vtable->gpu_shutdown(model);
+            vtable->model_free(model);
+            return 2;
+        }
 
         // With --dump-logits, the teacher-forced pass also writes the logit vector of every
         // step (same CLBRLGT1 format as the free-running dump). Because every step is fed the
@@ -824,6 +934,16 @@ int main(int argc, char **argv) {
         }
 
         void *eng = vtable->engine_init(model, max_context_len);
+        if (!eng) {
+            fprintf(stderr, "[Tuff] FATAL: engine initialization failed\n");
+            if (tf_dump) { fclose(tf_dump); remove(dump_logits_path); }
+            free(ref_tokens);
+            free(prompt_tokens);
+            tokenizer_free(tok);
+            vtable->gpu_shutdown(model);
+            vtable->model_free(model);
+            return 3;
+        }
         vtable->engine_set_sampler(eng, &sampler_params);
 
         if (tf_rollback && tf_batch < 2) {
@@ -931,6 +1051,8 @@ int main(int argc, char **argv) {
             }
             fprintf(stderr, "========================================================================\n");
             vtable->engine_free(eng);
+            free(ref_tokens);
+            free(prompt_tokens);
             tokenizer_free(tok);
             vtable->gpu_shutdown(model);
             vtable->model_free(model);
@@ -943,6 +1065,7 @@ int main(int argc, char **argv) {
         int32_t pred_token = prompt_tokens[0];
         for (int i = 0; i < n_prompt; ++i) {
             pred_token = vtable->engine_forward_token(eng, prompt_tokens[i], pos++);
+            fwd_check(is_lfm, pred_token, pos - 1);
         }
 
         int matches = 0;
@@ -973,6 +1096,7 @@ int main(int argc, char **argv) {
             }
             // Teacher-force: next step receives expected reference token instead of pred_token
             pred_token = vtable->engine_forward_token(eng, expected, pos++);
+            fwd_check(is_lfm, pred_token, pos - 1);
         }
         tuff_logit_capture_enable(0);
 
@@ -1005,6 +1129,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "========================================================================\n");
 
         vtable->engine_free(eng);
+        free(ref_tokens);
+        free(prompt_tokens);
         tokenizer_free(tok);
         vtable->gpu_shutdown(model);
         vtable->model_free(model);
@@ -1022,11 +1148,20 @@ int main(int argc, char **argv) {
         tuff_logit_capture_enable(1);
 
         void *eng = vtable->engine_init(model, max_context_len);
+        if (!eng) {
+            fprintf(stderr, "[Tuff] FATAL: engine initialization failed\n");
+            tuff_logit_capture_enable(0);
+            tokenizer_free(tok);
+            vtable->gpu_shutdown(model);
+            vtable->model_free(model);
+            return 3;
+        }
         vtable->engine_set_sampler(eng, &sampler_params);
         int pos = 0;
         int32_t curr_token = prompt_tokens[0];
         for (int i = 0; i < n_prompt; ++i) {
             curr_token = vtable->engine_forward_token(eng, prompt_tokens[i], pos++);
+            fwd_check(is_lfm, curr_token, pos - 1);
         }
 
         // The vector left behind by the last prompt forward is the one that selected the
@@ -1084,6 +1219,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "%s%d", i ? " " : "[Tuff] token IDs: ", curr_token);
 
             curr_token = vtable->engine_forward_token(eng, curr_token, pos++);
+            fwd_check(is_lfm, curr_token, pos - 1);
             uint32_t vn = 0;
             lg = tuff_logit_capture_take(&vn);
             if (i + 1 < n_predict && (!lg || vn != vocab)) {
@@ -1131,11 +1267,19 @@ int main(int argc, char **argv) {
         if (lfm_spec && !spec_kfix) spec_measure_costs(vtable, model, max_context_len, &sampler_params, prompt_tokens, n_prompt, spec_k_max,
                                                    arch == TUFF_ARCH_LFM2 || getenv("LFM25_SPEC_MEASURE") != NULL);
         void *eng = vtable->engine_init(model, max_context_len);
+        if (!eng) {
+            fprintf(stderr, "[Tuff] FATAL: engine initialization failed\n");
+            tokenizer_free(tok);
+            vtable->gpu_shutdown(model);
+            vtable->model_free(model);
+            return 3;
+        }
         vtable->engine_set_sampler(eng, &sampler_params);
         int pos = 0;
         int32_t curr_token = prompt_tokens[0];
         for (int i = 0; i < n_prompt; ++i) {
             curr_token = vtable->engine_forward_token(eng, prompt_tokens[i], pos++);
+            fwd_check(is_lfm, curr_token, pos - 1);
         }
         if (lfm_spec) {
             spec_t sp;
@@ -1163,6 +1307,7 @@ int main(int argc, char **argv) {
             printf("%d\n", curr_token);
             fflush(stdout);
             curr_token = vtable->engine_forward_token(eng, curr_token, pos++);
+            fwd_check(is_lfm, curr_token, pos - 1);
         }
         }
         vtable->engine_free(eng);
@@ -1197,6 +1342,16 @@ int main(int argc, char **argv) {
 
     for (int run = 0; run < n_runs; ++run) {
         void *eng = vtable->engine_init(model, max_context_len);
+        if (!eng) {
+            fprintf(stderr, "[Tuff] FATAL: engine initialization failed (run %d)\n", run + 1);
+            if (lfm_spec) free(lfm_sp.hist);
+            if (drafter) drafter_free(drafter);
+            free(tok_per_sec);
+            tokenizer_free(tok);
+            vtable->gpu_shutdown(model);
+            vtable->model_free(model);
+            return 3;
+        }
         vtable->engine_set_sampler(eng, &sampler_params);
         int pos = 0;
         int32_t curr_token = prompt_tokens[0];
@@ -1206,6 +1361,7 @@ int main(int argc, char **argv) {
 
         for (int i = 0; i < n_prompt; ++i) {
             curr_token = vtable->engine_forward_token(eng, prompt_tokens[i], pos++);
+            fwd_check(is_lfm, curr_token, pos - 1);
         }
         if (lfm_spec) {
             spec_begin_run(&lfm_sp, eng);
@@ -1216,6 +1372,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < n_warmup; ++i) {
             warmup_seq[n_prompt + i] = curr_token;
             curr_token = vtable->engine_forward_token(eng, curr_token, pos++);
+            fwd_check(is_lfm, curr_token, pos - 1);
             if (lfm_spec) spec_push(&lfm_sp, curr_token);
         }
 
@@ -1277,6 +1434,7 @@ int main(int argc, char **argv) {
             }
 
             int32_t next_tok = vtable->engine_forward_token(eng, curr_token, pos++);
+            fwd_check(is_lfm, next_tok, pos - 1);
             n_generated++;
 
             if (spec_measure_mode && arch == TUFF_ARCH_QWEN35MOE) {
