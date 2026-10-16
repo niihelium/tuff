@@ -68,16 +68,16 @@ checks: router8 oracle:moe8
 id: down-expert0-acts
 desc: expert down projection reads expert-0 activations for every expert
 file: src/lfm25_gpu.cu
-old: const block_q8_1_c *yk8 = y + (size_t)k * nblk * (QK_K / QK8_1);
-new: const block_q8_1_c *yk8 = y + (size_t)0 * nblk * (QK_K / QK8_1);
+old: rw[k] + kbx, y + (size_t)k * nblk * (QK_K / QK8_1) + kbx * (QK_K / QK8_1), kqs);
+new: rw[k] + kbx, y + (size_t)0 * nblk * (QK_K / QK8_1) + kbx * (QK_K / QK8_1), kqs);
 targets: lfm25-moe-ffn-test
 checks: moeffn8
 
 id: q6k-down-as-q4k
 desc: Q6_K expert down dispatched through the Q4_K kernel
 file: src/lfm25_gpu.cu
-old: if (down_type == GGML_TYPE_Q4_K) {
-new: if (down_type == GGML_TYPE_Q4_K || down_type == GGML_TYPE_Q6_K) {
+old: if (pre_mask == 0u) {\n        if (down_type == GGML_TYPE_Q4_K) {
+new: if (pre_mask == 0u) {\n        if (down_type == GGML_TYPE_Q4_K || down_type == GGML_TYPE_Q6_K) {
 targets: lfm25-moe-ffn-test
 checks: moeffn8
 

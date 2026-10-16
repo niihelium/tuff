@@ -6,11 +6,12 @@
 #   golden dense|dense26|moe8|moe   byte-identity vs the frozen goldens (graph on/off, expert cache)
 #   oracle dense|dense26|moe8|moe   three-stage llama.cpp/FP64 gate with locked thresholds
 #   router8/24, moeffn8/24     kernel unit tests vs llama.cpp fixtures
+#   cpuexp8/24                 CPU-miss expert path byte-identical to the all-GPU path (every miss mask)
 #   --controls                 also run the full negative-control suite (tests/lfm25_negative_controls.sh)
 #   --spec                     also run the speculative-decoding losslessness check (tests/verify_lfm25_spec.sh; slow, ~6 min)
 #
 # Env: TUFF_BIN (default ./build/tuff; the unit-test binaries are taken from the same build dir), PYTHON.
-# Builds nothing: run `cmake --build build -j16 --target tuff lfm25-llama-ref lfm25-router-test lfm25-moe-ffn-test` first.
+# Builds nothing: run `cmake --build build -j16 --target tuff lfm25-llama-ref lfm25-router-test lfm25-moe-ffn-test lfm25-cpu-expert-test` first.
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
@@ -51,6 +52,8 @@ step "router8"   "$BDIR/lfm25-router-test"  "$M8"  tests/fixtures/lfm25_8b_route
 step "router24"  "$BDIR/lfm25-router-test"  "$M24" tests/fixtures/lfm25_24b_router_cases.bin
 step "moeffn8"   "$BDIR/lfm25-moe-ffn-test" "$M8"  tests/fixtures/lfm25_8b_moe_ffn_cases.bin
 step "moeffn24"  "$BDIR/lfm25-moe-ffn-test" "$M24" tests/fixtures/lfm25_24b_moe_ffn_cases.bin
+step "cpuexp8"   "$BDIR/lfm25-cpu-expert-test" "$M8"  1
+step "cpuexp24"  "$BDIR/lfm25-cpu-expert-test" "$M24" 1
 [ "$SPEC" -eq 1 ] && step "spec lossless" ./tests/verify_lfm25_spec.sh
 [ "$CONTROLS" -eq 1 ] && step "negative controls" ./tests/lfm25_negative_controls.sh
 

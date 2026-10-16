@@ -39,7 +39,7 @@ cd "$(dirname "$0")/.."
 BIN="${TUFF_BIN:-./build/tuff}"
 THR="tests/lfm25_gate_thresholds.txt"
 PROMPT="Hello"
-CPU_MISS_DEFAULT=0     # tuff default of LFM25_CPU_MISS on the expert-cache path (must match LFM25_CPU_MISS_DEFAULT)
+CPU_MISS_DEFAULT=1     # tuff default of LFM25_CPU_MISS on the expert-cache path (must match LFM25_CPU_MISS_DEFAULT)
 
 locked() {
     local v
@@ -119,6 +119,8 @@ mode_setup() {
                      "tf-batch4||--tf-batch 4"
                      "tf-batch4-rollback-cache|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300|--tf-batch 4 --tf-rollback"
                      "cpu-miss-tiny|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300;LFM25_CPU_MISS=1"
+                     "upload-miss-tiny|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300;LFM25_CPU_MISS=0"
+                     "upload-miss-tiny-alt|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300;LFM25_CPU_MISS=0;LFM25_PREFETCH=1;LFM25_PINNED_EXPERTS=0;LFM25_CACHE_POLICY=lru"
                      "cpu-miss-tiny-noadmit|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300;LFM25_CPU_MISS=1;LFM25_CPU_MISS_ADMIT=0"
                      "tf-batch4-cpu-miss|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300;LFM25_CPU_MISS=1;LFM25_CPU_MISS_ADMIT=0|--tf-batch 4"
                      "tf-batch4-rollback-cpu-miss|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300;LFM25_CPU_MISS=1|--tf-batch 4 --tf-rollback"
@@ -131,7 +133,7 @@ mode_setup() {
             REF="tests/ref_lfm25_moe_128.txt"
             CONFIGS=("graph=1|LFM25_CUDA_GRAPH=1" "graph=0|LFM25_CUDA_GRAPH=0" "prefetch|LFM25_PREFETCH=1"
                      "tf-batch4||--tf-batch 4" "spec-ngram||--spec-draft ngram"
-                     "cpu-miss|LFM25_CPU_MISS=1" "cpu-miss-noadmit|LFM25_CPU_MISS=1;LFM25_CPU_MISS_ADMIT=0"
+                     "cpu-miss|LFM25_CPU_MISS=1" "upload-miss|LFM25_CPU_MISS=0" "upload-miss-prefetch|LFM25_CPU_MISS=0;LFM25_PREFETCH=1" "cpu-miss-noadmit|LFM25_CPU_MISS=1;LFM25_CPU_MISS_ADMIT=0"
                      "tf-batch4-cpu-miss|LFM25_CPU_MISS=1|--tf-batch 4" "spec-ngram-cpu-miss|LFM25_CPU_MISS=1|--spec-draft ngram") ;;
     esac
 }
