@@ -4,7 +4,7 @@ Everything needed to resume LFM2.5 work efficiently: current state, how we work,
 result, the hard-won facts, the pitfalls, and what is next. Companion to [LFM25_ROADMAP.md](../../LFM25_ROADMAP.md)
 (the plan + per-task results) and [architecture.md](../architecture.md).
 
-Last updated: 2026-10-16. Branch: `lfm25-phase1` (pushed to `origin`; not merged to `main`).
+Last updated: 2026-10-16 (end of day). Branch: `lfm25-phase1` (pushed to `origin`; not merged to `main`).
 
 ---
 
@@ -362,6 +362,12 @@ $PY tools/lfm25_pack_moe_fixtures.py    /tmp/d24 tests/fixtures/lfm25_24b_moe_ff
 ---
 
 ## 11. Next steps (in order)
+
+**2026-10-16 end state:** all roadmap tasks done; benchmarks vs llama.cpp, roofline and the ranked list of further
+optimizations are in [followup_2026-10-16.md](followup_2026-10-16.md) (raw data: [bench_2026-10-16.md](bench_2026-10-16.md)).
+Open decision: 2.6B stage-3 metric (followup §6). Tools: `tools/bw_probe.cu`, `tools/lfm25_bytes_per_token.py`,
+`scripts/lfm25_bench_vs_llama.sh`.
+
 
 1. **Task 4.1 A/B — done 2026-10-16** (balanced profile, accepted by the user; `FORCE=1`, all other power checks ok):
    1.2B 321.8 → 343.4 tok/s, +6.69% ± 0.17 (95% CI [+6.34, +7.04]); 8B 214.2 → 229.2 tok/s, +7.00% ± 0.08
