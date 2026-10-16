@@ -23,7 +23,7 @@ Last updated: 2026-10-16 (end of day). Branch: `lfm25-phase1` (pushed to `origin
 | 4.2 — fused in_proj+conv+gate+Q8_1, multi-block RMSNorm | done; A/B +5.46% / +5.65% / +4.79% | see git log | logits byte-identical to `e133b44` (3 models, graph on/off, forced cache) |
 | 4.2b — long-K Q6_K/Q4_K down matvec (unroll) | done; A/B 1.2B +4.26% (≈378 tok/s) | see git log | golden PASS ×3, 336/322 GB/s |
 | 4.3 — copy stream, pinned expert store, LFRU (24B); prefetch opt-in | done; A/B +3.4% (Hello) / +12.5% (translate) | see git log | golden PASS incl. tiny-cache + prefetch configs; 2 new cache controls |
-| 2.6B — dense 30-layer stepping stone | done; **not oracle-validated**: stage 3 FAIL (worst step 2.44 > 2.0, uniform-shift artefact), recorded, not waived; metric change = optional user proposal | see git log | roadmap *Stepping stone 2* |
+| 2.6B — dense 30-layer stepping stone | done, **oracle PASS** after the user-approved shift-invariant stage 3 (`a9155e3`; was worst step 2.44 > 2.0 on the plain RMS); golden recorded, in `all` | see git log | roadmap *Stepping stone 2*; 14/14 controls |
 | 5.1 — batched verify forward + conv rollback | done; verify(4) = 1.9× a token on 1.2B | see git log | golden PASS on tf-batch / rollback configs; 12/12 controls |
 | 5.2 — lossless n-gram speculation, adaptive k | done; 1.2B ≤ 1.09×, 2.6B ≤ 2.12×, 8B ≈ 1.0×, 24B ≤ 1.14× (worst 0.979) | see git log | 18/18 spec streams identical; 13/13 controls |
 
@@ -110,7 +110,7 @@ Orchestrator review checklist per task:
 3. **Three-stage oracle gate** vs llama.cpp + an FP64 numpy reference (end to end).
 4. **Negative controls** proving each test can fail.
 
-### 4.2 The oracle gate (`tests/verify_lfm25_oracle.sh dense|moe8|moe`)
+### 4.2 The oracle gate (`tests/verify_lfm25_oracle.sh dense|dense26|moe8|moe`)
 Why not 128/128 exact token match vs llama.cpp: llama.cpp cannot pass it against itself (GPU vs CPU diverge at token 5;
 same commit could not reproduce the old reference past token 25). FP64 top-2 margins as small as 0.004–0.014 occur within
 20 tokens while Q8_1 rounding noise is ~0.1 logit RMS, so after the first near-tie the streams fork by luck.
@@ -119,15 +119,19 @@ Stages (all must pass):
 1. **Exact prefix**: first min(16, first reference step with margin < 0.5) greedy tokens identical (dense: 10, 8B: 2, 24B: 1).
 2. **Teacher-forced top-1** on all 128 steps: a miss is OK only if the reference's own top1−top2 margin < 0.5, or — with FP64
    coverage — if ground truth does not prefer the reference token by ≥ 0.5 (signed: `fp64[ref] − fp64[tuff] < 0.5`).
-3. **FP64 tolerance**: tuff's per-step logit RMS vs FP64 compared with llama.cpp's. Dense: mean ratio ≤ 1.10 and worst step
+3. **FP64 tolerance**: tuff's per-step logit RMS vs FP64 compared with llama.cpp's — **shift-invariant** since `a9155e3`
+   (each step's mean error over the vocab is subtracted first, both runtimes, all modes; softmax/argmax ignore a uniform
+   shift, which is 56–66 % of the squared error on the 128k-vocab models). Dense: mean ratio ≤ 1.10 and worst step
    ≤ 2.0. MoE (`--stat robust`): median ratio ≤ 1.10 and p90 ratio ≤ 1.5 — router near-ties (4th/5th expert gap median 0.017)
    flip experts in BOTH runtimes, making mean/worst luck-dominated (8B: mean 1.21 / worst 5.54 from flips vs median 0.96).
 
-Current results:
-- dense: prefix 10/10, TF 124/128 (4 near-ties), mean ratio 0.71, worst 0.95.
-- moe8: prefix 2/2, TF 127/128 (1 near-tie), median 0.96, p90 1.11.
+Current results (stage 3 shift-invariant; plain-RMS values from before `a9155e3` in brackets):
+- dense: prefix 10/10, TF 124/128 (4 near-ties), mean ratio 0.81, worst 0.98 [0.71, 0.95].
+- dense26: prefix skipped (near-tie at step 0), TF 126/128 (2 near-ties), mean ratio 0.93, worst 1.33 [0.95, **2.44 FAIL**].
+- moe8: prefix 2/2, TF 127/128 (1 near-tie), median 0.93, p90 1.25 [0.96, 1.11].
 - moe (24B, reference = llama.cpp with experts on its CPU, noisier: RMS vs FP64 median 0.44): prefix 1/1, TF 114/128
-  (13 near-ties + step 68 FP64-adjudicated: ref margin 0.954 but FP64 prefers ref by only 0.328), median 0.69, p90 0.55.
+  (13 near-ties + step 68 FP64-adjudicated: ref margin 0.954 but FP64 prefers ref by only 0.328), median 0.62, p90 0.60
+  [0.69, 0.55].
   FP64 argmax agrees with tuff 69/72 vs with the reference 63/72.
 
 ### 4.3 Honest caveats and how they are now addressed
@@ -137,6 +141,13 @@ Current results:
   looking at the result it would flip.
 - The gate was changed twice **after** a failure (robust MoE stat; FP64 adjudication). Both were evidence-backed and
   followed by a negative control that still fails — but "test fails → change test" is a pattern to distrust.
+- **Third post-result change (2026-10-16, `a9155e3`): shift-invariant stage-3 RMS, all modes.** The 2.6B failed stage 3
+  only on the worst step (2.44 > 2.0 at step 1), and that error was a uniform logit shift (tuff −0.225 vs llama.cpp −0.019;
+  shift-free 0.082 vs 0.096; worst shift-free ratio 1.33; mean |shift| 0.056 in both runtimes, no systematic bias). The
+  change was made AFTER seeing that FAIL, so it went to the user under the lock rule; **the user approved it**. Thresholds
+  unchanged (sha256 `4023c970b5df`). Evidence it is not a loosening in disguise: the other three modes still pass with
+  similar ratios (table in the roadmap's *Gate Design*), and the new `conv-taps-swap-dense26` control still fails both
+  golden:dense26 and oracle:dense26. Full suite after the change: ALL PASS, 14/14 controls.
 - Stage 1 is nearly vacuous for MoE (2 and 1 tokens).
 - **Golden self-regression gate** (`tests/verify_lfm25_golden.sh`, 2026-10-16): the true 1:1 test. It freezes tuff's
   validated 128 greedy tokens plus the sha256 of each of the 128 teacher-forced logit rows per model (`tests/golden/*.json`),
@@ -148,7 +159,7 @@ Current results:
 - **Negative controls automated** (`tests/lfm25_negative_controls.sh`, table `tests/lfm25_negctl.txt`): 8 mutations,
   applied as exact single-match string replacements in a scratch copy (`/tmp/tuff_negctl`). A control whose string
   no longer matches is reported STALE and fails the run. ~100 s.
-- One entry point: `tests/verify_lfm25_all.sh [--controls]` (golden ×3, oracle ×3, 4 unit tests, optionally the controls),
+- One entry point: `tests/verify_lfm25_all.sh [--controls]` (golden ×4, oracle ×4 since dense26 joined `all`, 4 unit tests, optionally the controls),
   ~3 min with controls.
 
 ### 4.3b Gate robustness (after the Opus 5.5 review, 2026-10-16)
@@ -165,7 +176,7 @@ Current results:
 ### 4.4 Negative controls that must fail (keep using them)
 | Bug injected | Caught by |
 | :--- | :--- |
-| conv taps k0/k1 swapped | dense gate: prefix 1/16, 55 hard misses, FP64 ratio 17.9 |
+| conv taps k0/k1 swapped | dense gate: prefix 1/16, 55 hard misses, FP64 ratio 17.9; 2.6B (`conv-taps-swap-dense26`): golden + oracle FAIL |
 | router weights from biased score | router test 0/176 |
 | router ignores selection bias | router 57/176; moe8 gate stage 2 one hard miss, stage 3 median ratio 3.92 |
 | gate/up always expert id[0] | moe_ffn 0/44 |
@@ -365,7 +376,7 @@ $PY tools/lfm25_pack_moe_fixtures.py    /tmp/d24 tests/fixtures/lfm25_24b_moe_ff
 
 **2026-10-16 end state:** all roadmap tasks done; benchmarks vs llama.cpp, roofline and the ranked list of further
 optimizations are in [followup_2026-10-16.md](followup_2026-10-16.md) (raw data: [bench_2026-10-16.md](bench_2026-10-16.md)).
-2.6B closed as not oracle-validated; optional proposal: shift-invariant stage-3 metric (followup §6). Tools: `tools/bw_probe.cu`, `tools/lfm25_bytes_per_token.py`,
+2.6B: oracle PASS after the user-approved shift-invariant stage 3 (`a9155e3`), golden recorded, in `all` (followup §6 resolved). Tools: `tools/bw_probe.cu`, `tools/lfm25_bytes_per_token.py`,
 `scripts/lfm25_bench_vs_llama.sh`.
 
 

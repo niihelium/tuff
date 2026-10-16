@@ -3,8 +3,8 @@
 #
 # Usage: verify_lfm25_all.sh [--controls] [--spec]
 #
-#   golden dense|moe8|moe      byte-identity vs the frozen goldens (graph on/off, expert cache)
-#   oracle dense|moe8|moe      three-stage llama.cpp/FP64 gate with locked thresholds
+#   golden dense|dense26|moe8|moe   byte-identity vs the frozen goldens (graph on/off, expert cache)
+#   oracle dense|dense26|moe8|moe   three-stage llama.cpp/FP64 gate with locked thresholds
 #   router8/24, moeffn8/24     kernel unit tests vs llama.cpp fixtures
 #   --controls                 also run the full negative-control suite (tests/lfm25_negative_controls.sh)
 #   --spec                     also run the speculative-decoding losslessness check (tests/verify_lfm25_spec.sh; slow, ~6 min)
@@ -45,9 +45,8 @@ step() {  # <name> <cmd...>
     if [ $rc -eq 0 ]; then RES+=("PASS"); else RES+=("FAIL (exit $rc)"); fi
 }
 
-# dense26 excluded pending user decision on the stage-3 shift-sensitivity finding, see LFM25_ROADMAP.md
-for m in dense moe8 moe; do step "golden $m" ./tests/verify_lfm25_golden.sh "$m"; done
-for m in dense moe8 moe; do step "oracle $m" ./tests/verify_lfm25_oracle.sh "$m"; done
+for m in dense dense26 moe8 moe; do step "golden $m" ./tests/verify_lfm25_golden.sh "$m"; done
+for m in dense dense26 moe8 moe; do step "oracle $m" ./tests/verify_lfm25_oracle.sh "$m"; done
 step "router8"   "$BDIR/lfm25-router-test"  "$M8"  tests/fixtures/lfm25_8b_router_cases.bin
 step "router24"  "$BDIR/lfm25-router-test"  "$M24" tests/fixtures/lfm25_24b_router_cases.bin
 step "moeffn8"   "$BDIR/lfm25-moe-ffn-test" "$M8"  tests/fixtures/lfm25_8b_moe_ffn_cases.bin

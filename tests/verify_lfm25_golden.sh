@@ -225,7 +225,7 @@ update_mode() {
 }
 
 modes=("$TARGET")
-[ "$TARGET" = "all" ] && modes=(dense moe8 moe)
+[ "$TARGET" = "all" ] && modes=(dense dense26 moe8 moe)
 overall=0
 for m in "${modes[@]}"; do
     if [ "$UPDATE" -eq 1 ]; then update_mode "$m" || overall=1

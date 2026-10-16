@@ -22,6 +22,14 @@ new: float x_val = s_proj[64 + lane];\n\n    float u = b_val * x_val;\n\n    flo
 targets: tuff
 checks: golden:dense oracle:dense
 
+id: conv-taps-swap-dense26
+desc: conv taps k0/k1 swapped in fused in_proj+shortconv kernel (2.6B)
+file: src/lfm25_gpu.cu
+old: float x_val = s_proj[64 + lane];\n\n    float u = b_val * x_val;\n\n    float s0 = conv_state[i];\n    float s1 = conv_state[d + i];\n\n    float k0 = conv_w[i * 3 + 0];\n    float k1 = conv_w[i * 3 + 1];
+new: float x_val = s_proj[64 + lane];\n\n    float u = b_val * x_val;\n\n    float s0 = conv_state[i];\n    float s1 = conv_state[d + i];\n\n    float k0 = conv_w[i * 3 + 1];\n    float k1 = conv_w[i * 3 + 0];
+targets: tuff
+checks: golden:dense26 oracle:dense26
+
 id: inproj-bc-swap
 tags: quick
 desc: b and c in_proj rows swapped in fused in_proj+shortconv kernel

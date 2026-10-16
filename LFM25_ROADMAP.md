@@ -50,6 +50,17 @@ The gate therefore has three stages, all required:
 2. **Teacher-forced top-1**: all 128 reference steps are fed to tuff; a disagreement is allowed only where the reference itself is a near-tie (llama.cpp margin < 0.5).
 3. **FP64 tolerance**: over 32 teacher-forced steps, tuff's logit RMS error vs an FP64 numpy reference (`tools/lfm25_fp64_ref.py`) must be ≤ 1.10× llama.cpp's own, worst step ≤ 2.0×.
 
+**Shift-invariant stage 3 (all modes, 2026-10-16, `a9155e3`).** The per-step RMS is taken after subtracting that step's mean logit error over the vocab, identically for tuff and llama.cpp (i.e. the standard deviation of the error across the vocab); the mean |shift| is printed for information. Rationale: softmax and argmax are invariant to a uniform logit shift, and on the 128k-vocab models the shift is 56–66 % of the squared error in both runtimes (1.2B: 4 % / 27 %), so the old RMS was dominated by a component the output cannot see. **This changed the gate after the 2.6B stage-3 FAIL had been seen**; per the lock rule it was the user's decision, and the user approved it. No threshold value changed (`tests/lfm25_gate_thresholds.txt` sha256 `4023c970b5df`). Stage-3 lines before → after (same build):
+
+| Mode | Before (plain RMS) | After (shift-invariant) |
+| :--- | :--- | :--- |
+| dense (1.2B) | tuff 0.0938 / llama.cpp 0.1325, mean ratio 0.71, worst 0.95 — PASS | 0.0914 / 0.1133, ratio 0.81, worst 0.98 — PASS |
+| dense26 (2.6B) | 0.0925 / 0.0979, ratio 0.95, **worst 2.44 > 2.0 — FAIL** | 0.0634 / 0.0683, ratio 0.93, worst 1.33 — PASS (mean \|shift\| 0.056 / 0.056) |
+| moe8 (8B) | median 0.96, p90 1.11 (mean 1.21, worst 5.54) — PASS | median 0.93, p90 1.25 (mean 1.12, worst 5.11) — PASS |
+| moe (24B) | median 0.69, p90 0.55 (mean 0.59, worst 1.45) — PASS | median 0.62, p90 0.60 (mean 0.61, worst 1.15) — PASS |
+
+Stages 1–2 are unchanged in every mode (dense 10/10, 124/128; dense26 skipped/126/128; moe8 2/2, 127/128; moe 1/1, 114/128).
+
 **MoE variant of stage 3 (robust statistic).** On the 8B-A1B the router's 4th/5th expert scores are nearly tied (FP64 gaps 4e-5..0.037, median 0.017), so quantization noise flips which expert runs and produces discrete, heavy-tailed per-step error spikes in *both* runtimes; which one gets a flip on a given step is luck, and flips cascade through the conv/attention state. Measured over 32 steps, the tuff/llama.cpp RMS ratio has mean 1.21 but median 0.96, p75 1.05, p90 1.11 and worst step 5.54 (step 7: tuff flipped 5 layers, llama.cpp 2; at step 8 llama.cpp was worse, 0.69 vs 0.30). Mean and worst-step are therefore ill-posed for MoE; `--stat robust` (used for `moe8`/`moe`) requires median ratio ≤ 1.10 and p90 ratio ≤ 1.5 (`MAX_P90_RATIO`), printing mean and worst step for information only. Dense 1.2B keeps mean/worst-step (mean 0.71, median 0.69, p90 0.66, worst 0.95).
 
 **24B-A2B gate (`verify_lfm25_oracle.sh moe`).** Reference `tests/ref_lfm25_moe_128.*` was generated with llama.cpp `--cpu-experts` (13.5 GiB does not fit 8 GB), so the stage-3 llama.cpp logits run uses the same flag; stage 3 is `--stat robust`. The FP64 reference (`tools/lfm25_fp64_ref.py`, on-demand expert dequant, LRU slab cache) takes ~7.5 min for 32 steps (peak ~20 GB RSS) and is cached in `/tmp/tuff_oracle`. Sanity check of that reference against llama.cpp (independent of tuff): per-step RMS(llama - fp64) mean 0.47, median 0.44, max 0.94, no extreme spikes; FP64 argmax agrees with the reference token on 28/32 steps, the 4 misses all being near-ties (margins 0.32, 0.42, 0.055, 0.26 < 0.5).
@@ -66,10 +77,10 @@ The gate therefore has three stages, all required:
 | MAX_RATIO | 1.10 | stage 3: dense mean / MoE median |
 | MAX_STEP_RATIO | 2.0 | stage 3 dense worst step |
 | MAX_P90_RATIO | 1.5 | stage 3 MoE p90 |
-| N_FP | 32 / 32 / 72 | dense / moe8 / moe |
+| N_FP | 32 / 32 / 32 / 72 | dense / dense26 / moe8 / moe |
 | CTX | 1024 | all tuff gate runs |
 
-**Golden self-regression gate (byte-identity).** The oracle gate cannot see bit-level regressions: a reversed warp-reduction order passes it (FP64 ratio 0.80) while changing every logit row. `tests/verify_lfm25_golden.sh` freezes tuff's validated output per model (128 greedy tokens + sha256 of each teacher-forced logit row, `tests/golden/*.json`). Every optimization/refactor must reproduce it byte-for-byte with the graph on, the graph off, and (8B) the forced expert cache. Goldens are regenerated only with `--update --reason`, after a full oracle-gate pass. Negative controls run automatically with `tests/lfm25_negative_controls.sh` (8 controls); `tests/verify_lfm25_all.sh --controls` runs everything.
+**Golden self-regression gate (byte-identity).** The oracle gate cannot see bit-level regressions: a reversed warp-reduction order passes it (FP64 ratio 0.80) while changing every logit row. `tests/verify_lfm25_golden.sh` freezes tuff's validated output per model (128 greedy tokens + sha256 of each teacher-forced logit row, `tests/golden/*.json`). Every optimization/refactor must reproduce it byte-for-byte with the graph on, the graph off, and (8B) the forced expert cache. Goldens are regenerated only with `--update --reason`, after a full oracle-gate pass. Negative controls run automatically with `tests/lfm25_negative_controls.sh` (14 controls as of 2026-10-16); `tests/verify_lfm25_all.sh --controls` runs everything.
 
 The reference is produced by `tests/gen_lfm25_ref.sh` (`build/lfm25-llama-ref`: libllama, all layers on GPU, single-token decode, greedy). It is byte-reproducible; the command, llama.cpp commit and model SHA-256 are recorded in `tests/ref_lfm25_dense_128.recipe`. Negative control: swapping two conv taps fails all three stages (1/16 prefix, 55 hard misses, 17.9× FP64 error).
 
@@ -210,12 +221,12 @@ Usable VRAM: **~7,880 MiB**
 
 ---
 
-### Stepping stone 2: LFM2.5-2.6B (dense, 30 layers) — done; **verdict: NOT oracle-validated (stage 3 FAIL, recorded, not waived)**
+### Stepping stone 2: LFM2.5-2.6B (dense, 30 layers) — done; **oracle-validated after the user-approved shift-invariant stage 3** (was: stage 3 FAIL on the plain RMS)
 - tuff runs it (177 tok/s, `-c 1024`). Reference `tests/ref_lfm25_dense26_128.*` (llama.cpp `620d2225`, byte-reproducible), `verify_lfm25_oracle.sh dense26` and `verify_lfm25_golden.sh dense26` modes, thresholds `N_FP_DENSE26=32`, `STAT_DENSE26=mean` locked **before** the first run.
 - Result: stage 1 PASS (near-tie at step 0), stage 2 PASS (126/128, 2 near-ties), stage 3 **FAIL** on the worst-step limit only: mean ratio 0.95 ≤ 1.10, worst step 2.44 > 2.0 (step 1: tuff RMS 0.239 vs llama.cpp 0.098).
 - Analysis (not acted on): the step-1 error is almost entirely a **uniform shift of all logits** (tuff −0.225 vs llama.cpp −0.019), which softmax/argmax ignore. Shift-free RMS at step 1 is tuff 0.082 vs llama.cpp 0.096, worst shift-free ratio over 32 steps 1.33, mean 0.93. No systematic bias: mean |shift| is 0.056 for both runtimes and tuff's signed mean is −0.005. On the 128k-vocab models the shift is 56–66 % of the squared error in both runtimes (1.2B: 4 % / 27 %).
-- **Closed with the gate unchanged** (2026-10-16): the locked thresholds stand, and the 2.6B is recorded as supported and benchmarked (172 tok/s; spec up to 2.1×) but **not oracle-validated**. It has no golden, because a golden is only recorded after a full oracle pass, and it stays out of the `all` targets. `verify_lfm25_oracle.sh dense26` keeps reporting the FAIL.
-- Proposal for the user, not applied: a shift-invariant stage-3 RMS for all modes, decided in its own commit. Because this result has already been seen, it is the user's call (lock rule). If approved, re-run all gates and record the 2.6B golden.
+- First closed with the gate unchanged (2026-10-16, `d3ffe75`): supported and benchmarked (172 tok/s; spec up to 2.1×) but not oracle-validated, no golden, kept out of `all`.
+- **Re-opened and gated (2026-10-16)**: the user approved the shift-invariant stage-3 RMS for all modes (Gate Design; `a9155e3`), knowing it flips this already-seen FAIL. Thresholds unchanged. `verify_lfm25_oracle.sh dense26`: stage 1 PASS (skipped, near-tie at step 0), stage 2 126/128 (2 near-ties), stage 3 tuff 0.0634 vs llama.cpp 0.0683, ratio 0.93, worst step 1.33 ≤ 2.0 → **ORACLE PASS**. The other three modes still pass (table in Gate Design). Golden recorded (`tests/golden/lfm25_dense26.json`, `--reason "2.6B gated after the approved shift-invariant stage 3"`; graph=1 and graph=0 byte-identical); dense26 is in the `all` targets of `verify_lfm25_golden.sh` and `verify_lfm25_all.sh`; new negative control `conv-taps-swap-dense26` (golden:dense26 + oracle:dense26). Full run `verify_lfm25_all.sh --controls --spec`: **ALL LFM2.5 GATES PASS** (golden ×4, oracle ×4, 4 unit tests, spec 18 cases, **14/14 controls caught**; the new control: golden-dense26 FAIL, oracle-dense26 FAIL).
 
 ### Phase 4: Fused Kernels & CUDA Graph Capture
 **Objective**: Eliminate global memory round-trips and drive launch latency to zero.
