@@ -1642,17 +1642,27 @@ __global__ void lfm_moe_down_kernel(
     if (row >= out_dim) return;
 
     const int kqs = vdr * (threadIdx.x % tpsb);
-    float yk[LFM_ROUTER_TOPK];
+    // kbx outer / k inner: all 4 experts' loads are independent, so they issue together before the
+    // dependent float accumulation. Per (row, k) lane the sum is still tmp[k] += dot(...) over
+    // increasing kbx from 0.0f, then warp_reduce_sum_f -> bit-identical to the k-outer form.
+    const block_t * rw[LFM_ROUTER_TOPK];
 #pragma unroll
     for (int k = 0; k < LFM_ROUTER_TOPK; k++) {
-        const block_t * __restrict__ rw = (const block_t*)((const char*)w + (size_t)topk_ids[k] * down_stride) + (size_t)row * nblk;
-        const block_q8_1_c *yk8 = y + (size_t)k * nblk * (QK_K / QK8_1);
-        float tmp = 0.0f;
-        for (int kbx = threadIdx.x / tpsb; kbx < nblk; kbx += blocks_per_iter) {
-            tmp += lfm_moe_down_traits<block_t>::dot(rw + kbx, yk8 + kbx * (QK_K / QK8_1), kqs);
-        }
-        yk[k] = warp_reduce_sum_f(tmp);
+        rw[k] = (const block_t*)((const char*)w + (size_t)topk_ids[k] * down_stride) + (size_t)row * nblk;
     }
+    float tmp[LFM_ROUTER_TOPK];
+#pragma unroll
+    for (int k = 0; k < LFM_ROUTER_TOPK; k++) tmp[k] = 0.0f;
+    for (int kbx = threadIdx.x / tpsb; kbx < nblk; kbx += blocks_per_iter) {
+#pragma unroll
+        for (int k = 0; k < LFM_ROUTER_TOPK; k++) {
+            tmp[k] += lfm_moe_down_traits<block_t>::dot(
+                rw[k] + kbx, y + (size_t)k * nblk * (QK_K / QK8_1) + kbx * (QK_K / QK8_1), kqs);
+        }
+    }
+    float yk[LFM_ROUTER_TOPK];
+#pragma unroll
+    for (int k = 0; k < LFM_ROUTER_TOPK; k++) yk[k] = warp_reduce_sum_f(tmp[k]);
     if (threadIdx.x == 0) {
         float o = topk_w[0] * yk[0];
         o = o + topk_w[1] * yk[1];
