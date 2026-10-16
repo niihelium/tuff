@@ -23,7 +23,7 @@ Last updated: 2026-10-16 (end of day). Branch: `lfm25-phase1` (pushed to `origin
 | 4.2 — fused in_proj+conv+gate+Q8_1, multi-block RMSNorm | done; A/B +5.46% / +5.65% / +4.79% | see git log | logits byte-identical to `e133b44` (3 models, graph on/off, forced cache) |
 | 4.2b — long-K Q6_K/Q4_K down matvec (unroll) | done; A/B 1.2B +4.26% (≈378 tok/s) | see git log | golden PASS ×3, 336/322 GB/s |
 | 4.3 — copy stream, pinned expert store, LFRU (24B); prefetch opt-in | done; A/B +3.4% (Hello) / +12.5% (translate) | see git log | golden PASS incl. tiny-cache + prefetch configs; 2 new cache controls |
-| 2.6B — dense 30-layer stepping stone | tooling done; **oracle stage 3 FAIL (worst step 2.44 > 2.0), uniform-shift artefact; user decision pending** | see git log | roadmap *Stepping stone 2* |
+| 2.6B — dense 30-layer stepping stone | done; **not oracle-validated**: stage 3 FAIL (worst step 2.44 > 2.0, uniform-shift artefact), recorded, not waived; metric change = optional user proposal | see git log | roadmap *Stepping stone 2* |
 | 5.1 — batched verify forward + conv rollback | done; verify(4) = 1.9× a token on 1.2B | see git log | golden PASS on tf-batch / rollback configs; 12/12 controls |
 | 5.2 — lossless n-gram speculation, adaptive k | done; 1.2B ≤ 1.09×, 2.6B ≤ 2.12×, 8B ≈ 1.0×, 24B ≤ 1.14× (worst 0.979) | see git log | 18/18 spec streams identical; 13/13 controls |
 
@@ -365,7 +365,7 @@ $PY tools/lfm25_pack_moe_fixtures.py    /tmp/d24 tests/fixtures/lfm25_24b_moe_ff
 
 **2026-10-16 end state:** all roadmap tasks done; benchmarks vs llama.cpp, roofline and the ranked list of further
 optimizations are in [followup_2026-10-16.md](followup_2026-10-16.md) (raw data: [bench_2026-10-16.md](bench_2026-10-16.md)).
-Open decision: 2.6B stage-3 metric (followup §6). Tools: `tools/bw_probe.cu`, `tools/lfm25_bytes_per_token.py`,
+2.6B closed as not oracle-validated; optional proposal: shift-invariant stage-3 metric (followup §6). Tools: `tools/bw_probe.cu`, `tools/lfm25_bytes_per_token.py`,
 `scripts/lfm25_bench_vs_llama.sh`.
 
 
