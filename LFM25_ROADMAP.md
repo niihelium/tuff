@@ -129,6 +129,9 @@ Usable VRAM: **~7,880 MiB**
 [Phase 0: Tooling & VTable Setup] ───► [Phase 1: Dense Baseline (1.2B)] ───► [Phase 2: In-VRAM MoE (8B)]
                                                                                        │
 [Phase 5: Speculative Decoding]   ◄─── [Phase 4: CUDA Graphs & Fusion]  ◄─── [Phase 3: Hybrid MoE (24B)]
+        │
+        ▼
+[Phase 6: 24B Expert Scheduling] ───► [Phase 7: Prefill & Kernel Efficiency] ───► [Phase 8: Functional Gaps & Merge]
 ```
 
 ---
@@ -249,6 +252,9 @@ Usable VRAM: **~7,880 MiB**
   - `#pragma unroll 16` (Q6_K) / `unroll 4` (Q4_K) on the per-lane block loop of the dense MMVQ kernels: the next blocks' loads issue before the dependent float accumulation; per-lane accumulation order unchanged ⇒ byte-identical (golden PASS ×3).
   - nsys (1.2B, per call): Q6_K down 51.4 → 41.0 µs (268 → 336 GB/s); Q4_K down ~35 → 29.3 µs (270 → 322 GB/s).
   - `verify_lfm25_all.sh --controls` ALL PASS (8/8 controls); memcheck 0 errors. A/B vs `e0efcc1` (balanced, `FORCE=1`): 1.2B **+4.26% ± 0.06** (≈378 tok/s), 8B +0.17%, 24B +0.28% (their down projections run in the expert kernels).
+- [x] **Task 4.2c: MoE expert down projection** (follow-up item 5) — done, `a2514ee` (not pushed yet)
+  - `lfm_moe_down_kernel` loops block-outer / expert-inner with one accumulator per expert, so the 4 experts' loads issue together; per-(row, expert, lane) order unchanged ⇒ byte-identical (golden moe8 ×9, moe ×5; moe_ffn 44/44, 76/76).
+  - nsys (8B): Q6_K down 42.5 → 39.6 µs/call, Q4_K 29.4 → 29.0 µs; explicit unroll pragmas were slower. Gain ≈ 0.2 % of a token (the report estimated +4–6 %): the per-lane loops are only 4–7 blocks long.
 - [x] **Task 4.3: Async Prefetch & Dual-Stream MoE Execution (24B)**
   - Overlap layer $L$ expert computation with layer $L+1$ PCIe miss transfers.
   - Target: **$\ge 95 - 110$ tok/s** on RTX 3070 Laptop.
@@ -276,22 +282,90 @@ Usable VRAM: **~7,880 MiB**
   - **Lossless**: `tests/verify_lfm25_spec.sh` (6 prompts × 1.2B/8B/24B, adaptive and forced k=7, -n 256) shows token streams `cmp`-identical to non-speculative greedy in 18/18 cases. New golden configs (`spec-ngram`, `spec-ngram-k7`, 8B tiny-cache spec, 24B spec) PASS. `verify_lfm25_all.sh --controls --spec` ALL PASS with 13/13 controls (new: `spec-accept-one-too-many`). memcheck 0/0 on 1.2B and 8B with real drafts and rejections.
   - Bench (`scripts/lfm25_bench_spec.sh`, 9 prompts, `-n 256 --runs 3`; spec/baseline ratio): **1.2B 0.996–1.092** (py-csv 358 → 391, orchestrator re-run 360 → 396); **2.6B 1.04–2.12** (fibonacci 167 → 353, re-run 167 → 356; this model's greedy outputs repeat a lot); **8B 0.991–1.007** (verify costs ~0.85 of a token per position because experts run per token); **24B 0.979–1.144** (Hello 116 → 119, py-csv 127 → 145, history 101 → 112; miss-bound prompts such as fibonacci stay at 32 tok/s). Worst overall 0.979. The ≥ 110–125 tok/s target is met on cache-friendly prompts only; miss-bound 24B text is PCIe-bound (see the follow-up report).
 
+- [ ] **Task 5.3: Speculation follow-ups** (follow-up item 8)
+  - **Stop at EOS** during generation. Greedy runs currently continue past `<|endoftext|>` (consistent with the llama.cpp reference tool, but visible to users), which also inflates the measured acceptance. Gate: the golden and spec configs must still pass, because both stop at the same point.
+  - **Better drafts**: a longer history / suffix index instead of the prompt-lookup n-gram; optionally a small draft model (the 1.2B for the 24B, the same tokenizer is required; Qwen's CPU drafter H28 was refuted, so a draft would run on the GPU).
+  - **MoE verify**: compute the union of the batch's experts once instead of per token (verify currently costs ~0.85–0.9 of a token per position on the MoEs). Gate: byte-identical to per-token verify, per-(row, token) order unchanged.
+
 ---
+
+### Phase 6: 24B expert scheduling (miss-heavy text)
+**Objective**: stop the 24B from dropping below llama.cpp on miss-heavy prompts (28–44 tok/s vs 54; follow-up report §3–§4), while staying byte-identical to the all-GPU result (golden gate).
+
+- [ ] **Task 6.1: CPU evaluation of missed experts** (follow-up item 1) — **in progress, uncommitted** (`LFM25_CPU_MISS`, default off)
+  - The CPU computes a missed expert's raw gate/up and down row dots with the GPU's exact lane math; SiLU, Q8_1 quantisation and the weighted sum stay on the GPU (MUFU.EX2 is not CPU-reproducible). Misses are admitted to the cache asynchronously within a budget (`LFM25_CPU_MISS_ADMIT`).
+  - So far: `lfm25-cpu-expert-test` byte-identical for all 15 miss masks (8B 1057/1057, 24B 1825/1825); golden moe8 (14 configs) and moe (9 configs) PASS including the CPU-miss configs; oracle moe PASS.
+  - Open: the 2 new negative controls (first run hit a scratch build failure), 24B bench off vs on → default, full `verify_lfm25_all.sh --controls`.
+- [ ] **Task 6.2: Lookahead Expert Scheduling (LES)**
+  - **Source / attribution**: LES was introduced by **OpenBMB** with MiniCPM-V 4.7 35B-A3B ([model card](https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B)); implementation in [OpenBMB/llama.cpp-omni](https://github.com/OpenBMB/llama.cpp-omni) (MIT), `src/llama-moe-slot.cpp` (`lookahead_expert_prefetch`, `LLAMA_MOE_LOOKAHEAD_PREFETCH[_DEPTH]`, `LLAMA_MOE_PREFETCH_READ`, `LLAMA_MOE_MATMUL_SPLIT`), graph side in `src/llama-graph.cpp` (`build_moe_ffn` split A/B) and `src/models/qwen35moe.cpp` (next-layer router on `attn_post_norm`). Read at commit `0b74404c` (2026-10-13). Their description: cross-layer routing prediction preloads experts likely needed by the next layer; among the experts the actual router selects, the successfully prefetched ones are computed first, overlapping the loading of the remaining required experts; predictions only guide prefetching and scheduling, computation follows the original token-level routing, and mispredicted experts are loaded and evaluated as usual.
+  - **What they do (as read)**: (a) layer L+1's router on layer L's post-attention normed hidden, top-`depth` (default 8, up to 16) ids, decode only; (b) a worker thread `preadv`s the predicted experts from SSD into a reserved **ping-pong prefetch region** (2×depth slots) while the GPU runs layer L, so prefetches never evict cache entries, and a hit there is remapped for free; (c) **prediction-guided eviction**: LRU victim selection first skips residents predicted for the next step (`keep[]`), with a predict-only mode (`PREFETCH_READ=0`) that uses the prediction just to protect entries, at zero I/O; (d) **split compute (A2)**: the first `n_used − split` router ranks are computed as phase A, then a deferred-read node loads the missing tail-rank experts while phase A runs, then phase B. The split is by fixed router **rank**, not by residency, so the sum order is unchanged and output stays byte-identical. Their measurement: misses concentrate at the tail ranks (rank 7 misses ~7× rank 0).
+  - **Compared with tuff today**: tuff already has (a): `LFM25_PREFETCH=1` runs layer L+1's router on layer L's normed input, top-4, 75–78 % accurate. But it is a net loss and off by default, because prefetches go into the main pool over PCIe (0.9 ms per slab vs ~0.1 ms of lead) and wrong ones cost bus time. tuff lacks (b) a reserved prefetch region, (c) prediction-guided eviction, and (d) a split compute; the FFN of a layer with a miss waits for all of its slots.
+  - **Decision (user, 2026-10-16): no reserved prefetch region.** Every VRAM slot stays one cache. Instead combine LES's routing prediction with tuff's frequency-aware cache into one **probability-driven cache** (LES + tuff):
+  - **Plan (each step gated byte-identical by the golden, plus A/B on the 24B)**:
+    1. **Context statistics for every expert**, not just resident ones: a decayed invocation count `n[l][e]` for each of the 38 MoE layers × 64 experts, updated from the real router ids of every token in the current context (prompt and generated). The decay is an EMA or a window over the last W tokens, and it resets with the context. This gives `P_ctx(e | l) = n[l][e] / Σ_e n[l][e]`. It generalises today's LFRU `slot_cnt`, which only counts resident slots.
+    2. **Per-token prediction.** For each MoE layer, score each expert by `S(e | l) = P_ctx(e | l)` blended with the lookahead router probability, when that is available (LES-style: layer l's router on layer l−1's normed input, sigmoid probability). Weights are a knob, fitted offline on recorded router traces.
+    3. **Replacement by probability.** On a miss and on a prefetch, the victim is the resident expert with the lowest score `S` (instead of LRU/LFRU recency). This keeps every existing safety rule: never a slot this layer reads (`slot_prot`), and consumers wait on `slot_ev`.
+    4. **Long-lead prefetch.** Our bus is too slow for next-layer prefetch (0.9 ms per slab vs ~0.1 ms of lead). So the context prior is used to prefetch for the **next token's** layers instead: one token is 8–30 ms on the 24B, so 9–30 slabs fit. After each token, upload the highest-`S` non-resident experts, evicting the lowest-`S` residents. This only happens when `S(new) − S(victim)` beats a threshold, and within a bus budget (in-flight batches, as in Task 6.1 admission), so it never queues behind a real miss.
+    5. **Misses that still happen** go to whichever path finishes first: CPU evaluation (Task 6.1) or upload. Within a layer, the hits are computed first and the misses after. tuff's down kernel combines the 4 experts in a fixed order, `((w0·y0 + w1·y1) + w2·y2) + w3·y3`, so any hit/miss order is byte-identical; this reuses the 6.1 `skip_mask`/`pre_mask` paths.
+    6. **One policy, both MoE engines (user, 2026-10-16).** The policy must serve the LFM2.5 MoEs (`src/lfm25_expert_cache.c`: 32/64 experts, top-4, sigmoid router) and the Qwen3.5-MoE engine (`src/gpu.cu` M4 LFRU cache + `src/engine.c`: top-8 softmax router plus a shared expert, CPU miss pool, background fill thread `gpu_expert_cache_bgfill`).
+       - Put it in a new host-only module, `src/moe_policy.{c,h}`, with no CUDA and no slot storage. Interface: `observe(layer, ids, n)` per token with the real router ids; `observe_lookahead(layer, ids, probs, n)`; `score(layer, expert)`; `victim(layer-agnostic candidate iterator)`; `prefetch_plan(budget) → (layer, expert)` list. Knobs are model-agnostic: decay, blend weight, threshold, budget.
+       - Each engine keeps its own slots, uploads and safety rules, and only asks the policy which expert to keep, evict or prefetch.
+       - Victim selection has to stay cheap. Qwen's cache has ~2200 slots and replaced an O(n) LRU scan with an O(1) list in Iteration 10. So use score buckets or a lazily updated min-heap, not a scan.
+       - Lookahead on Qwen: the next layer's router is run on the current layer's normed input (the same approximation LES makes). The hybrid DeltaNet/attention layers don't change this.
+       - **Correctness differs between the engines.** On LFM2.5 the math does not depend on cache contents: hits on the GPU and misses on the CPU are byte-identical (Task 6.1), so a policy change is proven by the existing goldens. On Qwen it does depend on them (read from the code; confirm first with a forced-hit vs forced-miss logit dump): a miss runs `expert_mat_vec_cpu` with q8_K activations, while a hit runs GPU MMVQ with q8_1. So a different hit/miss pattern gives different (still valid) logits, and Qwen has no byte-identity golden. Before changing Qwen's policy: (a) record a Qwen golden with the cache frozen (`TUFF_FILL_BUDGET=0`) to catch unintended changes, and gate the policy change on the Qwen tolerance/oracle scripts (`scripts/verify_tolerance.sh`, `scripts/oracle_check.sh`). Or, better, (b) port the 6.1 byte-identical CPU path (Q8_1, GPU lane order) to the Qwen engine first, so cache policy becomes numerically invisible there too.
+       - **Off for fully VRAM-resident models (user, 2026-10-16).** The policy, its counters, the lookahead router pass and next-token prefetch exist only while an expert cache is active and the cache cannot hold every expert. The cache is active through `lfm25_expert_cache_wanted()` on LFM2.5 and `gpu_expert_cache_active()` on Qwen; "cannot hold every expert" means `n_slots < n_moe_layers × n_expert`. Resident models (1.2B and 2.6B dense, 8B-A1B, a Qwen that fits) keep today's path with zero extra work per token: no counting, no extra router matvec, no syncs, and their CUDA graph stays on. The only exception is the forced-cache test configs (`LFM25_FORCE_EXPERT_CACHE=1` with a small `LFM25_EXPERT_CACHE_MB`), which keep the policy reachable for the golden. Note: `lfm25_expert_cache_wanted()` currently decides by `expert_count > 32`, not by whether the experts fit in VRAM. The gate should be the fit test, as on Qwen, so that a 64-expert model on a larger GPU also runs resident. A check confirms the resident path is unchanged: the 8B's default golden configs and its graph must be byte-identical and print no policy line.
+       - Order: build and simulate on LFM2.5, where the existing goldens prove each step, then wire Qwen in behind the same knobs. The offline simulator should take router traces from both engines.
+    - First, offline (no engine change): dump router ids per token on the 4 benchmark prompts (24B and Qwen3.5-MoE) and simulate hit rates for LRU, LFRU, P_ctx and P_ctx+lookahead at the real slot count. Then implement only the variants that win in simulation.
+    - The math never depends on cache contents, so the golden configs (tiny cache, forced misses) keep proving byte-identity whatever the policy does.
+  - Negative controls: the hit part reads a missed expert's slot before its upload event; the miss part's yk written into the wrong k.
+- [ ] **Task 6.3: Remove the 38 host round-trips per 24B token** (follow-up item 3)
+  - Today every MoE layer syncs the router ids to the host, does the slot lookup there, and copies the slot ids back. With the per-layer host wait and the launch gaps, the nsys profile shows the GPU idle 48 % of a 24B token (most of that is waiting for misses).
+  - Plan: keep the slot map on the GPU (a lookup kernel writes the slot ids, or flags a miss); the host only services misses asynchronously; capture the hit path in a CUDA graph. With Task 6.1/6.2, a miss becomes a GPU→host request queue rather than a sync.
+  - Gain estimated +10–15 % on cache-friendly 24B text. Gate: golden moe/moe8 byte-identical incl. tiny-cache and CPU-miss configs; negative control: lookup kernel returns a stale slot.
+
+---
+
+### Phase 7: Prefill and resident-model kernel efficiency
+**Objective**: close the prefill gap (tuff feeds the prompt token by token: 1.2B 343 vs llama.cpp **12,099** tok/s pp512; 2.6B 162 vs 5,608; 8B 229 vs 5,385; 24B 97 vs 471) and move the resident models from 70–77 % toward 85–90 % of the VRAM roofline (follow-up report §3–§4).
+
+- [ ] **Task 7.1: Prefill through the batched forward** (follow-up item 2, quick step)
+  - Route the prompt through `forward_batch(8)` (exists since Task 5.1): ~2× faster prefill. Byte-identical to token-by-token prefill by construction (same per-(row, column) order) — golden must PASS unchanged; time-to-first-token measured.
+- [ ] **Task 7.2: MMQ-style prefill GEMM** (follow-up item 2, real fix)
+  - Tensor-core / dp4a tiled GEMM for prompt chunks: 10–30× faster prefill. It changes the summation order, so it is **not** byte-identical: validate with the oracle gate on prefill logits (teacher-forced stages unchanged), and regenerate the goldens only by an explicit decision, with `--update --reason`.
+- [ ] **Task 7.3: Small-matvec efficiency** (follow-up item 4)
+  - q/k/v in one launch, more rows per block, the 4.2b unroll on q/k/v/o and out_proj (234–295 GB/s today), and a multi-block router (214 µs/token on the 8B, 572 on the 24B). Per-row accumulation order unchanged ⇒ byte-identical. Estimated +5–8 % on the 1.2B/2.6B, +8–12 % on the 8B.
+- [ ] **Task 7.4: Fuse RMSNorm+Q8_1 into the preceding matvec's epilogue** (follow-up item 6)
+  - Grid-wide partial sum of squares, combined in a fixed order ⇒ can be byte-identical. Up to ~5 % on the dense models.
+- [ ] **Task 7.5: Attention** (follow-up item 7)
+  - Byte-identical option: split-K decode attention over more blocks with a fixed combine order (173 µs/token on the 1.2B at short context; n=512 is already 5–12 % slower than n=128).
+  - Non-identical option: FP16 KV (halves KV bytes, as llama.cpp does); needs oracle re-validation and a golden decision. Matters most at long context.
+- [ ] **Task 7.6: Launch and tail overhead** (follow-up item 9)
+  - 146 kernels per token on the 1.2B, ~6 % inter-kernel gaps inside the graph: further fusion or a persistent per-layer megakernel.
+- Note (follow-up item 10): every number here is under the `balanced` power profile (accepted by the user); `performance` is probably worth a few percent (`powerprofilesctl set performance`, needs sudo — user action). PCIe cannot improve on this laptop (gen3 host).
+
+---
+
+### Phase 8: Functional gaps and open questions
+- [ ] **Task 8.1: Sampling** — `--temp > 0` is currently an explicit error on LFM2.5; implement temperature / top-k / top-p (shared sampler) for the LFM engines. Greedy goldens stay as they are; sampling gets a seeded determinism check (checklist item 3).
+- [ ] **Task 8.2: More quantization mixes** — only Q4_K_M-style files are supported (other mixes, e.g. the 2.6B Q8_0, fail fast). Add Q8_0 (and Q5_K / Q6_K trunks) with their own references and goldens.
+- [ ] **Task 8.3: Router tie rule** — "ties → lower expert index" is unverified against ggml's CUDA `argsort_top_k` (the `reversed router tie-break` control is NOT caught because real data has no exact ties). Check the ggml source and add a synthetic tie case to the router test.
+- [ ] **Task 8.4: Qwen tokenizer regression test** — the `add_bos` change for llama3-group pre-tokenizers was reasoned (pre-tokenizer names), not tested on a Qwen model. Add a Qwen tokenization check.
+- [ ] **Task 8.5: Merge readiness** — the branch `lfm25-phase1` is pushed but not merged. The §6 sign-off checklist is unticked: run each item, record the evidence, then open the PR to `main`.
 
 ## 5. Performance Milestones & Target Rooflines
 
-Measured and projected decode throughput on **RTX 3070 Laptop (8 GB VRAM, 330 GB/s)**:
+Measured decode throughput on **RTX 3070 Laptop (8 GB VRAM, 371 GB/s measured streaming read)**, 2026-10-16 (`-c 1024 --temp 0 --runs 3`, 128 tokens after 32 warmup, `balanced` profile; llama.cpp `620d2225` `llama-bench tg128` with its best flags). Source: [follow-up report](wiki/lfm25/followup_2026-10-16.md) §2–§4.
 
-| Configuration | Active Params | VRAM Residency | Decode Speed (tok/s) | Notes |
-| :--- | :---: | :---: | :---: | :--- |
-| **Qwen3.6-35B-A3B (Baseline)** | 3.0 B | 71.9% hit rate | **60.15** | Current production speed in `tuf` |
-| **LFM2.5-1.2B (Phase 1: Baseline)** | 1.2 B | 100% VRAM | **~250 – 280** | Unfused kernels, individual launches |
-| **LFM2.5-1.2B (Phase 4: CUDA Graph)** | 1.2 B | 100% VRAM | **~350 – 400** | Full static graph, fused conv+gate |
-| **LFM2.5-2.6B (Dense 30 Layers)** | 2.6 B | 100% VRAM | **~175 – 190** | Static graph, 128k vocab |
-| **LFM2.5-8B-A1B (Phase 2: In-VRAM MoE)**| 1.6 B | 100% VRAM | **~95 – 110** | 100% resident, zero PCIe misses |
-| **LFM2.5-24B-A2B (Phase 3: Baseline)** | 2.45 B | ~88% hit rate | **~68 – 75** | Unfused kernels, no graphs |
-| **LFM2.5-24B-A2B (Phase 4: CUDA Graphs)**| 2.45 B | ~91% hit rate | **~95 – 110** | Zero launch overhead + async DMA |
-| **LFM2.5-24B-A2B (Phase 5: + N-Gram)** | 2.45 B | ~91% hit rate | **~110 – 125** | Lossless speculative decode |
+| Model | tuff | tuff + n-gram spec | llama.cpp | % of VRAM roofline (tuff) | Headroom target (Phase 7) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| LFM2.5-1.2B dense | **378.9** | 375–444 | 336.5 | 74 % (ceiling 509) | ~430–450 |
+| LFM2.5-2.6B dense | **172.3** | 184–216 (n=512 up to 277) | 152.8 | 77 % (ceiling 223) | ~195 |
+| LFM2.5-8B-A1B (resident) | **243.3** | ≈ baseline | 216.4 | 70 % (ceiling 347) | ~290 |
+| LFM2.5-24B-A2B, cache-friendly text | **121.0** (Hello) / 123.7 (code) | 121–140 | 54.2 (`-ncmoe 21 -t 8`) | PCIe-bound | Phase 6.3: +10–15 % |
+| LFM2.5-24B-A2B, miss-heavy text | **28–44** | ≈ baseline | ~54 | serial PCIe bound | Phase 6.1/6.2: ≥ llama.cpp |
+| Qwen3.6-35B-A3B (other engine) | 60.15 | — | — | 71.9 % hit rate | Phase 6.2 step 6 |
+
+Prefill (prompt processing) is the largest gap: see Phase 7.
 
 ---
 
