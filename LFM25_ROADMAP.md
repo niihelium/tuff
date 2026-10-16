@@ -56,7 +56,7 @@ The gate therefore has three stages, all required:
 
 **FP64 adjudication of stage-2 hard misses (24B).** With the CPU-expert reference being noisy (logit RMS vs FP64 ~0.44 median, ~3x the 8B's GPU reference), the reference's own top1-top2 margin is unreliable as a near-tie test. Over 72 FP64 steps the FP64 argmax agrees with tuff 69/72 but with the llama.cpp reference only 63/72; of tuff's 11 misses FP64 sides with tuff on 9. The lone hard miss (step 68, reference margin 0.954) is a near-tie in ground truth: FP64 logit(ref token) - logit(tuff token) = 0.328. `lfm25_gate.py teacher --fp64` therefore reclassifies a hard miss as a near-tie only if |FP64 gap| < `MIN_MARGIN` (0.5) and the step is covered by the FP64 file (`N_FP`: 72 for `moe`, 32 otherwise); uncovered steps stay hard misses. This is a real test, not a waiver: with `--min-margin 0.3` step 68 is not excused.
 
-**Locked thresholds (2026-10-16).** Gate parameters live in `tests/lfm25_gate_thresholds.txt` (sha256 `996f77a5ea01`, printed by every run). An environment override makes the run EXPLORATORY (exit 3, never a pass). A change needs its own commit with the rationale, written before looking at the result it would flip.
+**Locked thresholds (2026-10-16).** Gate parameters live in `tests/lfm25_gate_thresholds.txt` (sha256 `4023c970b5df` (was `996f77a5ea01` before the dense26 keys were added in `855baaa`; no value changed), printed by every run). An environment override makes the run EXPLORATORY (exit 3, never a pass). A change needs its own commit with the rationale, written before looking at the result it would flip.
 
 | Parameter | Value | Applies to |
 | :--- | :---: | :--- |

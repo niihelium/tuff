@@ -86,17 +86,21 @@ for r in $(seq 1 "$ROUNDS"); do
     fi
     ratio=$(awk -v a="$a_tok" -v b="$b_tok" 'BEGIN{ if(a+0>0) printf "%.4f", b/a; else print "ERR" }')
     printf '%-6s %-7s %-9s %-24s %-9s %-24s %-8s\n' "$r" "$order" "$a_tok" "$a_st" "$b_tok" "$b_st" "$ratio"
-    echo "$ratio" >> "$results"
+    # An ERR round (a run produced no tok/s, or A==0) carries no information: it is excluded from the statistics
+    # (never counted as 0) and tallied separately; any ERR round makes the verdict INVALID.
+    if [ "$ratio" = "ERR" ] || [ "${b_tok:-ERR}" = "ERR" ]; then echo "ERR" >> "$results"; else echo "$ratio" >> "$results"; fi
 done
 
 echo
-awk '{n++; s+=$1; ss+=$1*$1} END {
-    if (n<2) { print "not enough rounds"; exit }
+awk '$1=="ERR"{e++; next} {n++; s+=$1; ss+=$1*$1} END {
+    if (e>0) printf "ERROR rounds: %d of %d excluded from the statistics\n", e, n+e;
+    if (n<2) { print "not enough valid rounds"; print (e>0 ? "VERDICT: INVALID -- " e " round(s) errored." : "VERDICT: INVALID -- not enough rounds."); exit }
     m=s/n; sd=sqrt((ss-n*m*m)/(n-1));
-    printf "paired ratio B/A over %d rounds: %.4f +/- %.4f  (%+.2f%% +/- %.2f)\n", n, m, sd, (m-1)*100, sd*100;
+    printf "paired ratio B/A over %d valid rounds: %.4f +/- %.4f  (%+.2f%% +/- %.2f)\n", n, m, sd, (m-1)*100, sd*100;
     lo=m-2*sd; hi=m+2*sd;
     printf "approx 95%% interval: [%.4f, %.4f] = [%+.2f%%, %+.2f%%]\n", lo, hi, (lo-1)*100, (hi-1)*100;
-    if (lo <= 1.0 && hi >= 1.0) print "VERDICT: interval includes 1.0 -- the difference is NOT established.";
+    if (e>0) print "VERDICT: INVALID -- " e " round(s) errored; do not use the numbers above.";
+    else if (lo <= 1.0 && hi >= 1.0) print "VERDICT: interval includes 1.0 -- the difference is NOT established.";
     else if (lo > 1.0) print "VERDICT: B is faster than A.";
     else print "VERDICT: B is SLOWER than A.";
 }' "$results"

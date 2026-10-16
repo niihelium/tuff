@@ -6,8 +6,13 @@
 # For every control in tests/lfm25_negctl.txt (override: NEGCTL_TABLE): inject one realistic bug into a
 # scratch COPY of the tree (NEGCTL_DIR, default /tmp/tuff_negctl; the real repo is never modified), rebuild
 # the needed targets there, run the listed checks against the mutant binaries and require EACH to FAIL.
-# A check that still passes = NOT CAUGHT (a blind spot in the gates). A control whose search string no
-# longer matches exactly once is STALE. Exit 1 on any NOT CAUGHT / STALE / build or setup error.
+# Before any mutation, EVERY distinct check used by the selected controls is run once on the unmutated scratch
+# build and must PASS (cached per run); otherwise "FAIL" under a mutant could just be a broken setup.
+# Check outcomes: PASS; FAIL = a real gate failure recognized by the gate's own verdict line ("GOLDEN FAIL",
+# "ORACLE FAIL", "SPEC FAIL", "N/M cases pass" with N<M); ERROR = anything else (missing files, tracebacks,
+# unexpected exit codes). CAUGHT needs every listed check FAIL. ERROR (also in the baseline) -> "ERROR (setup)",
+# exit 1. A check that still passes = NOT CAUGHT (a blind spot). A control whose search string no longer
+# matches exactly once is STALE. Exit 1 on any NOT CAUGHT / STALE / build or setup error.
 #
 # Env: NEGCTL_DIR, NEGCTL_TABLE, PYTHON (stdlib python; default python3), JOBS (default 16).
 set -uo pipefail
@@ -28,6 +33,15 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+# Caller LFM25_* variables must not leak into the checks (the gate scripts scrub too; this covers the unit tests).
+SCRUB=(); SCRUBBED=()
+while IFS= read -r v; do
+    case "$v" in LFM25_*) SCRUB+=(-u "$v"); SCRUBBED+=("$v") ;; esac
+done < <(compgen -e)
+if [ "${#SCRUBBED[@]}" -gt 0 ]; then
+    echo "WARNING: scrubbed caller environment for checks (unset): ${SCRUBBED[*]}" >&2
+fi
 
 M8="/run/media/nii/pohjola/models/LiquidAI/LFM2.5-8B-A1B-GGUF/LFM2.5-8B-A1B-Q4_K_M.gguf"
 M24="/run/media/nii/pohjola/models/LiquidAI/LFM2.5-24B-A2B-GGUF/LFM2.5-24B-A2B-Q4_K_M.gguf"
@@ -98,7 +112,21 @@ build() {  # <targets...>
     cmake --build "$DIR/build" -j"$JOBS" --target "$@" > "$DIR/build.log" 2>&1
 }
 
-# run_check <check> -> sets CHK_LABEL, CHK_RES (FAIL = the check failed = good; PASS = not caught; ERROR:<why>)
+# unit_verdict <out-file> <rc> <summary-regex-prefix>: unit tests exit 0 = pass, 1 = failed cases, anything else = error.
+# FAIL only if rc==1 AND the summary line is present and shows a real failure (N<M or accum FAIL).
+unit_verdict() {
+    local out="$1" rc="$2" line n m
+    if [ "$rc" -eq 0 ]; then CHK_RES=PASS; return; fi
+    line="$(grep -E '^(router|moe_ffn): [0-9]+/[0-9]+ cases pass' "$out" | tail -1)"
+    if [ "$rc" -eq 1 ] && [ -n "$line" ]; then
+        n="$(sed -E 's/^[a-z_]+: ([0-9]+)\/([0-9]+) .*/\1/' <<< "$line")"
+        m="$(sed -E 's/^[a-z_]+: ([0-9]+)\/([0-9]+) .*/\2/' <<< "$line")"
+        if [ "$n" -lt "$m" ] || grep -q 'accum FAIL' <<< "$line"; then CHK_RES=FAIL; return; fi
+    fi
+    CHK_RES="ERROR:exit $rc, no failing 'N/M cases pass' verdict"
+}
+
+# run_check <check> -> sets CHK_LABEL, CHK_RES (PASS | FAIL = real gate failure | ERROR:<why>)
 run_check() {
     local chk="$1" out rc
     out="$DIR/check.out"
@@ -106,32 +134,27 @@ run_check() {
         golden:*)
             CHK_LABEL="golden-${chk#golden:}"
             TUFF_BIN="$DIR/build/tuff" "$DIR/tests/verify_lfm25_golden.sh" "${chk#golden:}" > "$out" 2>&1; rc=$?
-            if [ $rc -eq 0 ]; then CHK_RES=PASS
-            elif grep -q "NOT comparable" "$out"; then CHK_RES="ERROR:golden not comparable in scratch build (environment mismatch)"
-            else CHK_RES=FAIL; fi ;;
+            if [ $rc -eq 0 ] && grep -q "^GOLDEN PASS" "$out"; then CHK_RES=PASS
+            elif grep -q "NOT comparable\|golden missing\|tuff run incomplete\|GOLDEN ERROR" "$out"; then CHK_RES="ERROR:golden check could not run cleanly (exit $rc)"
+            elif [ $rc -eq 1 ] && grep -q "^GOLDEN FAIL" "$out"; then CHK_RES=FAIL
+            else CHK_RES="ERROR:golden exit $rc without a verdict"; fi ;;
         oracle:*)
             CHK_LABEL="oracle-${chk#oracle:}"
             TUFF_BIN="$DIR/build/tuff" REF_BIN="$REF_BIN" "$DIR/tests/verify_lfm25_oracle.sh" "${chk#oracle:}" > "$out" 2>&1; rc=$?
-            if [ $rc -eq 0 ]; then CHK_RES=PASS
-            elif [ $rc -eq 1 ]; then CHK_RES=FAIL
-            else CHK_RES="ERROR:oracle exit $rc"; fi ;;
+            if [ $rc -eq 0 ] && grep -q "ORACLE PASS" "$out"; then CHK_RES=PASS
+            elif [ $rc -eq 1 ] && grep -q "ORACLE FAIL" "$out"; then CHK_RES=FAIL
+            else CHK_RES="ERROR:oracle exit $rc without a verdict"; fi ;;
         spec)
             CHK_LABEL="spec-dense"
             TUFF_BIN="$DIR/build/tuff" "$DIR/tests/verify_lfm25_spec.sh" dense > "$out" 2>&1; rc=$?
-            if [ $rc -eq 0 ]; then CHK_RES=PASS
-            elif grep -q "FAIL(" "$out"; then CHK_RES=FAIL      # a token stream differed
-            else CHK_RES="ERROR:spec check exit $rc without a stream difference"; fi ;;
-        router8)   CHK_LABEL=router8;   "$DIR/build/lfm25-router-test"  "$M8"  "$DIR/tests/fixtures/lfm25_8b_router_cases.bin"  > "$out" 2>&1; rc=$? ;;
-        router24)  CHK_LABEL=router24;  "$DIR/build/lfm25-router-test"  "$M24" "$DIR/tests/fixtures/lfm25_24b_router_cases.bin" > "$out" 2>&1; rc=$? ;;
-        moeffn8)   CHK_LABEL=moeffn8;   "$DIR/build/lfm25-moe-ffn-test" "$M8"  "$DIR/tests/fixtures/lfm25_8b_moe_ffn_cases.bin"  > "$out" 2>&1; rc=$? ;;
-        moeffn24)  CHK_LABEL=moeffn24;  "$DIR/build/lfm25-moe-ffn-test" "$M24" "$DIR/tests/fixtures/lfm25_24b_moe_ffn_cases.bin" > "$out" 2>&1; rc=$? ;;
-        *) CHK_LABEL="$chk"; CHK_RES="ERROR:unknown check"; return ;;
-    esac
-    case "$chk" in
-        router*|moeffn*)
-            if [ $rc -eq 0 ]; then CHK_RES=PASS
-            elif [ $rc -eq 1 ]; then CHK_RES=FAIL
-            else CHK_RES="ERROR:exit $rc"; fi ;;
+            if [ $rc -eq 0 ] && grep -q "^SPEC PASS" "$out"; then CHK_RES=PASS
+            elif [ $rc -eq 1 ] && grep -q "^SPEC FAIL" "$out"; then CHK_RES=FAIL
+            else CHK_RES="ERROR:spec exit $rc without a verdict"; fi ;;
+        router8)   CHK_LABEL=router8;   env ${SCRUB[@]+"${SCRUB[@]}"} "$DIR/build/lfm25-router-test"  "$M8"  "$DIR/tests/fixtures/lfm25_8b_router_cases.bin"  > "$out" 2>&1; rc=$?; unit_verdict "$out" $rc ;;
+        router24)  CHK_LABEL=router24;  env ${SCRUB[@]+"${SCRUB[@]}"} "$DIR/build/lfm25-router-test"  "$M24" "$DIR/tests/fixtures/lfm25_24b_router_cases.bin" > "$out" 2>&1; rc=$?; unit_verdict "$out" $rc ;;
+        moeffn8)   CHK_LABEL=moeffn8;   env ${SCRUB[@]+"${SCRUB[@]}"} "$DIR/build/lfm25-moe-ffn-test" "$M8"  "$DIR/tests/fixtures/lfm25_8b_moe_ffn_cases.bin"  > "$out" 2>&1; rc=$?; unit_verdict "$out" $rc ;;
+        moeffn24)  CHK_LABEL=moeffn24;  env ${SCRUB[@]+"${SCRUB[@]}"} "$DIR/build/lfm25-moe-ffn-test" "$M24" "$DIR/tests/fixtures/lfm25_24b_moe_ffn_cases.bin" > "$out" 2>&1; rc=$?; unit_verdict "$out" $rc ;;
+        *) CHK_LABEL="$chk"; CHK_RES="ERROR:unknown check" ;;
     esac
 }
 
@@ -141,12 +164,34 @@ total=0; caught=0; bad=0
 # their mtime so the baseline build below is guaranteed to recompile them from pristine content.
 while IFS=$'\t' read -r _ _ f _; do cp "$SRC/$f" "$DIR/$f"; done < <(helper list "$TABLE")
 
-# --- baseline: the unmutated scratch build must reproduce the golden, or "FAIL" below means nothing -----
-if ! build tuff; then tail -20 "$DIR/build.log" >&2; echo "[negctl] baseline: scratch build FAILED" ; exit 1; fi
-if TUFF_BIN="$DIR/build/tuff" "$DIR/tests/verify_lfm25_golden.sh" dense > "$DIR/baseline.out" 2>&1; then
-    echo "[negctl] baseline: unmutated scratch build reproduces the dense golden -> OK"
-else
-    cat "$DIR/baseline.out"; echo "[negctl] baseline: unmutated scratch build does NOT match the golden -> controls are meaningless"; exit 1
+# --- select controls, then baseline every distinct check on the unmutated scratch build ---------------------
+SEL_CHECKS=(); SEL_TARGETS="tuff"
+while IFS=$'\t' read -r id quick _ targets checks _; do
+    [ -n "$id" ] || continue
+    [ -z "$ONLY" ] || [ "$id" = "$ONLY" ] || continue
+    [ "$QUICK" -eq 0 ] || [ "$quick" = "1" ] || continue
+    for t in $targets; do [[ " $SEL_TARGETS " == *" $t "* ]] || SEL_TARGETS+=" $t"; done
+    for c in $checks; do [[ " ${SEL_CHECKS[*]-} " == *" $c "* ]] || SEL_CHECKS+=("$c"); done
+done < <(helper list "$TABLE")
+
+# shellcheck disable=SC2086
+if ! build $SEL_TARGETS; then tail -20 "$DIR/build.log" >&2; echo "[negctl] baseline: scratch build FAILED"; exit 1; fi
+declare -A BASE
+setup_bad=0
+for chk in ${SEL_CHECKS[@]+"${SEL_CHECKS[@]}"}; do
+    run_check "$chk"
+    BASE[$chk]="$CHK_RES"
+    if [ "$CHK_RES" = PASS ]; then
+        echo "[negctl] baseline: $CHK_LABEL on the unmutated scratch build -> PASS"
+    else
+        tail -15 "$DIR/check.out"
+        echo "[negctl] baseline: $CHK_LABEL on the unmutated scratch build -> ${CHK_RES} -> ERROR (setup)"
+        setup_bad=1
+    fi
+done
+if [ "$setup_bad" -ne 0 ]; then
+    echo "[negctl] ERROR (setup): a check does not PASS on the unmutated build, so 'FAIL' under a mutant would be meaningless"
+    echo "NEGATIVE CONTROLS FAIL (ERROR (setup))"; exit 1
 fi
 
 while IFS=$'\t' read -r id quick file targets checks desc <&3; do
@@ -164,16 +209,17 @@ while IFS=$'\t' read -r id quick file targets checks desc <&3; do
         tail -15 "$DIR/build.log" >&2
         echo "[negctl] $id: $desc: mutant does not build -> BUILD ERROR"; bad=$((bad + 1)); restore; continue
     fi
-    line=""; ok=1
+    line=""; ok=1; errd=0
     for chk in $checks; do
         run_check "$chk"
         case "$CHK_RES" in
             FAIL) line+="${line:+, }$CHK_LABEL FAIL" ;;
             PASS) line+="${line:+, }$CHK_LABEL PASS"; ok=0 ;;
-            *)    line+="${line:+, }$CHK_LABEL ${CHK_RES}"; ok=0 ;;
+            *)    line+="${line:+, }$CHK_LABEL ${CHK_RES}"; ok=0; errd=1 ;;
         esac
     done
     if [ $ok -eq 1 ]; then echo "[negctl] $id: $desc: $line -> CAUGHT"; caught=$((caught + 1))
+    elif [ $errd -eq 1 ]; then echo "[negctl] $id: $desc: $line -> ERROR (setup)"; bad=$((bad + 1))
     else echo "[negctl] $id: $desc: $line -> NOT CAUGHT"; bad=$((bad + 1)); fi
     restore
 done 3< <(helper list "$TABLE")

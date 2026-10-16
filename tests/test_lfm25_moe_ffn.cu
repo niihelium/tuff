@@ -37,6 +37,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "bad fixture header/magic\n"); return 2;
     }
     const uint32_t n_cases = hdr[0], dim = hdr[1], ffn = hdr[2], K = hdr[3];
+    if (n_cases == 0) {  // an empty fixture would "pass" 0/0 and prove nothing
+        fprintf(stderr, "ERROR: fixture %s contains 0 cases (setup error, not a pass)\n", argv[2]); return 2;
+    }
     if (dim != 2048 || (ffn != 1792 && ffn != 1536) || K != 4) {
         fprintf(stderr, "unexpected fixture dims: dim=%u ffn_dim=%u k=%u\n", dim, ffn, K); return 2;
     }

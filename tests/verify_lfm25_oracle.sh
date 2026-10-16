@@ -107,62 +107,99 @@ done
 [ -x "$BIN" ] || { echo "Error: $BIN not found; build tuff first." >&2; exit 1; }
 [ -x "$REF_BIN" ] || { echo "Error: $REF_BIN not found; cmake --build build --target lfm25-llama-ref" >&2; exit 1; }
 
+# TMP_DIR only holds the expensive, content-keyed FP64 cache. Every per-run output (tuff dumps, llama logits,
+# logs) goes to a fresh directory so a previous run's files can never be graded (stale-logits hazard).
 TMP_DIR="/tmp/tuff_oracle"
 mkdir -p "$TMP_DIR"
-GOT="$TMP_DIR/got_lfm25_${MODE}.txt"
-ERR="$TMP_DIR/err_lfm25_${MODE}.txt"
-TF_LOGITS="$TMP_DIR/tuff_tf_lfm25_${MODE}.bin"
-TF_ERR="$TMP_DIR/tuff_tf_lfm25_${MODE}.err"
-LL_LOGITS="$TMP_DIR/llama_tf_lfm25_${MODE}.bin"
+RUN_DIR="$(mktemp -d /tmp/tuff_oracle_run.XXXXXX)"
+trap 'rm -rf "$RUN_DIR"' EXIT
+GOT="$RUN_DIR/got.txt"
+ERR="$RUN_DIR/greedy.err"
+TF_LOGITS="$RUN_DIR/tuff_tf.bin"
+TF_ERR="$RUN_DIR/tuff_tf.err"
+LL_LOGITS="$RUN_DIR/llama_tf.bin"
+
+# The caller's LFM25_* variables must not change what the gate runs (e.g. an exported LFM25_CUDA_GRAPH=0).
+SCRUB=(); SCRUBBED=()
+while IFS= read -r v; do
+    case "$v" in LFM25_*) SCRUB+=(-u "$v"); SCRUBBED+=("$v") ;; esac
+done < <(compgen -e)
+if [ "${#SCRUBBED[@]}" -gt 0 ]; then
+    echo "WARNING: scrubbed caller environment for tuff runs (unset): ${SCRUBBED[*]}" >&2
+fi
+
+die_setup() { echo "ORACLE ERROR ($MODE): $*" >&2; exit 2; }
 
 echo "LFM2.5 oracle gate ($MODE): $MODEL_PATH"
 echo "thresholds: $THR sha256=$THR_SHA"
 
-# Run tuff: greedy prefix, then the teacher-forced pass with per-step logits.
-"$BIN" --model "$MODEL_PATH" --prompt "$PROMPT" -c "$CTX" -n "$N_EXACT" --temp 0 --dump-tokens > "$GOT" 2> "$ERR" \
-    || { tail -20 "$ERR" >&2; exit 1; }
-"$BIN" --model "$MODEL_PATH" --prompt "$PROMPT" -c "$CTX" -n "$N" --temp 0 \
-    --teacher-force "$REF" --dump-logits "$TF_LOGITS" > /dev/null 2> "$TF_ERR" || true
-[ -s "$TF_LOGITS" ] || { tail -20 "$TF_ERR" >&2; echo "Error: tuff produced no teacher-forced logits" >&2; exit 1; }
+# Run tuff: greedy prefix, then the teacher-forced pass with per-step logits. A run is only usable if tuff
+# finished normally: greedy = exit 0 and N_EXACT tokens; teacher-forced = exit 0 or 1 (1 is tuff's own strict
+# 128/128 check, the expected outcome) AND the "Teacher-Forced Verification Result" banner AND a logits file.
+env ${SCRUB[@]+"${SCRUB[@]}"} "$BIN" --model "$MODEL_PATH" --prompt "$PROMPT" -c "$CTX" -n "$N_EXACT" --temp 0 --dump-tokens > "$GOT" 2> "$ERR" \
+    || { g_rc=$?; tail -20 "$ERR" >&2; die_setup "greedy prefix run failed (tuff exit $g_rc)"; }
+[ "$(wc -l < "$GOT")" -eq "$N_EXACT" ] || die_setup "greedy prefix run produced $(wc -l < "$GOT") tokens, want $N_EXACT"
+env ${SCRUB[@]+"${SCRUB[@]}"} "$BIN" --model "$MODEL_PATH" --prompt "$PROMPT" -c "$CTX" -n "$N" --temp 0 \
+    --teacher-force "$REF" --dump-logits "$TF_LOGITS" > /dev/null 2> "$TF_ERR" \
+    && tf_rc=0 || tf_rc=$?
+if { [ "$tf_rc" -ne 0 ] && [ "$tf_rc" -ne 1 ]; } || ! grep -q "Teacher-Forced Verification Result" "$TF_ERR" || [ ! -s "$TF_LOGITS" ]; then
+    tail -20 "$TF_ERR" >&2
+    die_setup "teacher-forced run did not complete (tuff exit $tf_rc, banner/logits missing)"
+fi
 
 # Both runtimes must see the same prompt tokens, or every comparison below is meaningless.
 TUFF_PROMPT="$(sed -n 's/^\[Tuff\] Prompt tokens ([0-9]*): //p' "$ERR" | xargs)"
 REF_PROMPT="$(sed -n 's/^prompt tokens ([0-9]*): *//p' "${REF%.txt}.recipe" 2>/dev/null | xargs)"
 if [ -n "$REF_PROMPT" ] && [ "$TUFF_PROMPT" != "$REF_PROMPT" ]; then
-    echo "Error: prompt tokenization differs: tuff [$TUFF_PROMPT] vs reference [$REF_PROMPT]" >&2
-    exit 1
+    die_setup "prompt tokenization differs: tuff [$TUFF_PROMPT] vs reference [$REF_PROMPT]"
 fi
 VOCAB="$(od -An -tu4 -j12 -N4 "$TF_LOGITS" | xargs)"
 
-# llama.cpp teacher-forced logits (seconds on GPU) and the FP64 reference (cached per model+ref).
+# llama.cpp teacher-forced logits (seconds on GPU) and the FP64 reference (cached per model+ref+prompt tokens+script).
 "$REF_BIN" --model "$MODEL_PATH" --prompt "$PROMPT" -n "$N_FP" --teacher "$REF" \
-    --logits-out "$LL_LOGITS" ${REF_EXTRA[@]+"${REF_EXTRA[@]}"} 2> /dev/null
-KEY="$(stat -c '%s-%Y' "$MODEL_PATH")-$(sha1sum "$REF" | cut -c1-12)-$N_FP"
+    --logits-out "$LL_LOGITS" ${REF_EXTRA[@]+"${REF_EXTRA[@]}"} 2> /dev/null \
+    || die_setup "llama.cpp reference run failed"
+KEY="$(stat -c '%s-%Y' "$MODEL_PATH")-$(sha1sum "$REF" | cut -c1-12)-$N_FP-$(sha1sum tools/lfm25_fp64_ref.py | cut -c1-12)-$(printf '%s' "$TUFF_PROMPT" | sha1sum | cut -c1-8)"
 FP_LOGITS="$TMP_DIR/fp64_lfm25_${MODE}_${KEY}.bin"
 if [ ! -s "$FP_LOGITS" ]; then
-    echo "  (computing FP64 reference for $N_FP steps, ~1 min dense, ~3 min 8B MoE, 24B: see roadmap; cached afterwards)"
+    echo "  (computing FP64 reference for $N_FP steps, ~1 min dense, ~3 min 8B MoE, ~25 min 24B; cached afterwards)"
     "$PY" -I tools/lfm25_fp64_ref.py --model "$MODEL_PATH" --prompt-tokens "$TUFF_PROMPT" \
-        --tokens "$REF" -n "$N_FP" --out "$FP_LOGITS.tmp" 2> "$TMP_DIR/fp64.err" \
-        || { tail -20 "$TMP_DIR/fp64.err" >&2; exit 1; }
+        --tokens "$REF" -n "$N_FP" --out "$FP_LOGITS.tmp" 2> "$RUN_DIR/fp64.err" \
+        || { tail -20 "$RUN_DIR/fp64.err" >&2; die_setup "FP64 reference failed"; }
     mv "$FP_LOGITS.tmp" "$FP_LOGITS"
 fi
 
 echo "=========================================================="
-rc=0
-"$PY" tools/lfm25_gate.py exact --ref "$REF" --got "$GOT" -n "$N_EXACT" \
-    --margins "$MARGINS" --min-margin "$MIN_MARGIN" || rc=1
-"$PY" tools/lfm25_gate.py teacher --ref "$REF" --margins "$MARGINS" --tuff "$TF_LOGITS" \
-    --vocab "$VOCAB" -n "$N" --min-margin "$MIN_MARGIN" --fp64 "$FP_LOGITS" || rc=1
-"$PY" tools/lfm25_gate.py tolerance --fp64 "$FP_LOGITS" --tuff "$TF_LOGITS" --llama "$LL_LOGITS" \
+rc=0; err=0
+# A stage is a verdict only if it printed its own "-> PASS" / "-> FAIL" line; a non-zero exit without one
+# (traceback, missing file) is a setup ERROR, not a gate failure.
+stage() {
+    local out r
+    out="$("$@" 2>&1)" && r=0 || r=$?
+    printf '%s\n' "$out"
+    if [ "$r" -ne 0 ]; then
+        if printf '%s\n' "$out" | grep -q -- '-> FAIL'; then rc=1; else err=1; fi
+    elif ! printf '%s\n' "$out" | grep -q -- '-> PASS'; then
+        err=1
+    fi
+}
+stage "$PY" tools/lfm25_gate.py exact --ref "$REF" --got "$GOT" -n "$N_EXACT" \
+    --margins "$MARGINS" --min-margin "$MIN_MARGIN"
+stage "$PY" tools/lfm25_gate.py teacher --ref "$REF" --margins "$MARGINS" --tuff "$TF_LOGITS" \
+    --vocab "$VOCAB" -n "$N" --min-margin "$MIN_MARGIN" --fp64 "$FP_LOGITS"
+stage "$PY" tools/lfm25_gate.py tolerance --fp64 "$FP_LOGITS" --tuff "$TF_LOGITS" --llama "$LL_LOGITS" \
     --vocab "$VOCAB" -n "$N_FP" --stat "$STAT" \
-    --max-ratio "$MAX_RATIO" --max-step-ratio "$MAX_STEP_RATIO" --max-p90-ratio "$MAX_P90_RATIO" || rc=1
+    --max-ratio "$MAX_RATIO" --max-step-ratio "$MAX_STEP_RATIO" --max-p90-ratio "$MAX_P90_RATIO"
 echo "=========================================================="
-if [ "$rc" -eq 0 ]; then
+if [ "$err" -eq 1 ]; then
+    echo "  ORACLE ERROR ($MODE): a stage produced no verdict"
+elif [ "$rc" -eq 0 ]; then
     echo "  ORACLE PASS ($MODE)"
 else
     echo "  ORACLE FAIL ($MODE)"
 fi
 echo "=========================================================="
+[ "$err" -eq 1 ] && exit 2
 if [ "${#OVERRIDES[@]}" -gt 0 ]; then
     list="$(printf '%s, ' "${OVERRIDES[@]}")"
     echo "EXPLORATORY (thresholds overridden: ${list%, }) — NOT A GATE RESULT"

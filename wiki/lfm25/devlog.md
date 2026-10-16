@@ -132,7 +132,7 @@ Current results:
 
 ### 4.3 Honest caveats and how they are now addressed
 - Thresholds (0.5 / 1.10 / 1.5 / 2.0) are judgment calls, not derived. **Now locked** in `tests/lfm25_gate_thresholds.txt`
-  (sha256 `996f77a5ea01`, printed by every gate run; table in the roadmap's *Gate Design*). An env override makes the run
+  (sha256 `4023c970b5df` (was `996f77a5ea01` before the dense26 keys were added in `855baaa`; no value changed), printed by every gate run; table in the roadmap's *Gate Design*). An env override makes the run
   `EXPLORATORY ... NOT A GATE RESULT`, exit 3. Changing the file needs its own commit with the rationale, written before
   looking at the result it would flip.
 - The gate was changed twice **after** a failure (robust MoE stat; FP64 adjudication). Both were evidence-backed and
@@ -150,6 +150,17 @@ Current results:
   no longer matches is reported STALE and fails the run. ~100 s.
 - One entry point: `tests/verify_lfm25_all.sh [--controls]` (golden ×3, oracle ×3, 4 unit tests, optionally the controls),
   ~3 min with controls.
+
+### 4.3b Gate robustness (after the Opus 5.5 review, 2026-10-16)
+- Oracle: per-run outputs in a `mktemp -d` dir (only the FP64 cache stays in `/tmp/tuff_oracle`); tuff must exit 0/1 and
+  print its teacher-forcing banner; a stage without a verdict line is `ORACLE ERROR` (exit 2), never PASS/FAIL. FP64 cache
+  key includes the FP64 script sha1 and the prompt tokens.
+- All gate scripts scrub caller `LFM25_*` variables (printed warning) and apply only each config's own env; the golden
+  asserts the expert-cache line matches the config. Graphed execution itself is not observable (byte-identical by design).
+- Negative controls: every distinct check is first run on the unmutated scratch build and must PASS; outcomes are
+  PASS / FAIL (the gate's own FAIL verdict) / ERROR (setup) — a control is CAUGHT only on real FAILs.
+- Spec check requires the spec stats line, drafts on the repeat prompt and at least one rejected draft per model.
+- `ab_interleaved.sh`: errored rounds are excluded and make the verdict INVALID.
 
 ### 4.4 Negative controls that must fail (keep using them)
 | Bug injected | Caught by |
@@ -286,7 +297,7 @@ $PY tools/lfm25_pack_moe_fixtures.py    /tmp/d24 tests/fixtures/lfm25_24b_moe_ff
 | experts / top-k / expert ffn | — | 32 / 4 / 1792 | 64 / 4 / 1536 |
 | expert down type | — | Q4_K ×12, Q6_K ×10 layers | Q4_K ×20, Q6_K ×18 |
 | rope base / vocab | 1e7 / 65536 | 5e6 / 128000 | 1e7 / 128000 |
-| BOS / EOS | 1 / 2 | 124894 / 124900 | 124894 / 124900 |
+| BOS / EOS | 1 / 7 | 124894 / 124900 | 124894 / 124900 |
 | "Hello" tokens | 1 36309 | 124894 35808 | 124894 35808 |
 
 - ShortConv: `in_proj` → [b, c, x]; u = b⊙x; y = s0·k0 + s1·k1 + u·k2 (k2 = current); state ← (s1, u); out = c⊙y.
