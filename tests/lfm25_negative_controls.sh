@@ -14,7 +14,10 @@
 # exit 1. A check that still passes = NOT CAUGHT (a blind spot). A control whose search string no longer
 # matches exactly once is STALE. Exit 1 on any NOT CAUGHT / STALE / build or setup error.
 #
-# Env: NEGCTL_DIR, NEGCTL_TABLE, PYTHON (stdlib python; default python3), JOBS (default 16).
+# The baseline PASS of each check is cached across invocations (key: scratch-tree content hash + binaries + check; see
+# "Baseline cache" below; NEGCTL_NO_CACHE=1 disables) so `--only A` then `--only B` does not redo it.
+#
+# Env: NEGCTL_DIR, NEGCTL_TABLE, NEGCTL_NO_CACHE, PYTHON (stdlib python; default python3), JOBS (default 16).
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
@@ -117,7 +120,7 @@ build() {  # <targets...>
 unit_verdict() {
     local out="$1" rc="$2" line n m
     if [ "$rc" -eq 0 ]; then CHK_RES=PASS; return; fi
-    line="$(grep -E '^(router|moe_ffn): [0-9]+/[0-9]+ cases pass' "$out" | tail -1)"
+    line="$(grep -E '^(router|moe_ffn|cpu_expert): [0-9]+/[0-9]+ cases pass' "$out" | tail -1)"
     if [ "$rc" -eq 1 ] && [ -n "$line" ]; then
         n="$(sed -E 's/^[a-z_]+: ([0-9]+)\/([0-9]+) .*/\1/' <<< "$line")"
         m="$(sed -E 's/^[a-z_]+: ([0-9]+)\/([0-9]+) .*/\2/' <<< "$line")"
@@ -154,6 +157,8 @@ run_check() {
         router24)  CHK_LABEL=router24;  env ${SCRUB[@]+"${SCRUB[@]}"} "$DIR/build/lfm25-router-test"  "$M24" "$DIR/tests/fixtures/lfm25_24b_router_cases.bin" > "$out" 2>&1; rc=$?; unit_verdict "$out" $rc ;;
         moeffn8)   CHK_LABEL=moeffn8;   env ${SCRUB[@]+"${SCRUB[@]}"} "$DIR/build/lfm25-moe-ffn-test" "$M8"  "$DIR/tests/fixtures/lfm25_8b_moe_ffn_cases.bin"  > "$out" 2>&1; rc=$?; unit_verdict "$out" $rc ;;
         moeffn24)  CHK_LABEL=moeffn24;  env ${SCRUB[@]+"${SCRUB[@]}"} "$DIR/build/lfm25-moe-ffn-test" "$M24" "$DIR/tests/fixtures/lfm25_24b_moe_ffn_cases.bin" > "$out" 2>&1; rc=$?; unit_verdict "$out" $rc ;;
+        cpuexp8)   CHK_LABEL=cpuexp8;   env ${SCRUB[@]+"${SCRUB[@]}"} "$DIR/build/lfm25-cpu-expert-test" "$M8"  1 > "$out" 2>&1; rc=$?; unit_verdict "$out" $rc ;;
+        cpuexp24)  CHK_LABEL=cpuexp24;  env ${SCRUB[@]+"${SCRUB[@]}"} "$DIR/build/lfm25-cpu-expert-test" "$M24" 1 > "$out" 2>&1; rc=$?; unit_verdict "$out" $rc ;;
         *) CHK_LABEL="$chk"; CHK_RES="ERROR:unknown check" ;;
     esac
 }
@@ -178,10 +183,27 @@ done < <(helper list "$TABLE")
 if ! build $SEL_TARGETS; then tail -20 "$DIR/build.log" >&2; echo "[negctl] baseline: scratch build FAILED"; exit 1; fi
 declare -A BASE
 setup_bad=0
+# Baseline cache: a PASS of a check on the unmutated scratch build is remembered in $DIR/build/negctl_baseline/<key>, where
+# key = sha256(content hash of the scratch tree sources [everything except build*/logs] + sha256 of the freshly built binaries
+# + the check id + the model files' size/mtime). A later invocation (e.g. `--only A` then `--only B`) with the same tree and
+# binaries skips that baseline run. Only PASS is cached (a failing baseline is always re-run); NEGCTL_NO_CACHE=1 disables it.
+BCACHE="$DIR/build/negctl_baseline"
+mkdir -p "$BCACHE"
+TREE_HASH="$(cd "$DIR" && find . \( -name 'build*' -o -name check.out -o -name build.log -o -name cmake_configure.log \) -prune -o -type f -print0 \
+    | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+BIN_HASH="$( (for t in $SEL_TARGETS; do [ -f "$DIR/build/$t" ] && sha256sum "$DIR/build/$t" | cut -d' ' -f1; done) | sha256sum | cut -d' ' -f1)"
+MODEL_ID="$(stat -c '%n:%s:%Y' "$M8" "$M24" "$REF_BIN" 2>/dev/null | sha256sum | cut -d' ' -f1)"
 for chk in ${SEL_CHECKS[@]+"${SEL_CHECKS[@]}"}; do
+    ckey="$(printf '%s %s %s %s' "$TREE_HASH" "$BIN_HASH" "$MODEL_ID" "$chk" | sha256sum | cut -d' ' -f1)"
+    if [ -z "${NEGCTL_NO_CACHE:-}" ] && [ -f "$BCACHE/$ckey" ]; then
+        BASE[$chk]=PASS
+        echo "[negctl] baseline: $(cat "$BCACHE/$ckey") on the unmutated scratch build -> PASS (cached: same tree + binaries, skipped)"
+        continue
+    fi
     run_check "$chk"
     BASE[$chk]="$CHK_RES"
     if [ "$CHK_RES" = PASS ]; then
+        echo "$CHK_LABEL" > "$BCACHE/$ckey"
         echo "[negctl] baseline: $CHK_LABEL on the unmutated scratch build -> PASS"
     else
         tail -15 "$DIR/check.out"

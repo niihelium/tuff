@@ -29,7 +29,8 @@
 # scrubbed env + the cache line, not observed directly.
 # Exit: 0 pass, 1 golden mismatch / incomplete run, 2 setup error (missing model/ref/golden-env, bad usage).
 #
-# Env: TUFF_BIN (default ./build/tuff), PYTHON, GOLDEN_CACHE (local cache of golden logits, only used
+# Env: GOLDEN_JOBS (default 1: one `tuff --jobs` process per model key; 0: two fresh tuff processes per config, the old
+#      behaviour), GOLDEN_KEEP=<dir> (keep every config's tokens/logits/stderr there, for A/B comparisons), TUFF_BIN (default ./build/tuff), PYTHON, GOLDEN_CACHE (local cache of golden logits, only used
 #      for max |delta logit| diagnostics; default /tmp/tuff_golden).
 set -uo pipefail
 
@@ -38,6 +39,7 @@ cd "$(dirname "$0")/.."
 BIN="${TUFF_BIN:-./build/tuff}"
 THR="tests/lfm25_gate_thresholds.txt"
 PROMPT="Hello"
+CPU_MISS_DEFAULT=0     # tuff default of LFM25_CPU_MISS on the expert-cache path (must match LFM25_CPU_MISS_DEFAULT)
 
 locked() {
     local v
@@ -89,7 +91,7 @@ fi
 [ -x "$BIN" ] || { echo "Error: $BIN not found; build tuff first." >&2; exit 1; }
 
 SCRATCH="$(mktemp -d /tmp/tuff_golden_run.XXXXXX)"
-trap 'rm -rf "$SCRATCH"' EXIT
+trap '[ -z "${GOLDEN_KEEP:-}" ] || { mkdir -p "$GOLDEN_KEEP"; cp -r "$SCRATCH"/. "$GOLDEN_KEEP"/; }; rm -rf "$SCRATCH"' EXIT
 
 # Sets MODEL, REF, IS_MOE (0/1), CACHE_ALWAYS (1 = this model always runs the expert cache), CONFIGS ("name|ENV=..;ENV=..|extra tuff args" entries, the last field optional and appended to BOTH
 # tuff runs; the first entry is the one stored as the golden).
@@ -116,6 +118,11 @@ mode_setup() {
                      "expert-cache-tiny-alt|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300;LFM25_PREFETCH=1;LFM25_PINNED_EXPERTS=0;LFM25_CACHE_POLICY=lru"
                      "tf-batch4||--tf-batch 4"
                      "tf-batch4-rollback-cache|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300|--tf-batch 4 --tf-rollback"
+                     "cpu-miss-tiny|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300;LFM25_CPU_MISS=1"
+                     "cpu-miss-tiny-noadmit|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300;LFM25_CPU_MISS=1;LFM25_CPU_MISS_ADMIT=0"
+                     "tf-batch4-cpu-miss|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300;LFM25_CPU_MISS=1;LFM25_CPU_MISS_ADMIT=0|--tf-batch 4"
+                     "tf-batch4-rollback-cpu-miss|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300;LFM25_CPU_MISS=1|--tf-batch 4 --tf-rollback"
+                     "spec-ngram-cpu-miss|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300;LFM25_CPU_MISS=1|--spec-draft ngram"
                      "spec-ngram||--spec-draft ngram"
                      "spec-ngram-cache|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300|--spec-draft ngram") ;;
         moe)
@@ -123,7 +130,9 @@ mode_setup() {
             MODEL="/run/media/nii/pohjola/models/LiquidAI/LFM2.5-24B-A2B-GGUF/LFM2.5-24B-A2B-Q4_K_M.gguf"
             REF="tests/ref_lfm25_moe_128.txt"
             CONFIGS=("graph=1|LFM25_CUDA_GRAPH=1" "graph=0|LFM25_CUDA_GRAPH=0" "prefetch|LFM25_PREFETCH=1"
-                     "tf-batch4||--tf-batch 4" "spec-ngram||--spec-draft ngram") ;;
+                     "tf-batch4||--tf-batch 4" "spec-ngram||--spec-draft ngram"
+                     "cpu-miss|LFM25_CPU_MISS=1" "cpu-miss-noadmit|LFM25_CPU_MISS=1;LFM25_CPU_MISS_ADMIT=0"
+                     "tf-batch4-cpu-miss|LFM25_CPU_MISS=1|--tf-batch 4" "spec-ngram-cpu-miss|LFM25_CPU_MISS=1|--spec-draft ngram") ;;
     esac
 }
 
@@ -135,33 +144,102 @@ split_entry() {
     if [[ "$rest" == *"|"* ]]; then xargs_="${rest#*|}"; else xargs_=""; fi
 }
 
-# run_config <dir> <env-string> [extra tuff args]: writes <dir>/tokens and <dir>/logits. Returns 1 (with a reason on
-# stderr) if tuff did not produce a complete output. Greedy run: exit 0 and N tokens. Teacher-forced run: exit 0 or 1
-# (1 = tuff's own strict 128/128 check) AND the "Teacher-Forced Verification Result" banner AND a logits file of the
-# exact size. Both runs must show the expert-cache line iff the config is supposed to use the cache.
-run_config() {
-    local dir="$1" envs="${2//;/ }" xa="${3:-}" rc cache_want=0
+# Execution (two interchangeable back ends, same output files per config dir: tokens, logits, err1, err2, rc1, rc2):
+#   GOLDEN_JOBS=1 (default)  exec_jobs: ONE tuff --jobs process per distinct model key (the weights/expert store are loaded
+#                            once; all configs of the key run as jobs, 2 jobs per config: greedy + teacher-forced).
+#                            Model keys: "plain", and "force" (LFM25_FORCE_EXPERT_CACHE=1 on a <=32-expert MoE changes
+#                            the weight upload). The tuff runner also reloads the model by itself if a key changes.
+#   GOLDEN_JOBS=0            exec_procs: the old behaviour, two fresh tuff processes per config (for comparison).
+# Both run with the caller's LFM25_* scrubbed (SCRUB) and only the config's own env applied.
+
+q() { local s="${1//\\/\\\\}"; s="${s//\"/\\\"}"; printf '"%s"' "$s"; }   # quote for a tuff jobs line
+
+# config_key <envs>: the model key of a config (see above).
+config_key() {
+    if [ "$IS_MOE" -eq 1 ] && [ "$CACHE_ALWAYS" -eq 0 ] && [[ " $1 " == *" LFM25_FORCE_EXPERT_CACHE=1 "* ]]; then echo force; else echo plain; fi
+}
+
+exec_procs() {  # <dir> <env-string> [extra tuff args]
+    local dir="$1" envs="${2//;/ }" xa="${3:-}" rc
     mkdir -p "$dir"
-    if [ "$IS_MOE" -eq 1 ] && { [ "$CACHE_ALWAYS" -eq 1 ] || [[ " $envs " == *" LFM25_FORCE_EXPERT_CACHE=1 "* ]]; }; then cache_want=1; fi
     # shellcheck disable=SC2086
     env ${SCRUB[@]+"${SCRUB[@]}"} $envs "$BIN" --model "$MODEL" --prompt "$PROMPT" -c "$CTX" -n "$N" --temp 0 --dump-tokens $xa \
-        > "$dir/tokens" 2> "$dir/err1" || { tail -5 "$dir/err1" >&2; echo "greedy run failed" >&2; return 1; }
-    [ "$(wc -l < "$dir/tokens")" -eq "$N" ] || { echo "greedy run produced $(wc -l < "$dir/tokens") tokens, want $N" >&2; return 1; }
+        > "$dir/tokens" 2> "$dir/err1"; echo $? > "$dir/rc1"
     # shellcheck disable=SC2086
     env ${SCRUB[@]+"${SCRUB[@]}"} $envs "$BIN" --model "$MODEL" --prompt "$PROMPT" -c "$CTX" -n "$N" --temp 0 \
-        --teacher-force "$REF" --dump-logits "$dir/logits" $xa > /dev/null 2> "$dir/err2" && rc=0 || rc=$?
-    if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then tail -5 "$dir/err2" >&2; echo "teacher-forced run exited $rc" >&2; return 1; fi
+        --teacher-force "$REF" --dump-logits "$dir/logits" $xa > /dev/null 2> "$dir/err2"; echo $? > "$dir/rc2"
+}
+
+# exec_jobs <mode>: runs every config of the mode, one tuff --jobs process per model key. Config dirs: $SCRATCH/<mode>-<name>.
+exec_jobs() {
+    local mode="$1" key entry name envs xargs_ dir jf
+    for key in plain force; do
+        jf="$SCRATCH/$mode-$key.jobs"; : > "$jf"
+        for entry in "${CONFIGS[@]}"; do
+            split_entry "$entry"
+            [ "$(config_key "${envs//;/ }")" = "$key" ] || continue
+            dir="$SCRATCH/$mode-$name"; rm -rf "$dir"; mkdir -p "$dir"
+            printf '%s --prompt %s -c %s -n %s --temp 0 --dump-tokens %s --out %s --err %s --status %s\n' \
+                "${envs//;/ }" "$(q "$PROMPT")" "$CTX" "$N" "$xargs_" "$dir/tokens" "$dir/err1" "$dir/rc1" >> "$jf"
+            printf '%s --prompt %s -c %s -n %s --temp 0 --teacher-force %s --dump-logits %s %s --out %s --err %s --status %s\n' \
+                "${envs//;/ }" "$(q "$PROMPT")" "$CTX" "$N" "$REF" "$dir/logits" "$xargs_" "$dir/out2" "$dir/err2" "$dir/rc2" >> "$jf"
+        done
+        [ -s "$jf" ] || continue
+        # the runner's own exit code is deliberately ignored: the golden accepts teacher-forced exit 1, and every job
+        # writes its own status file (a missing one = the job never ran = incomplete)
+        env ${SCRUB[@]+"${SCRUB[@]}"} "$BIN" --model "$MODEL" --jobs "$jf" > /dev/null 2> "$SCRATCH/$mode-$key.runner.err" || true
+    done
+}
+
+# verify_config <dir> <env-string>: checks the files of one executed config. Returns 1 (with a reason on stderr) if tuff did
+# not produce a complete output. Greedy run: exit 0 and N tokens. Teacher-forced run: exit 0 or 1 (1 = tuff's own strict
+# 128/128 check) AND the "Teacher-Forced Verification Result" banner AND a logits file of the exact size. Both runs must
+# show the expert-cache line iff the config is supposed to use the cache.
+verify_config() {
+    local dir="$1" envs="${2//;/ }" rc cache_want=0 rc1 rc2
+    rc1="$(cat "$dir/rc1" 2>/dev/null || echo missing)"; rc2="$(cat "$dir/rc2" 2>/dev/null || echo missing)"
+    if [ "$IS_MOE" -eq 1 ] && { [ "$CACHE_ALWAYS" -eq 1 ] || [[ " $envs " == *" LFM25_FORCE_EXPERT_CACHE=1 "* ]]; }; then cache_want=1; fi
+    [ "$rc1" = 0 ] || { tail -5 "$dir/err1" >&2; echo "greedy run failed (exit $rc1)" >&2; return 1; }
+    [ "$(wc -l < "$dir/tokens")" -eq "$N" ] || { echo "greedy run produced $(wc -l < "$dir/tokens") tokens, want $N" >&2; return 1; }
+    rc="$rc2"
+    if [ "$rc" != 0 ] && [ "$rc" != 1 ]; then tail -5 "$dir/err2" >&2; echo "teacher-forced run exited $rc" >&2; return 1; fi
     grep -q "Teacher-Forced Verification Result" "$dir/err2" || { tail -5 "$dir/err2" >&2; echo "teacher-forced run printed no result banner" >&2; return 1; }
     [ -s "$dir/logits" ] || { tail -5 "$dir/err2" >&2; echo "teacher-forced run produced no logits" >&2; return 1; }
     local vocab want got e has
     vocab="$(od -An -tu4 -j12 -N4 "$dir/logits" | xargs)"
     want=$((16 + N * vocab * 4)); got="$(stat -c %s "$dir/logits")"
     [ "$got" -eq "$want" ] || { echo "logits file is $got bytes, want $want" >&2; return 1; }
+    # CPU-miss mode: tuff prints "[LFM25 CACHE] cpu-miss: ON|OFF" on the cache path (and nothing otherwise).
+    local cpu_want="$CPU_MISS_DEFAULT" cm
+    [[ " $envs " == *" LFM25_CPU_MISS=1 "* ]] && cpu_want=1
+    [[ " $envs " == *" LFM25_CPU_MISS=0 "* ]] && cpu_want=0
     for e in err1 err2; do
         has=0; grep -q '^\[LFM25 CACHE\] [0-9]* slots' "$dir/$e" && has=1
         [ "$has" -eq "$cache_want" ] || { echo "effective path mismatch ($e): expert cache expected=$cache_want seen=$has" >&2; return 1; }
+        cm=none
+        grep -q '^\[LFM25 CACHE\] cpu-miss: ON' "$dir/$e" && cm=1
+        grep -q '^\[LFM25 CACHE\] cpu-miss: OFF' "$dir/$e" && cm=0
+        if [ "$cache_want" -eq 1 ]; then
+            [ "$cm" = "$cpu_want" ] || { echo "effective path mismatch ($e): cpu-miss expected=$cpu_want seen=$cm" >&2; return 1; }
+        else
+            [ "$cm" = none ] || { echo "effective path mismatch ($e): cpu-miss line without the expert cache" >&2; return 1; }
+        fi
     done
     return 0
+}
+
+# exec_all <mode>: executes every config of the (already set up) mode with the selected back end.
+exec_all() {
+    local entry name envs xargs_
+    if [ "${GOLDEN_JOBS:-1}" = 0 ]; then
+        for entry in "${CONFIGS[@]}"; do
+            split_entry "$entry"
+            rm -rf "$SCRATCH/$1-$name"
+            exec_procs "$SCRATCH/$1-$name" "$envs" "$xargs_"
+        done
+    else
+        exec_jobs "$1"
+    fi
 }
 
 check_mode() {
@@ -177,15 +255,15 @@ check_mode() {
     if ! "${GOLD_PY[@]}" env-check --golden "$golden" --model "$MODEL" --ref "$REF" --tuff-bin "$BIN"; then
         echo "GOLDEN FAIL ($mode)"; return 1
     fi
+    exec_all "$mode"
     for entry in "${CONFIGS[@]}"; do
         split_entry "$entry"
-        rm -rf "$SCRATCH/$mode-$name"
-        if ! run_config "$SCRATCH/$mode-$name" "$envs" "$xargs_"; then
+        if ! verify_config "$SCRATCH/$mode-$name" "$envs"; then
             echo "[golden] $mode $name: tuff run incomplete -> FAIL"; rc=1; continue
         fi
         "${GOLD_PY[@]}" check --golden "$golden" --config "$name" \
             --tokens "$SCRATCH/$mode-$name/tokens" --logits "$SCRATCH/$mode-$name/logits" || rc=1
-        rm -f "$SCRATCH/$mode-$name/logits"
+        [ -z "${GOLDEN_KEEP:-}" ] && rm -f "$SCRATCH/$mode-$name/logits"
     done
     if [ "$rc" -eq 0 ]; then echo "GOLDEN PASS ($mode)"; else echo "GOLDEN FAIL ($mode)"; fi
     return "$rc"
@@ -201,10 +279,10 @@ update_mode() {
         return 1
     fi
     echo "[golden] $mode: step 2/3 - all configurations must agree byte-for-byte"
+    exec_all "$mode"
     for entry in "${CONFIGS[@]}"; do
         split_entry "$entry"
-        rm -rf "$SCRATCH/$mode-$name"
-        run_config "$SCRATCH/$mode-$name" "$envs" "$xargs_" || { echo "[golden] $mode $name: tuff run incomplete - REFUSED"; return 1; }
+        verify_config "$SCRATCH/$mode-$name" "$envs" || { echo "[golden] $mode $name: tuff run incomplete - REFUSED"; return 1; }
         names="${names:+$names,}$name"
         if [ -z "$first" ]; then
             first="$name"

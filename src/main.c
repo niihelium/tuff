@@ -15,6 +15,11 @@
 #include <math.h>
 #include <omp.h>
 #include <sys/resource.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <ctype.h>
+#include <limits.h>
+#include "lfm25_model.h"
 
 #define TF_MAX_BATCH 8   // == LFM25_MAX_BATCH
 
@@ -33,6 +38,12 @@ static void print_usage(const char *prog) {
         "  --tf-batch <B>              with --teacher-force: feed the reference in chunks of B tokens (LFM2.5 batched forward)\n"
         "  --tf-rollback               with --tf-batch B>=2: roll back to 1+(chunk%%B) tokens after every chunk and re-feed\n"
         "\n"
+        "Job runner (LFM2.5 engines): load the model once, run many jobs\n"
+        "  --jobs <file>               one job per line: [NAME=value ...] <tuff arguments> [--out <f>] [--err <f>] [--status <f>];\n"
+        "                              other arguments on this command line are defaults for every job; reloads the model only when\n"
+        "                              the model path or LFM25_FORCE_EXPERT_CACHE (on <=32-expert MoE) changes. Env: TUFF_TIMING=1\n"
+        "                              prints per-phase wall times.\n"
+"\n"
         "Interactive TUI Chat Options:\n"
         "  --chat, -i, --interactive   launch interactive terminal chat mode\n"
         "  --system <prompt>           system prompt\n"
@@ -68,6 +79,8 @@ static void print_usage(const char *prog) {
 // getenv() is a linear scan of environ, so it is read exactly once and cached. The benign
 // race on first touch is harmless: every racing reader computes the same value.
 static int g_tuff_exact = -1;
+// --jobs mode re-reads TUFF_EXACT for every job (the job may set it).
+static void tuff_exact_reset(void) { g_tuff_exact = -1; }
 
 int tuff_exact(void) {
     int v = g_tuff_exact;
@@ -150,6 +163,69 @@ static double vmrss_mib(void) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// Job runner infrastructure (`tuff --jobs <file>`): one process loads the model once and runs many jobs.
+// ---------------------------------------------------------------------------------------------------------------
+static int         g_in_jobs = 0;        // 1 while inside the --jobs runner (exit() must not take the runner down silently)
+static const char *g_cur_status = NULL;  // --status path of the running job
+
+// exit() for fatal conditions inside a run: in jobs mode the job's exit code is recorded (last stderr line + status file)
+// before the whole runner terminates (a fatal engine error leaves CUDA state we do not trust for the next job).
+static void job_exit(int code) {
+    if (g_in_jobs) {
+        fflush(stdout);
+        fprintf(stderr, "JOB_EXIT=%d\n", code);
+        if (g_cur_status) { FILE *f = fopen(g_cur_status, "w"); if (f) { fprintf(f, "%d\n", code); fclose(f); } }
+    }
+    exit(code);
+}
+
+// TUFF_TIMING=1: one line per phase on stderr, "[Tuff timing] <phase>: <seconds since the previous mark> (t=<seconds since job start>)".
+static int    g_tm_on = 0;
+static double g_tm_last = 0.0, g_tm_start = 0.0;
+
+static double tm_mono(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+}
+
+static void tm_reset(void) {
+    const char *e = getenv("TUFF_TIMING");
+    g_tm_on = e && e[0] == '1';
+    g_tm_start = g_tm_last = tm_mono();
+}
+
+static void tm_mark(const char *what) {
+    if (!g_tm_on) return;
+    double now = tm_mono();
+    fprintf(stderr, "[Tuff timing] %s: %.3f s (t=%.3f)\n", what, now - g_tm_last, now - g_tm_start);
+    g_tm_last = now;
+}
+
+// Seconds since this process was started (dynamic loading + static init + CUDA runtime load happen before main()).
+static double proc_age_sec(void) {
+    FILE *f = fopen("/proc/self/stat", "r");
+    if (!f) return -1.0;
+    char buf[1024];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    const char *p = strrchr(buf, ')');
+    if (!p) return -1.0;
+    unsigned long long start = 0;
+    int field = 3;   // fields after "(comm)" start at 3 (state)
+    for (p += 2; *p && field < 22; ++p) if (*p == ' ') field++;
+    if (sscanf(p, "%llu", &start) != 1) return -1.0;
+    FILE *u = fopen("/proc/uptime", "r");
+    if (!u) return -1.0;
+    double up = 0.0;
+    int ok = fscanf(u, "%lf", &up);
+    fclose(u);
+    if (ok != 1) return -1.0;
+    return up - (double)start / (double)sysconf(_SC_CLK_TCK);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // Lossless n-gram (prompt-lookup) speculative decoding for the LFM2.5 engines (Task 5.2). Greedy only.
 // Draft = continuation of the most recent earlier occurrence of the last n tokens (n = nmax..nmin) of the token
 // history; verification = one engine_forward_batch([t, d1..dk]) whose per-position argmax is bit-identical to k+1
@@ -161,6 +237,7 @@ static double vmrss_mib(void) {
 //   throughput(0) = 1 / cost(one graphed single token)
 // where cost() is a table measured once at startup. Ties and no-gain cases choose k = 0 (no speculation).
 // ---------------------------------------------------------------------------------------------------------------
+
 #define SPEC_KMAX 7
 #define SPEC_NBUCKET 6
 #define SPEC_DECAY 0.85
@@ -369,7 +446,7 @@ static int spec_step(spec_t *s, int32_t t, int pos, int rem, int32_t *out) {
         out[0] = vt->engine_forward_token(s->eng, t, pos);
         if (out[0] < 0) {
             fprintf(stderr, "[Tuff] FATAL: engine_forward_token failed at position %d\n", pos);
-            exit(3);
+            job_exit(3);
         }
         spec_push(s, out[0]);
         if (!s->k_fixed) {
@@ -386,14 +463,14 @@ static int spec_step(spec_t *s, int32_t t, int pos, int rem, int32_t *out) {
     for (int i = 0; i < k; ++i) toks[1 + i] = d[i];
     if (vt->engine_forward_batch(s->eng, toks, k + 1, pos, am, NULL) != 0) {
         fprintf(stderr, "[Tuff] FATAL: speculative engine_forward_batch failed at position %d (k=%d)\n", pos, k);
-        exit(1);
+        job_exit(1);
     }
     int m = 0;
     while (m < k && d[m] == am[m]) m++;
     for (int i = 0; i <= m; ++i) { out[i] = am[i]; spec_push(s, am[i]); }
     if (m < k && vt->engine_rollback(s->eng, m + 1) != 0) {
         fprintf(stderr, "[Tuff] FATAL: speculative engine_rollback(%d) failed at position %d\n", m + 1, pos);
-        exit(1);
+        job_exit(1);
     }
     if (!s->k_fixed) {
         const double dt = omp_get_wtime() - t0;
@@ -431,249 +508,283 @@ static int ctx_fits(const char *what, long need, int ctx) {
 static void fwd_check(int is_lfm, int32_t t, int pos) {
     if (is_lfm && t < 0) {
         fprintf(stderr, "[Tuff] FATAL: engine_forward_token failed at position %d\n", pos);
-        exit(3);
+        job_exit(3);
     }
 }
 
-int main(int argc, char **argv) {
-    const char *model_path = "/run/media/nii/pohjola/models/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_S.gguf";
-    const char *prompt = "Hello";
-    bool prompt_specified = false;
-    bool chat_mode = false;
-    const char *system_prompt = "You are a helpful, respectful and honest AI assistant.";
-    const char *log_filepath = NULL;
-    int max_context_len = 131072;
-    int max_gen_tokens = 1024;
-    bool fill_ram = false;
-    bool inspect_mode = false;
-    bool bench_dense_batch = false;
-    bool dump_tokens_mode = false;
-    bool spec_mtp_mode = true;
-    bool spec_measure_mode = false;
-    bool spec_ngram_requested = false;   // explicit --spec-draft ngram (LFM engines only act on an explicit request)
-    int  spec_k_max = 4;                 // --spec-k (LFM engines)
-    const char *spec_draft_model = NULL;
-    const char *dump_logits_path = NULL; // non-NULL => --dump-logits mode
-    int n_predict = -1; // resolved below based on mode
-    int n_warmup = 32;
-    int n_runs = 3;
-    int n_gpu_expert_layers = 0; // 0 => auto (computed below); set g_n_gpu_expert_layers in gpu.h
-    sampler_params_t sampler_params = sampler_params_default();
-    const float default_temp = sampler_params.temp;
 
-    const char *teacher_force_path = NULL; // non-NULL => --teacher-force mode
-    int tf_batch = 1;                      // --tf-batch B: teacher-force in chunks of B tokens through engine_forward_batch
-    bool tf_rollback = false;              // --tf-rollback: after each chunk roll back to 1 + (chunk % B) tokens and re-feed
+// ---------------------------------------------------------------------------------------------------------------
+// Job configuration: everything the command line (or a job line) can say.
+// ---------------------------------------------------------------------------------------------------------------
+typedef struct job_cfg {
+    const char *model_path, *prompt, *system_prompt, *log_filepath, *spec_draft_model, *dump_logits_path, *teacher_force_path;
+    bool prompt_specified, chat_mode, fill_ram, inspect_mode, bench_dense_batch, dump_tokens_mode;
+    bool spec_mtp_mode, spec_measure_mode, spec_ngram_requested, tf_rollback;
+    int max_context_len, max_gen_tokens, spec_k_max, n_predict, n_warmup, n_runs, n_gpu_expert_layers, tf_batch;
+    sampler_params_t sampler_params;
+    float default_temp;
+    int kv_quant;
+    // process-wide knobs of the Qwen/draft machinery, applied by cfg_apply_globals()
+    int g_spec_mtp, g_spec_draft, g_spec_draft_len, g_spec_ngram_n, g_spec_ngram_min;
+    // job-only options (--jobs mode)
+    const char *jobs_path, *out_path, *err_path, *status_path;
+    // derived by job_prepare()
+    tuff_arch_t arch;
+    const engine_vtable_t *vtable;
+    int is_lfm;
+    bool lfm_spec;
+    int spec_nmax, spec_nmin, spec_kfix;
+} job_cfg_t;
 
+// Defaults of the process-wide knobs, captured once before any job touches them.
+static struct { int mtp, draft, draft_len, ngram_n, ngram_min; } g_glob_def;
+
+static void cfg_init(job_cfg_t *cfg) {
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->model_path = "/run/media/nii/pohjola/models/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_S.gguf";
+    cfg->prompt = "Hello";
+    cfg->system_prompt = "You are a helpful, respectful and honest AI assistant.";
+    cfg->max_context_len = 131072;
+    cfg->max_gen_tokens = 1024;
+    cfg->spec_mtp_mode = true;
+    cfg->spec_k_max = 4;
+    cfg->n_predict = -1;
+    cfg->n_warmup = 32;
+    cfg->n_runs = 3;
+    cfg->tf_batch = 1;
+    cfg->sampler_params = sampler_params_default();
+    cfg->default_temp = cfg->sampler_params.temp;
+    cfg->kv_quant = KV_QUANT_Q8_0;
+    cfg->g_spec_mtp = g_glob_def.mtp; cfg->g_spec_draft = g_glob_def.draft; cfg->g_spec_draft_len = g_glob_def.draft_len;
+    cfg->g_spec_ngram_n = g_glob_def.ngram_n; cfg->g_spec_ngram_min = g_glob_def.ngram_min;
     const char *kvq_env = getenv("TUFF_KV_QUANT");
     if (kvq_env && kvq_env[0] != '\0') {
-        if (strcmp(kvq_env, "f32") == 0 || strcmp(kvq_env, "fp32") == 0) {
-            gpu_set_kv_quant(KV_QUANT_F32);
-        } else if (strcmp(kvq_env, "q8_0") == 0 || strcmp(kvq_env, "q8") == 0) {
-            gpu_set_kv_quant(KV_QUANT_Q8_0);
-        } else if (strcmp(kvq_env, "q4_0") == 0 || strcmp(kvq_env, "q4") == 0) {
-            gpu_set_kv_quant(KV_QUANT_Q4_0);
-        }
+        if (strcmp(kvq_env, "f32") == 0 || strcmp(kvq_env, "fp32") == 0) cfg->kv_quant = KV_QUANT_F32;
+        else if (strcmp(kvq_env, "q8_0") == 0 || strcmp(kvq_env, "q8") == 0) cfg->kv_quant = KV_QUANT_Q8_0;
+        else if (strcmp(kvq_env, "q4_0") == 0 || strcmp(kvq_env, "q4") == 0) cfg->kv_quant = KV_QUANT_Q4_0;
     }
+}
 
+static void cfg_apply_globals(const job_cfg_t *cfg) {
+    gpu_set_kv_quant(cfg->kv_quant);
+    g_spec_mtp = cfg->g_spec_mtp; g_spec_draft = cfg->g_spec_draft; g_spec_draft_len = cfg->g_spec_draft_len;
+    g_spec_ngram_n = cfg->g_spec_ngram_n; g_spec_ngram_min = cfg->g_spec_ngram_min;
+}
+
+// Returns 1 to continue, 0 to stop with exit code *rc (usage errors, --help).
+static int parse_args(int argc, char **argv, job_cfg_t *cfg, int *rc) {
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
-            model_path = argv[++i];
+            cfg->model_path = argv[++i];
         } else if (strcmp(argv[i], "--chat") == 0 || strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) {
-            chat_mode = true;
+            cfg->chat_mode = true;
         } else if (strcmp(argv[i], "--system") == 0 && i + 1 < argc) {
-            system_prompt = argv[++i];
+            cfg->system_prompt = argv[++i];
         } else if ((strcmp(argv[i], "--log") == 0 || strcmp(argv[i], "--log-file") == 0) && i + 1 < argc) {
-            log_filepath = argv[++i];
+            cfg->log_filepath = argv[++i];
         } else if ((strcmp(argv[i], "--max-seq") == 0 || strcmp(argv[i], "-c") == 0 ||
                     strcmp(argv[i], "--ctx-size") == 0 || strcmp(argv[i], "--ctx") == 0 ||
                     strcmp(argv[i], "--context-size") == 0) && i + 1 < argc) {
-            max_context_len = atoi(argv[++i]);
+            cfg->max_context_len = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--fill-ram") == 0 || strcmp(argv[i], "--fill-vram") == 0 ||
                    strcmp(argv[i], "--fill_ram") == 0 || strcmp(argv[i], "--fill_vram") == 0) {
-            fill_ram = true;
+            cfg->fill_ram = true;
         } else if (strcmp(argv[i], "--max-gen") == 0 && i + 1 < argc) {
-            max_gen_tokens = atoi(argv[++i]);
+            cfg->max_gen_tokens = atoi(argv[++i]);
         } else if ((strcmp(argv[i], "--prompt") == 0 || strcmp(argv[i], "-p") == 0) && i + 1 < argc) {
-            prompt = argv[++i];
-            prompt_specified = true;
+            cfg->prompt = argv[++i];
+            cfg->prompt_specified = true;
         } else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
-            n_predict = atoi(argv[++i]);
+            cfg->n_predict = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) {
-            n_warmup = atoi(argv[++i]);
+            cfg->n_warmup = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--runs") == 0 && i + 1 < argc) {
-            n_runs = atoi(argv[++i]);
+            cfg->n_runs = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--spec-draft-model") == 0 && i + 1 < argc) {
-            spec_draft_model = argv[++i];
-            spec_mtp_mode = true;
-            g_spec_mtp = 1;
-            g_spec_draft = SPEC_DRAFT_EXTERNAL;
+            cfg->spec_draft_model = argv[++i];
+            cfg->spec_mtp_mode = true;
+            cfg->g_spec_mtp = 1;
+            cfg->g_spec_draft = SPEC_DRAFT_EXTERNAL;
         } else if (strcmp(argv[i], "--spec-mtp") == 0) {
-            spec_mtp_mode = true;
-            g_spec_mtp = 1;
+            cfg->spec_mtp_mode = true;
+            cfg->g_spec_mtp = 1;
         } else if (strncmp(argv[i], "--spec-draft=", 13) == 0) {
-            spec_mtp_mode = true;
-            g_spec_mtp = 1;
+            cfg->spec_mtp_mode = true;
+            cfg->g_spec_mtp = 1;
             const char *s = argv[i] + 13;
-            spec_ngram_requested = (strcmp(s, "ngram") == 0);
+            cfg->spec_ngram_requested = (strcmp(s, "ngram") == 0);
             if (strcmp(s, "ngram") == 0) {
-                g_spec_draft = SPEC_DRAFT_NGRAM;
+                cfg->g_spec_draft = SPEC_DRAFT_NGRAM;
             } else if (strcmp(s, "ngram+mtp") == 0 || strcmp(s, "mtp+ngram") == 0) {
-                g_spec_draft = SPEC_DRAFT_NGRAM_MTP;
+                cfg->g_spec_draft = SPEC_DRAFT_NGRAM_MTP;
             } else if (strcmp(s, "mtp") == 0) {
-                g_spec_draft = SPEC_DRAFT_MTP;
+                cfg->g_spec_draft = SPEC_DRAFT_MTP;
             } else if (strcmp(s, "external") == 0) {
-                g_spec_draft = SPEC_DRAFT_EXTERNAL;
+                cfg->g_spec_draft = SPEC_DRAFT_EXTERNAL;
             } else if (strcmp(s, "none") == 0 || strcmp(s, "off") == 0 || strcmp(s, "0") == 0) {
-                g_spec_draft = SPEC_DRAFT_NONE;
-                spec_mtp_mode = false;
-                g_spec_mtp = 0;
+                cfg->g_spec_draft = SPEC_DRAFT_NONE;
+                cfg->spec_mtp_mode = false;
+                cfg->g_spec_mtp = 0;
             } else {
                 fprintf(stderr, "Error: --spec-draft must be ngram, mtp, ngram+mtp, external or none (got '%s')\n", s);
-                return 2;
+                { *rc = 2; { *rc = 0; return 0; } }
             }
         } else if (strcmp(argv[i], "--no-spec") == 0) {
-            spec_ngram_requested = false;
-            g_spec_draft = SPEC_DRAFT_NONE;
-            spec_mtp_mode = false;
-            g_spec_mtp = 0;
+            cfg->spec_ngram_requested = false;
+            cfg->g_spec_draft = SPEC_DRAFT_NONE;
+            cfg->spec_mtp_mode = false;
+            cfg->g_spec_mtp = 0;
         } else if (strcmp(argv[i], "--spec-draft") == 0 && i + 1 < argc) {
-            spec_mtp_mode = true;
-            g_spec_mtp = 1;
+            cfg->spec_mtp_mode = true;
+            cfg->g_spec_mtp = 1;
             const char *s = argv[++i];
-            spec_ngram_requested = (strcmp(s, "ngram") == 0);
+            cfg->spec_ngram_requested = (strcmp(s, "ngram") == 0);
             if (strcmp(s, "ngram") == 0) {
-                g_spec_draft = SPEC_DRAFT_NGRAM;
+                cfg->g_spec_draft = SPEC_DRAFT_NGRAM;
             } else if (strcmp(s, "ngram+mtp") == 0 || strcmp(s, "mtp+ngram") == 0) {
-                g_spec_draft = SPEC_DRAFT_NGRAM_MTP;
+                cfg->g_spec_draft = SPEC_DRAFT_NGRAM_MTP;
             } else if (strcmp(s, "mtp") == 0) {
-                g_spec_draft = SPEC_DRAFT_MTP;
+                cfg->g_spec_draft = SPEC_DRAFT_MTP;
             } else if (strcmp(s, "external") == 0) {
-                g_spec_draft = SPEC_DRAFT_EXTERNAL;
+                cfg->g_spec_draft = SPEC_DRAFT_EXTERNAL;
             } else if (strcmp(s, "none") == 0 || strcmp(s, "off") == 0 || strcmp(s, "0") == 0) {
-                g_spec_draft = SPEC_DRAFT_NONE;
-                spec_mtp_mode = false;
-                g_spec_mtp = 0;
+                cfg->g_spec_draft = SPEC_DRAFT_NONE;
+                cfg->spec_mtp_mode = false;
+                cfg->g_spec_mtp = 0;
             } else {
                 fprintf(stderr, "Error: --spec-draft must be ngram, mtp, ngram+mtp, external or none (got '%s')\n", s);
-                return 2;
+                { *rc = 2; { *rc = 0; return 0; } }
             }
         } else if ((strcmp(argv[i], "--spec-ngram") == 0 || strcmp(argv[i], "--spec-ngram-max") == 0) && i + 1 < argc) {
-            g_spec_ngram_n = atoi(argv[++i]);
-            if (g_spec_ngram_n < 1 || g_spec_ngram_n > 8) {
-                fprintf(stderr, "Error: --spec-ngram must be between 1 and 8 (got %d)\n", g_spec_ngram_n);
-                return 2;
+            cfg->g_spec_ngram_n = atoi(argv[++i]);
+            if (cfg->g_spec_ngram_n < 1 || cfg->g_spec_ngram_n > 8) {
+                fprintf(stderr, "Error: --spec-ngram must be between 1 and 8 (got %d)\n", cfg->g_spec_ngram_n);
+                { *rc = 2; { *rc = 0; return 0; } }
             }
         } else if (strcmp(argv[i], "--spec-ngram-min") == 0 && i + 1 < argc) {
-            g_spec_ngram_min = atoi(argv[++i]);
-            if (g_spec_ngram_min < 1 || g_spec_ngram_min > 8) {
-                fprintf(stderr, "Error: --spec-ngram-min must be between 1 and 8 (got %d)\n", g_spec_ngram_min);
-                return 2;
+            cfg->g_spec_ngram_min = atoi(argv[++i]);
+            if (cfg->g_spec_ngram_min < 1 || cfg->g_spec_ngram_min > 8) {
+                fprintf(stderr, "Error: --spec-ngram-min must be between 1 and 8 (got %d)\n", cfg->g_spec_ngram_min);
+                { *rc = 2; { *rc = 0; return 0; } }
             }
         } else if ((strcmp(argv[i], "--spec-draft-len") == 0 || strcmp(argv[i], "--draft-len") == 0) && i + 1 < argc) {
-            g_spec_draft_len = atoi(argv[++i]);
-            if (g_spec_draft_len < 1 || g_spec_draft_len > 3) {
-                fprintf(stderr, "Error: --spec-draft-len must be between 1 and 3 (got %d)\n", g_spec_draft_len);
-                return 2;
+            cfg->g_spec_draft_len = atoi(argv[++i]);
+            if (cfg->g_spec_draft_len < 1 || cfg->g_spec_draft_len > 3) {
+                fprintf(stderr, "Error: --spec-draft-len must be between 1 and 3 (got %d)\n", cfg->g_spec_draft_len);
+                { *rc = 2; { *rc = 0; return 0; } }
             }
         } else if (strcmp(argv[i], "--spec-k") == 0 && i + 1 < argc) {
-            spec_k_max = atoi(argv[++i]);
-            if (spec_k_max < 1 || spec_k_max > SPEC_KMAX) {
-                fprintf(stderr, "Error: --spec-k must be between 1 and %d (got %d)\n", SPEC_KMAX, spec_k_max);
-                return 2;
+            cfg->spec_k_max = atoi(argv[++i]);
+            if (cfg->spec_k_max < 1 || cfg->spec_k_max > SPEC_KMAX) {
+                fprintf(stderr, "Error: --spec-k must be between 1 and %d (got %d)\n", SPEC_KMAX, cfg->spec_k_max);
+                { *rc = 2; { *rc = 0; return 0; } }
             }
         } else if (strcmp(argv[i], "--spec-measure") == 0) {
-            spec_mtp_mode = true;
-            spec_measure_mode = true;
-            g_spec_mtp = 1;
+            cfg->spec_mtp_mode = true;
+            cfg->spec_measure_mode = true;
+            cfg->g_spec_mtp = 1;
         } else if (strcmp(argv[i], "--n-gpu-expert-layers") == 0 && i + 1 < argc) {
-            n_gpu_expert_layers = atoi(argv[++i]);
+            cfg->n_gpu_expert_layers = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--inspect") == 0) {
-            inspect_mode = true;
+            cfg->inspect_mode = true;
         } else if (strcmp(argv[i], "--bench-dense-batch") == 0) {
-            bench_dense_batch = true;
+            cfg->bench_dense_batch = true;
         } else if (strcmp(argv[i], "--dump-tokens") == 0) {
-            dump_tokens_mode = true;
+            cfg->dump_tokens_mode = true;
         } else if (strcmp(argv[i], "--dump-logits") == 0 && i + 1 < argc) {
-            dump_logits_path = argv[++i];
+            cfg->dump_logits_path = argv[++i];
         } else if (strcmp(argv[i], "--dump-logits") == 0) {
             fprintf(stderr, "Error: --dump-logits requires a path argument\n");
             print_usage(argv[0]);
         } else if (strncmp(argv[i], "--kv-quant=", 11) == 0) {
             const char *s = argv[i] + 11;
             if (strcmp(s, "f32") == 0 || strcmp(s, "fp32") == 0) {
-                gpu_set_kv_quant(KV_QUANT_F32);
+                cfg->kv_quant = KV_QUANT_F32;
             } else if (strcmp(s, "q8_0") == 0 || strcmp(s, "q8") == 0) {
-                gpu_set_kv_quant(KV_QUANT_Q8_0);
+                cfg->kv_quant = KV_QUANT_Q8_0;
             } else if (strcmp(s, "q4_0") == 0 || strcmp(s, "q4") == 0) {
-                gpu_set_kv_quant(KV_QUANT_Q4_0);
+                cfg->kv_quant = KV_QUANT_Q4_0;
             } else {
                 fprintf(stderr, "Error: --kv-quant must be f32, q8_0, or q4_0 (got '%s')\n", s);
-                return 2;
+                { *rc = 2; { *rc = 0; return 0; } }
             }
         } else if (strcmp(argv[i], "--kv-quant") == 0 && i + 1 < argc) {
             const char *s = argv[++i];
             if (strcmp(s, "f32") == 0 || strcmp(s, "fp32") == 0) {
-                gpu_set_kv_quant(KV_QUANT_F32);
+                cfg->kv_quant = KV_QUANT_F32;
             } else if (strcmp(s, "q8_0") == 0 || strcmp(s, "q8") == 0) {
-                gpu_set_kv_quant(KV_QUANT_Q8_0);
+                cfg->kv_quant = KV_QUANT_Q8_0;
             } else if (strcmp(s, "q4_0") == 0 || strcmp(s, "q4") == 0) {
-                gpu_set_kv_quant(KV_QUANT_Q4_0);
+                cfg->kv_quant = KV_QUANT_Q4_0;
             } else {
                 fprintf(stderr, "Error: --kv-quant must be f32, q8_0, or q4_0 (got '%s')\n", s);
-                return 2;
+                { *rc = 2; { *rc = 0; return 0; } }
             }
         } else if (strcmp(argv[i], "--tf-batch") == 0 && i + 1 < argc) {
-            tf_batch = atoi(argv[++i]);
-            if (tf_batch < 1 || tf_batch > TF_MAX_BATCH) {
+            cfg->tf_batch = atoi(argv[++i]);
+            if (cfg->tf_batch < 1 || cfg->tf_batch > TF_MAX_BATCH) {
                 fprintf(stderr, "Error: --tf-batch must be 1..%d\n", TF_MAX_BATCH);
-                return 2;
+                { *rc = 2; { *rc = 0; return 0; } }
             }
         } else if (strcmp(argv[i], "--tf-rollback") == 0) {
-            tf_rollback = true;
+            cfg->tf_rollback = true;
         } else if (strcmp(argv[i], "--teacher-force") == 0 && i + 1 < argc) {
-            teacher_force_path = argv[++i];
+            cfg->teacher_force_path = argv[++i];
         } else if (strcmp(argv[i], "--teacher-force") == 0) {
             fprintf(stderr, "Error: --teacher-force requires a path argument\n");
             print_usage(argv[0]);
-            return 2;
+            { *rc = 2; { *rc = 0; return 0; } }
         } else if ((strcmp(argv[i], "--temp") == 0 || strcmp(argv[i], "--temperature") == 0) && i + 1 < argc) {
-            sampler_params.temp = (float)atof(argv[++i]);
+            cfg->sampler_params.temp = (float)atof(argv[++i]);
         } else if ((strcmp(argv[i], "--top-p") == 0 || strcmp(argv[i], "--top_p") == 0) && i + 1 < argc) {
-            sampler_params.top_p = (float)atof(argv[++i]);
+            cfg->sampler_params.top_p = (float)atof(argv[++i]);
         } else if ((strcmp(argv[i], "--top-k") == 0 || strcmp(argv[i], "--top_k") == 0) && i + 1 < argc) {
-            sampler_params.top_k = atoi(argv[++i]);
+            cfg->sampler_params.top_k = atoi(argv[++i]);
         } else if ((strcmp(argv[i], "--min-p") == 0 || strcmp(argv[i], "--min_p") == 0) && i + 1 < argc) {
-            sampler_params.min_p = (float)atof(argv[++i]);
+            cfg->sampler_params.min_p = (float)atof(argv[++i]);
         } else if ((strcmp(argv[i], "--repeat-penalty") == 0 || strcmp(argv[i], "--repeat_penalty") == 0) && i + 1 < argc) {
-            sampler_params.repeat_penalty = (float)atof(argv[++i]);
+            cfg->sampler_params.repeat_penalty = (float)atof(argv[++i]);
         } else if ((strcmp(argv[i], "--repeat-last-n") == 0 || strcmp(argv[i], "--repeat_last_n") == 0) && i + 1 < argc) {
-            sampler_params.repeat_last_n = atoi(argv[++i]);
+            cfg->sampler_params.repeat_last_n = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
-            sampler_params.seed = strtoull(argv[++i], NULL, 10);
+            cfg->sampler_params.seed = strtoull(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--jobs") == 0 && i + 1 < argc) {
+            cfg->jobs_path = argv[++i];
+        } else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
+            cfg->out_path = argv[++i];
+        } else if (strcmp(argv[i], "--err") == 0 && i + 1 < argc) {
+            cfg->err_path = argv[++i];
+        } else if (strcmp(argv[i], "--status") == 0 && i + 1 < argc) {
+            cfg->status_path = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
-            return 0;
+            { *rc = 0; return 0; }
         }
     }
+    return 1;
+}
 
-    if (max_context_len < 1 || max_context_len > 262144) {
-        fprintf(stderr, "Error: --max-seq must be between 1 and 262144 (got %d)\n", max_context_len);
+// Argument validation + everything that happens before the model is loaded (architecture, sampler/spec policy).
+// Returns -1 to continue, else the exit code.
+static int job_prepare(job_cfg_t *cfg) {
+    cfg_apply_globals(cfg);
+    if (cfg->max_context_len < 1 || cfg->max_context_len > 262144) {
+        fprintf(stderr, "Error: --max-seq must be between 1 and 262144 (got %d)\n", cfg->max_context_len);
         return 2;
     }
 
-    if (!prompt_specified && !inspect_mode && !bench_dense_batch &&
-        !dump_tokens_mode && !dump_logits_path && !teacher_force_path) {
-        chat_mode = true;
+    if (!cfg->prompt_specified && !cfg->inspect_mode && !cfg->bench_dense_batch &&
+        !cfg->dump_tokens_mode && !cfg->dump_logits_path && !cfg->teacher_force_path) {
+        cfg->chat_mode = true;
     }
 
-    if (n_predict < 0) n_predict = (dump_tokens_mode || dump_logits_path) ? 32 : 128;
-    if (n_runs < 1 || n_warmup < 0) {
-        fprintf(stderr, "Error: --runs must be >= 1 and --warmup >= 0 (got --runs %d --warmup %d)\n", n_runs, n_warmup);
+    if (cfg->n_predict < 0) cfg->n_predict = (cfg->dump_tokens_mode || cfg->dump_logits_path) ? 32 : 128;
+    if (cfg->n_runs < 1 || cfg->n_warmup < 0) {
+        fprintf(stderr, "Error: --runs must be >= 1 and --warmup >= 0 (got --runs %d --warmup %d)\n", cfg->n_runs, cfg->n_warmup);
         return 2;
     }
-    if (n_predict <= 0) {
-        fprintf(stderr, "Error: -n must be >= 1 (got %d)\n", n_predict);
+    if (cfg->n_predict <= 0) {
+        fprintf(stderr, "Error: -n must be >= 1 (got %d)\n", cfg->n_predict);
         return 2;
     }
 
@@ -686,56 +797,91 @@ int main(int argc, char **argv) {
     // of the first N layers into VRAM (guaranteed resident, never miss). Default 0 = no prefill;
     // the engine still overlaps resident/LFRU-hit experts on the GPU with miss experts on the CPU
     // within each layer. Negative/absent = 0.
-    g_n_gpu_expert_layers = n_gpu_expert_layers < 0 ? 0 : n_gpu_expert_layers; // extern in gpu.h
+    g_n_gpu_expert_layers = cfg->n_gpu_expert_layers < 0 ? 0 : cfg->n_gpu_expert_layers; // extern in gpu.h
     fprintf(stderr, "[Tuff] expert split: %d layers pre-resident on GPU "
                     "(0 = none, hit/miss CPU overlap on)\n", g_n_gpu_expert_layers);
 
-    tuff_arch_t arch = tuff_detect_arch(model_path);
-    const engine_vtable_t *vtable = tuff_get_vtable(arch);
-    if (!vtable) {
-        fprintf(stderr, "[Tuff] ERROR: Unsupported or unrecognized architecture in %s\n", model_path);
+    cfg->arch = tuff_detect_arch(cfg->model_path);
+    cfg->vtable = tuff_get_vtable(cfg->arch);
+    if (!cfg->vtable) {
+        fprintf(stderr, "[Tuff] ERROR: Unsupported or unrecognized architecture in %s\n", cfg->model_path);
         return 1;
     }
     fprintf(stderr, "[Tuff] Detected architecture: %s (%s engine)\n",
-            tuff_arch_to_string(arch), vtable->name);
+            tuff_arch_to_string(cfg->arch), cfg->vtable->name);
 
-    const int is_lfm = arch_is_lfm(arch);
+    cfg->is_lfm = arch_is_lfm(cfg->arch);
 
     // The LFM2.5 engines decode greedily only (the sampler is stored but never consulted).
-    if (is_lfm && sampler_params.temp > 0.0f) {
-        if (default_temp <= 0.0f) {
-            fprintf(stderr, "[Tuff] ERROR: sampling not implemented for LFM2.5 (--temp %g); use --temp 0\n", (double)sampler_params.temp);
+    if (cfg->is_lfm && cfg->sampler_params.temp > 0.0f) {
+        if (cfg->default_temp <= 0.0f) {
+            fprintf(stderr, "[Tuff] ERROR: sampling not implemented for LFM2.5 (--temp %g); use --temp 0\n", (double)cfg->sampler_params.temp);
             return 2;
         }
         fprintf(stderr, "[Tuff] WARNING: LFM2.5 decodes greedily; --temp %g (default %g) is ignored\n",
-                (double)sampler_params.temp, (double)default_temp);
+                (double)cfg->sampler_params.temp, (double)cfg->default_temp);
     }
 
     // LFM engines: lossless n-gram speculation is opt-in via an explicit --spec-draft ngram (greedy only).
-    bool lfm_spec = false;
-    int spec_nmax = g_spec_ngram_n, spec_nmin = g_spec_ngram_min, spec_kfix = 0;
-    if (spec_ngram_requested && vtable->engine_forward_batch && vtable->engine_rollback) {
+    cfg->lfm_spec = false;
+    cfg->spec_nmax = cfg->g_spec_ngram_n; cfg->spec_nmin = cfg->g_spec_ngram_min; cfg->spec_kfix = 0;
+    if (cfg->spec_ngram_requested && cfg->vtable->engine_forward_batch && cfg->vtable->engine_rollback) {
         {
-            lfm_spec = true;
-            if (spec_nmin > spec_nmax) spec_nmin = spec_nmax;
+            cfg->lfm_spec = true;
+            if (cfg->spec_nmin > cfg->spec_nmax) cfg->spec_nmin = cfg->spec_nmax;
             const char *ks = getenv("LFM25_SPEC_K");
             if (ks && ks[0]) {
-                spec_kfix = atoi(ks);
-                if (spec_kfix < 1 || spec_kfix > SPEC_KMAX) {
+                cfg->spec_kfix = atoi(ks);
+                if (cfg->spec_kfix < 1 || cfg->spec_kfix > SPEC_KMAX) {
                     fprintf(stderr, "Error: LFM25_SPEC_K must be between 1 and %d (got '%s')\n", SPEC_KMAX, ks);
                     return 2;
                 }
-                if (spec_kfix > spec_k_max) spec_k_max = spec_kfix;
+                if (cfg->spec_kfix > cfg->spec_k_max) cfg->spec_k_max = cfg->spec_kfix;
             }
         }
     }
+    return -1;
+}
 
-    fprintf(stderr, "[Tuff] Loading GGUF model from: %s\n", model_path);
-    void *model = vtable->model_load(model_path);
+// ---------------------------------------------------------------------------------------------------------------
+// Model lifetime: loaded once, reused by every job whose "model key" matches.
+// Model key = (model path, LFM25_FORCE_EXPERT_CACHE=1 on an LFM2.5 MoE with <= 32 experts). Reasons: the path picks the
+// weights; lfm25_gpu_prepare() uploads the expert tensors of a <=32-expert MoE only when the expert cache is NOT forced
+// (src/lfm25_gpu.cu), and the VRAM they occupy would otherwise be missing / wasted for the other mode. Everything else
+// read from the environment (LFM25_*, TUFF_*) is read per engine_init()/per run, not at model-load time.
+// ---------------------------------------------------------------------------------------------------------------
+typedef struct {
+    void *model;
+    const engine_vtable_t *vt;
+    char *path;
+    int prepared;
+    int force_matters;   // LFM25_FORCE_EXPERT_CACHE changes the weight upload (MoE with <= 32 experts)
+    int force;           // value of the flag the weights were uploaded with
+} loaded_model_t;
+
+static int env_force_expert_cache(void) {
+    const char *f = getenv("LFM25_FORCE_EXPERT_CACHE");
+    return f && f[0] == '1';
+}
+
+static int model_reusable(const loaded_model_t *lm, const job_cfg_t *cfg) {
+    if (!lm->model || lm->vt != cfg->vtable) return 0;
+    if (strcmp(lm->path, cfg->model_path) != 0) return 0;
+    if (lm->force_matters && lm->force != env_force_expert_cache()) return 0;
+    return 1;
+}
+
+// Returns -1 on success, else the exit code. `prepare` = upload the weights to VRAM (everything but --inspect).
+static int load_model(job_cfg_t *cfg, int prepare, loaded_model_t *lm) {
+    const engine_vtable_t *vtable = cfg->vtable;
+    memset(lm, 0, sizeof(*lm));
+    fprintf(stderr, "[Tuff] Loading GGUF model from: %s\n", cfg->model_path);
+    void *model = vtable->model_load(cfg->model_path);
     if (!model) {
-        fprintf(stderr, "Failed to load model from %s\n", model_path);
+        fprintf(stderr, "Failed to load model from %s\n", cfg->model_path);
         return 1;
     }
+    tm_mark("model_load (gguf parse + mmap)");
 
     // Iteration 11: warm the model weight bytes (especially the lazy expert region) into
     // RAM before any timed decode, so miss-fill reads hit the page cache instead of disk.
@@ -748,19 +894,70 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[Tuff] Page-warmup: %.2f s (one-time, pre-decode); VmRSS %.0f MiB -> %.0f MiB\n",
                 tw1 - tw0, rss_before, rss_after);
     }
+    tm_mark("page_warmup");
 
-    if (inspect_mode) {
-        vtable->model_print_inspection(model);
-        vtable->model_free(model);
-        return 0;
+    lm->model = model; lm->vt = vtable; lm->path = strdup(cfg->model_path);
+    if (cfg->is_lfm) {
+        const lfm25_model_t *lmod = (const lfm25_model_t*)model;
+        lm->force_matters = lmod->is_moe && lmod->expert_count <= 32;
+        lm->force = env_force_expert_cache();
     }
+    if (!prepare) return -1;
 
     // M2: upload dense weights to VRAM once, before any decode.
-    if (vtable->gpu_prepare(model, &max_context_len, fill_ram ? 1 : 0) != 0) {
-        fprintf(stderr, "[Tuff] ERROR: GPU preparation failed for %s (model not supported by the %s engine)\n", model_path, vtable->name);
+    if (vtable->gpu_prepare(model, &cfg->max_context_len, cfg->fill_ram ? 1 : 0) != 0) {
+        fprintf(stderr, "[Tuff] ERROR: GPU preparation failed for %s (model not supported by the %s engine)\n", cfg->model_path, vtable->name);
         vtable->model_free(model);
+        free(lm->path);
+        memset(lm, 0, sizeof(*lm));
         return 1;
     }
+    lm->prepared = 1;
+    tm_mark("gpu_prepare (cuda init + weight upload)");
+    return -1;
+}
+
+static void unload_model(loaded_model_t *lm) {
+    if (!lm->model) return;
+    if (lm->prepared) lm->vt->gpu_shutdown(lm->model);
+    lm->vt->model_free(lm->model);
+    free(lm->path);
+    memset(lm, 0, sizeof(*lm));
+}
+
+
+static int run_job(const engine_vtable_t *vtable, void *model, job_cfg_t *cfg) {
+    const char *prompt = cfg->prompt;
+    const char *system_prompt = cfg->system_prompt;
+    const char *log_filepath = cfg->log_filepath;
+    const char *model_path = cfg->model_path;
+    int max_context_len = cfg->max_context_len;
+    int max_gen_tokens = cfg->max_gen_tokens;
+    const bool chat_mode = cfg->chat_mode;
+    const bool bench_dense_batch = cfg->bench_dense_batch;
+    const bool dump_tokens_mode = cfg->dump_tokens_mode;
+    const bool spec_mtp_mode = cfg->spec_mtp_mode;
+    const bool spec_measure_mode = cfg->spec_measure_mode;
+    const char *spec_draft_model = cfg->spec_draft_model;
+    const char *dump_logits_path = cfg->dump_logits_path;
+    const int n_warmup = cfg->n_warmup, n_runs = cfg->n_runs, n_predict = cfg->n_predict;
+    sampler_params_t sampler_params = cfg->sampler_params;
+    const char *teacher_force_path = cfg->teacher_force_path;
+    const int tf_batch = cfg->tf_batch;
+    const bool tf_rollback = cfg->tf_rollback;
+    const tuff_arch_t arch = cfg->arch;
+    const int is_lfm = cfg->is_lfm;
+    const bool lfm_spec = cfg->lfm_spec;
+    const int spec_nmax = cfg->spec_nmax, spec_nmin = cfg->spec_nmin, spec_kfix = cfg->spec_kfix, spec_k_max = cfg->spec_k_max;
+    (void)bench_dense_batch; (void)spec_draft_model;
+
+    if (cfg->inspect_mode) {
+        vtable->model_print_inspection(model);
+        return 0;
+    }
+    if (n_runs < 1 || n_warmup < 0 || n_predict < 1) return 2;   // job_prepare() rejects these already
+
+    spec_static_costs();   // the cost table is per-job state: never inherit a previous job's measurement
 
     if (arch == TUFF_ARCH_QWEN35MOE) {
         model_t *qm = (model_t*)model;
@@ -778,19 +975,17 @@ int main(int argc, char **argv) {
             }
             gpu_bench_head_batch(&qm->output_weight, (int)qm->embedding_length,
                                  (int)qm->vocab_size, 50);
-            vtable->model_free(model);
             return 0;
         }
     }
 
     tokenizer_t *tok = tokenizer_init(vtable->model_get_gguf(model));
+    tm_mark("tokenizer_init");
 
     if (chat_mode) {
         if (arch != TUFF_ARCH_QWEN35MOE) {
             fprintf(stderr, "[Tuff] Interactive chat is currently only supported for Qwen models.\n");
             tokenizer_free(tok);
-            vtable->gpu_shutdown(model);
-            vtable->model_free(model);
             return 1;
         }
         chat_config_t cfg;
@@ -805,8 +1000,6 @@ int main(int argc, char **argv) {
 
         int rc = run_interactive_chat((model_t*)model, tok, &cfg);
         tokenizer_free(tok);
-        vtable->gpu_shutdown(model);
-        vtable->model_free(model);
         return rc;
     }
 
@@ -814,12 +1007,10 @@ int main(int argc, char **argv) {
     if (!prompt_tokens) {
         fprintf(stderr, "[Tuff] FATAL: failed to allocate prompt_tokens for context length %d\n", max_context_len);
         tokenizer_free(tok);
-        vtable->gpu_shutdown(model);
-        vtable->model_free(model);
         return 1;
     }
     int n_prompt = tokenizer_tokenize(tok, prompt, prompt_tokens, max_context_len);
-    if (n_prompt == 0) {
+    if (n_prompt <= 0) {
         prompt_tokens[0] = tok->bos_id;
         n_prompt = 1;
     }
@@ -839,8 +1030,6 @@ int main(int argc, char **argv) {
         if (!ctx_fits(what, need, max_context_len)) {
             free(prompt_tokens);
             tokenizer_free(tok);
-            vtable->gpu_shutdown(model);
-            vtable->model_free(model);
             return 2;
         }
     }
@@ -850,8 +1039,6 @@ int main(int argc, char **argv) {
         if (!tf) {
             fprintf(stderr, "[Tuff] FATAL: cannot open teacher-force file: %s\n", teacher_force_path);
             tokenizer_free(tok);
-            vtable->gpu_shutdown(model);
-            vtable->model_free(model);
             return 2;
         }
         // At most max_context_len reference tokens are ever used; heap-allocated (the default window is 131072).
@@ -877,16 +1064,12 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[Tuff] FATAL: out of memory for the teacher-force reference\n");
             free(prompt_tokens);
             tokenizer_free(tok);
-            vtable->gpu_shutdown(model);
-            vtable->model_free(model);
             return 2;
         }
         if (tf_bad) {
             free(ref_tokens);
             free(prompt_tokens);
             tokenizer_free(tok);
-            vtable->gpu_shutdown(model);
-            vtable->model_free(model);
             return 2;
         }
         if (n_ref == 0) {
@@ -894,8 +1077,6 @@ int main(int argc, char **argv) {
             free(ref_tokens);
             free(prompt_tokens);
             tokenizer_free(tok);
-            vtable->gpu_shutdown(model);
-            vtable->model_free(model);
             return 2;
         }
 
@@ -906,8 +1087,6 @@ int main(int argc, char **argv) {
             free(ref_tokens);
             free(prompt_tokens);
             tokenizer_free(tok);
-            vtable->gpu_shutdown(model);
-            vtable->model_free(model);
             return 2;
         }
 
@@ -927,21 +1106,18 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[Tuff] FATAL: cannot write %s\n", dump_logits_path);
                 if (tf_dump) fclose(tf_dump);
                 tokenizer_free(tok);
-                vtable->gpu_shutdown(model);
-                vtable->model_free(model);
                 return 3;
             }
         }
 
         void *eng = vtable->engine_init(model, max_context_len);
+        tm_mark("engine_init");
         if (!eng) {
             fprintf(stderr, "[Tuff] FATAL: engine initialization failed\n");
             if (tf_dump) { fclose(tf_dump); remove(dump_logits_path); }
             free(ref_tokens);
             free(prompt_tokens);
             tokenizer_free(tok);
-            vtable->gpu_shutdown(model);
-            vtable->model_free(model);
             return 3;
         }
         vtable->engine_set_sampler(eng, &sampler_params);
@@ -950,8 +1126,6 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[Tuff] FATAL: --tf-rollback requires --tf-batch >= 2\n");
             vtable->engine_free(eng);
             tokenizer_free(tok);
-            vtable->gpu_shutdown(model);
-            vtable->model_free(model);
             return 2;
         }
         if (tf_batch > 1) {
@@ -960,8 +1134,6 @@ int main(int argc, char **argv) {
                 vtable->engine_free(eng);
                 if (tf_dump) { fclose(tf_dump); remove(dump_logits_path); }
                 tokenizer_free(tok);
-                vtable->gpu_shutdown(model);
-                vtable->model_free(model);
                 return 2;
             }
             // Chunked teacher forcing. The token stream is prompt ++ reference[0..target_steps); the logits row computed
@@ -973,7 +1145,7 @@ int main(int argc, char **argv) {
             int total = n_prompt + target_steps;
             int32_t *seq = (int32_t*)malloc((size_t)total * sizeof(int32_t));
             float *rows = (float*)malloc((size_t)tf_batch * tf_vocab * sizeof(float));
-            if (!seq || !rows) { fprintf(stderr, "[Tuff] FATAL: out of memory\n"); return 2; }
+            if (!seq || !rows) { fprintf(stderr, "[Tuff] FATAL: out of memory\n"); free(seq); free(rows); vtable->engine_free(eng); return 2; }
             for (int q = 0; q < n_prompt; ++q) seq[q] = prompt_tokens[q];
             for (int q = 0; q < target_steps; ++q) seq[n_prompt + q] = ref_tokens[q];
 
@@ -984,6 +1156,7 @@ int main(int argc, char **argv) {
                 int32_t am[TF_MAX_BATCH];
                 if (vtable->engine_forward_batch(eng, seq + p, n, p, am, rows) != 0) {
                     fprintf(stderr, "[Tuff] FATAL: engine_forward_batch failed at position %d (n=%d)\n", p, n);
+                    vtable->engine_free(eng);
                     return 3;
                 }
                 n_batches++;
@@ -993,6 +1166,7 @@ int main(int argc, char **argv) {
                     if (keep > n) keep = n;
                     if (vtable->engine_rollback(eng, keep) != 0) {
                         fprintf(stderr, "[Tuff] FATAL: engine_rollback(%d) failed at position %d\n", keep, p);
+                        vtable->engine_free(eng);
                         return 3;
                     }
                     if (keep < n) n_rollbacks++;
@@ -1023,6 +1197,7 @@ int main(int argc, char **argv) {
             }
             free(seq);
             free(rows);
+            tm_mark("teacher-forced decode (tf-batch)");
             fprintf(stderr, "[Tuff] --tf-batch %d%s: %d batches, %d rollbacks\n", tf_batch, tf_rollback ? " --tf-rollback" : "",
                     n_batches, n_rollbacks);
 
@@ -1035,8 +1210,6 @@ int main(int argc, char **argv) {
                     remove(dump_logits_path);
                     vtable->engine_free(eng);
                     tokenizer_free(tok);
-                    vtable->gpu_shutdown(model);
-                    vtable->model_free(model);
                     return 3;
                 }
                 fprintf(stderr, "[Tuff] wrote %u x %u teacher-forced logits to %s\n", tf_written, tf_vocab, dump_logits_path);
@@ -1054,8 +1227,6 @@ int main(int argc, char **argv) {
             free(ref_tokens);
             free(prompt_tokens);
             tokenizer_free(tok);
-            vtable->gpu_shutdown(model);
-            vtable->model_free(model);
             return (matches == target_steps) ? 0 : 1;
         }
 
@@ -1068,6 +1239,7 @@ int main(int argc, char **argv) {
             fwd_check(is_lfm, pred_token, pos - 1);
         }
 
+        tm_mark("prefill (prompt forward, incl. graph capture)");
         int matches = 0;
         int first_divergence = -1;
         int dump_ok = 1;
@@ -1099,6 +1271,7 @@ int main(int argc, char **argv) {
             fwd_check(is_lfm, pred_token, pos - 1);
         }
         tuff_logit_capture_enable(0);
+        tm_mark("teacher-forced decode");
 
         if (tf_dump) {
             if (dump_ok && (fseek(tf_dump, 8, SEEK_SET) != 0 ||
@@ -1110,8 +1283,6 @@ int main(int argc, char **argv) {
                 remove(dump_logits_path);
                 vtable->engine_free(eng);
                 tokenizer_free(tok);
-                vtable->gpu_shutdown(model);
-                vtable->model_free(model);
                 return 3;
             }
             fprintf(stderr, "[Tuff] wrote %u x %u teacher-forced logits to %s\n",
@@ -1132,8 +1303,6 @@ int main(int argc, char **argv) {
         free(ref_tokens);
         free(prompt_tokens);
         tokenizer_free(tok);
-        vtable->gpu_shutdown(model);
-        vtable->model_free(model);
         return (matches == target_steps) ? 0 : 1;
     }
 
@@ -1148,12 +1317,11 @@ int main(int argc, char **argv) {
         tuff_logit_capture_enable(1);
 
         void *eng = vtable->engine_init(model, max_context_len);
+        tm_mark("engine_init");
         if (!eng) {
             fprintf(stderr, "[Tuff] FATAL: engine initialization failed\n");
             tuff_logit_capture_enable(0);
             tokenizer_free(tok);
-            vtable->gpu_shutdown(model);
-            vtable->model_free(model);
             return 3;
         }
         vtable->engine_set_sampler(eng, &sampler_params);
@@ -1167,6 +1335,7 @@ int main(int argc, char **argv) {
         // The vector left behind by the last prompt forward is the one that selected the
         // first generated token, so the i-th dumped vector lines up 1:1 with the i-th token
         // ID printed by --dump-tokens.
+        tm_mark("prefill (prompt forward, incl. graph capture)");
         uint32_t vocab = 0;
         const float *lg = tuff_logit_capture_take(&vocab);
         if (!lg || vocab == 0) {
@@ -1179,8 +1348,6 @@ int main(int argc, char **argv) {
                 "             an empty or zero-filled dump would compare as a silent PASS.\n");
             vtable->engine_free(eng);
             tokenizer_free(tok);
-            vtable->gpu_shutdown(model);
-            vtable->model_free(model);
             return 3;
         }
         if (vocab != vtable->model_get_vocab_size(model)) {
@@ -1188,8 +1355,6 @@ int main(int argc, char **argv) {
                     vocab, vtable->model_get_vocab_size(model));
             vtable->engine_free(eng);
             tokenizer_free(tok);
-            vtable->gpu_shutdown(model);
-            vtable->model_free(model);
             return 3;
         }
 
@@ -1199,8 +1364,6 @@ int main(int argc, char **argv) {
             perror(NULL);
             vtable->engine_free(eng);
             tokenizer_free(tok);
-            vtable->gpu_shutdown(model);
-            vtable->model_free(model);
             return 3;
         }
 
@@ -1229,6 +1392,7 @@ int main(int argc, char **argv) {
             }
         }
         fprintf(stderr, "\n");
+        tm_mark("decode (dump-logits)");
 
         if (io_ok && n_written == (uint32_t)n_predict) {
             if (fseek(fp, 8, SEEK_SET) != 0 ||
@@ -1243,8 +1407,6 @@ int main(int argc, char **argv) {
         tuff_logit_capture_enable(0);
         vtable->engine_free(eng);
         tokenizer_free(tok);
-        vtable->gpu_shutdown(model);
-        vtable->model_free(model);
 
         if (!io_ok) {
             fprintf(stderr, "[Tuff] FATAL: failed writing %s (%u/%d vectors); removing it "
@@ -1267,11 +1429,10 @@ int main(int argc, char **argv) {
         if (lfm_spec && !spec_kfix) spec_measure_costs(vtable, model, max_context_len, &sampler_params, prompt_tokens, n_prompt, spec_k_max,
                                                    arch == TUFF_ARCH_LFM2 || getenv("LFM25_SPEC_MEASURE") != NULL);
         void *eng = vtable->engine_init(model, max_context_len);
+        tm_mark("engine_init");
         if (!eng) {
             fprintf(stderr, "[Tuff] FATAL: engine initialization failed\n");
             tokenizer_free(tok);
-            vtable->gpu_shutdown(model);
-            vtable->model_free(model);
             return 3;
         }
         vtable->engine_set_sampler(eng, &sampler_params);
@@ -1281,6 +1442,7 @@ int main(int argc, char **argv) {
             curr_token = vtable->engine_forward_token(eng, prompt_tokens[i], pos++);
             fwd_check(is_lfm, curr_token, pos - 1);
         }
+        tm_mark("prefill (prompt forward, incl. graph capture)");
         if (lfm_spec) {
             spec_t sp;
             spec_init(&sp, vtable, max_context_len, spec_nmax, spec_nmin, spec_k_max, spec_kfix);
@@ -1310,10 +1472,10 @@ int main(int argc, char **argv) {
             fwd_check(is_lfm, curr_token, pos - 1);
         }
         }
+        tm_mark("decode (dump-tokens)");
         vtable->engine_free(eng);
+        tm_mark("engine_free");
         tokenizer_free(tok);
-        vtable->gpu_shutdown(model);
-        vtable->model_free(model);
         return 0;
     }
 
@@ -1342,14 +1504,13 @@ int main(int argc, char **argv) {
 
     for (int run = 0; run < n_runs; ++run) {
         void *eng = vtable->engine_init(model, max_context_len);
+        tm_mark("engine_init");
         if (!eng) {
             fprintf(stderr, "[Tuff] FATAL: engine initialization failed (run %d)\n", run + 1);
             if (lfm_spec) free(lfm_sp.hist);
             if (drafter) drafter_free(drafter);
             free(tok_per_sec);
             tokenizer_free(tok);
-            vtable->gpu_shutdown(model);
-            vtable->model_free(model);
             return 3;
         }
         vtable->engine_set_sampler(eng, &sampler_params);
@@ -1363,6 +1524,7 @@ int main(int argc, char **argv) {
             curr_token = vtable->engine_forward_token(eng, prompt_tokens[i], pos++);
             fwd_check(is_lfm, curr_token, pos - 1);
         }
+        tm_mark("prefill (prompt forward, incl. graph capture)");
         if (lfm_spec) {
             spec_begin_run(&lfm_sp, eng);
             for (int i = 0; i < n_prompt; ++i) spec_push(&lfm_sp, prompt_tokens[i]);
@@ -1376,6 +1538,7 @@ int main(int argc, char **argv) {
             if (lfm_spec) spec_push(&lfm_sp, curr_token);
         }
 
+        tm_mark("warmup");
         if (drafter && arch == TUFF_ARCH_QWEN35MOE) {
             drafter_prefill(drafter, warmup_seq, n_prompt + n_warmup);
             engine_set_drafter((engine_t*)eng, drafter);
@@ -1447,6 +1610,7 @@ int main(int argc, char **argv) {
             curr_token = next_tok;
         }
         double t1 = omp_get_wtime();
+        tm_mark("decode (timed)");
         if (run == 0) fprintf(stderr, "\n");
         if (getenv("TUFF_TRACE") && run == 0) {
             cupti_profiler_stop_and_print();
@@ -1481,6 +1645,7 @@ int main(int argc, char **argv) {
 
         if (lfm_spec) spec_print_stats(&lfm_sp, (unsigned long long)n_generated);
         vtable->engine_free(eng);
+        tm_mark("engine_free");
     }
     if (lfm_spec) free(lfm_sp.hist);
     if (drafter) drafter_free(drafter);
@@ -1511,7 +1676,211 @@ int main(int argc, char **argv) {
 
     free(tok_per_sec);
     tokenizer_free(tok);
-    vtable->gpu_shutdown(model);
-    vtable->model_free(model);
     return 0;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// --jobs <file>: one process, one model load, many jobs.
+// A job line is: [NAME=value ...] <ordinary tuff arguments> [--out <file>] [--err <file>] [--status <file>]
+// The effective command line of a job is  <arguments given to this tuff invocation, minus --jobs> + <job arguments>,
+// run with the environment of this process + the job's NAME=value assignments (everything a previous job assigned is
+// restored first, so no variable leaks from one job to the next). stdout/stderr of the job go to --out/--err (appended
+// with a last stderr line "JOB_EXIT=<code>"); --status additionally gets the exit code. Blank lines and lines starting
+// with '#' are skipped. Jobs run strictly in order; the process exits 0 iff every job exited 0 (else with the first
+// nonzero job exit code); the per-job codes are what scripts should consult.
+// ---------------------------------------------------------------------------------------------------------------
+typedef struct { char *name; char *old; } env_save_t;   // old == NULL => was unset
+
+// Shell-like split: whitespace separated, '...' literal, "..." with \" and \\ escapes. Returns token count or -1.
+static int split_line(const char *s, char ***out) {
+    int cap = 16, n = 0;
+    char **v = (char**)malloc((size_t)cap * sizeof(char*));
+    size_t len = strlen(s);
+    char *cur = (char*)malloc(len + 1);
+    for (const char *p = s; *p;) {
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (!*p) break;
+        size_t k = 0;
+        while (*p && !isspace((unsigned char)*p)) {
+            if (*p == '\'') {
+                p++;
+                while (*p && *p != '\'') cur[k++] = *p++;
+                if (!*p) { free(cur); for (int i = 0; i < n; ++i) free(v[i]); free(v); return -1; }
+                p++;
+            } else if (*p == '"') {
+                p++;
+                while (*p && *p != '"') {
+                    if (*p == '\\' && (p[1] == '"' || p[1] == '\\')) p++;
+                    cur[k++] = *p++;
+                }
+                if (!*p) { free(cur); for (int i = 0; i < n; ++i) free(v[i]); free(v); return -1; }
+                p++;
+            } else {
+                cur[k++] = *p++;
+            }
+        }
+        cur[k] = 0;
+        if (n == cap) { cap *= 2; v = (char**)realloc(v, (size_t)cap * sizeof(char*)); }
+        v[n++] = strdup(cur);
+    }
+    free(cur);
+    *out = v;
+    return n;
+}
+
+static int is_env_assignment(const char *t) {
+    if (!(isalpha((unsigned char)t[0]) || t[0] == '_')) return 0;
+    const char *p = t;
+    while (isalnum((unsigned char)*p) || *p == '_') p++;
+    return *p == '=';
+}
+
+static void env_restore(env_save_t *sv, int *n) {
+    for (int i = 0; i < *n; ++i) {
+        if (sv[i].old) setenv(sv[i].name, sv[i].old, 1); else unsetenv(sv[i].name);
+        free(sv[i].name); free(sv[i].old);
+    }
+    *n = 0;
+}
+
+static const char* tok_after(char **v, int n, const char *opt) {   // value following the LAST occurrence of opt, or NULL
+    const char *r = NULL;
+    for (int i = 0; i + 1 < n; ++i) if (strcmp(v[i], opt) == 0) r = v[i + 1];
+    return r;
+}
+
+static int run_jobs(const char *jobs_path, int cli_argc, char **cli_argv) {
+    FILE *jf = fopen(jobs_path, "r");
+    if (!jf) { fprintf(stderr, "[Tuff] FATAL: cannot open jobs file %s\n", jobs_path); return 2; }
+    g_in_jobs = 1;
+    int saved_out = dup(STDOUT_FILENO), saved_err = dup(STDERR_FILENO);
+    loaded_model_t lm; memset(&lm, 0, sizeof(lm));
+    env_save_t *sv = (env_save_t*)calloc(256, sizeof(env_save_t));
+    int nsv = 0, overall = 0, njob = 0, nfail = 0;
+    char *line = NULL; size_t lcap = 0;
+    while (getline(&line, &lcap, jf) >= 0) {
+        char **tk = NULL;
+        int nt = split_line(line, &tk);
+        if (nt == 0 || (nt > 0 && tk[0][0] == '#')) { for (int i = 0; i < nt; ++i) free(tk[i]); free(tk); continue; }
+        njob++;
+        int rc = 0;
+        const char *out_path = NULL, *err_path = NULL;
+        char **av = NULL; int ac = 0;
+        if (nt < 0) {
+            fprintf(stderr, "[Tuff] jobs: line %d: unterminated quote\n", njob);
+            rc = 2;
+        } else {
+            // environment: back to the runner's own, then this job's assignments
+            env_restore(sv, &nsv);
+            int ia = 0;
+            while (ia < nt && is_env_assignment(tk[ia]) && nsv < 256) {
+                char *eq = strchr(tk[ia], '=');
+                size_t nl = (size_t)(eq - tk[ia]);
+                char *name = strndup(tk[ia], nl);
+                const char *old = getenv(name);
+                sv[nsv].name = name; sv[nsv].old = old ? strdup(old) : NULL; nsv++;
+                setenv(name, eq + 1, 1);
+                ia++;
+            }
+            av = (char**)malloc((size_t)(1 + cli_argc + nt) * sizeof(char*));
+            av[ac++] = (char*)"tuff";
+            for (int i = 0; i < cli_argc; ++i) av[ac++] = cli_argv[i];
+            for (int i = ia; i < nt; ++i) av[ac++] = tk[i];
+            out_path = tok_after(av, ac, "--out");
+            err_path = tok_after(av, ac, "--err");
+            g_cur_status = tok_after(av, ac, "--status");
+        }
+        int fo = -1, fe = -1;
+        fflush(stdout); fflush(stderr);
+        if (out_path) { fo = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fo >= 0) dup2(fo, STDOUT_FILENO); }
+        if (err_path) { fe = open(err_path, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fe >= 0) dup2(fe, STDERR_FILENO); }
+
+        if (rc == 0) {
+            job_cfg_t cfg;
+            cfg_init(&cfg);
+            int prc = 0;
+            tuff_exact_reset();
+            tuff_logit_capture_enable(0);   // a previous job that failed mid-capture must not leave the sink armed
+            tm_reset();
+            if (!parse_args(ac, av, &cfg, &prc)) rc = prc;
+            else if ((prc = job_prepare(&cfg)) >= 0) rc = prc;
+            else if (!arch_is_lfm(cfg.arch)) {
+                fprintf(stderr, "[Tuff] ERROR: --jobs supports the LFM2.5 engines only (got %s)\n", tuff_arch_to_string(cfg.arch));
+                rc = 2;
+            } else {
+                if (lm.model && !model_reusable(&lm, &cfg)) {
+                    fprintf(stderr, "[Tuff] jobs: model key changed (%s, force-expert-cache=%d) -> reloading the model\n",
+                            cfg.model_path, env_force_expert_cache());
+                    unload_model(&lm);
+                    tm_mark("model_unload");
+                }
+                if (!lm.model) {
+                    prc = load_model(&cfg, 1, &lm);
+                    if (prc >= 0) rc = prc;
+                } else {
+                    fprintf(stderr, "[Tuff] jobs: reusing the loaded model %s\n", lm.path);
+                }
+                if (rc == 0) {
+                    rc = run_job(cfg.vtable, lm.model, &cfg);
+                    fflush(stdout);
+                }
+            }
+        }
+        fflush(stdout);
+        fprintf(stderr, "JOB_EXIT=%d\n", rc);
+        if (g_cur_status) { FILE *f = fopen(g_cur_status, "w"); if (f) { fprintf(f, "%d\n", rc); fclose(f); } }
+        fflush(stderr);
+        if (fo >= 0) { dup2(saved_out, STDOUT_FILENO); close(fo); }
+        if (fe >= 0) { dup2(saved_err, STDERR_FILENO); close(fe); }
+        fprintf(stderr, "[Tuff] job %d: exit %d%s%s\n", njob, rc, err_path ? " err=" : "", err_path ? err_path : "");
+        if (rc != 0) { nfail++; if (!overall) overall = rc; }
+        g_cur_status = NULL;
+        free(av);
+        for (int i = 0; i < nt; ++i) free(tk[i]);
+        free(tk);
+    }
+    free(line);
+    fclose(jf);
+    env_restore(sv, &nsv);
+    free(sv);
+    unload_model(&lm);
+    close(saved_out); close(saved_err);
+    fprintf(stderr, "[Tuff] jobs: %d job(s), %d failed\n", njob, nfail);
+    return overall;
+}
+
+int main(int argc, char **argv) {
+    g_glob_def.mtp = g_spec_mtp; g_glob_def.draft = g_spec_draft; g_glob_def.draft_len = g_spec_draft_len;
+    g_glob_def.ngram_n = g_spec_ngram_n; g_glob_def.ngram_min = g_spec_ngram_min;
+    tm_reset();
+    if (g_tm_on) fprintf(stderr, "[Tuff timing] process start -> main(): %.3f s\n", proc_age_sec());
+
+    job_cfg_t cfg;
+    cfg_init(&cfg);
+    int rc = 0;
+    if (!parse_args(argc, argv, &cfg, &rc)) return rc;
+
+    if (cfg.jobs_path) {
+        // Arguments other than --jobs act as defaults for every job line.
+        char **rest = (char**)malloc((size_t)argc * sizeof(char*));
+        int nr = 0;
+        for (int i = 1; i < argc; ++i) {
+            if (strcmp(argv[i], "--jobs") == 0 && i + 1 < argc) { i++; continue; }
+            rest[nr++] = argv[i];
+        }
+        int jrc = run_jobs(cfg.jobs_path, nr, rest);
+        free(rest);
+        return jrc;
+    }
+
+    if ((rc = job_prepare(&cfg)) >= 0) return rc;
+    tm_mark("args + arch detect");
+
+    loaded_model_t lm;
+    if ((rc = load_model(&cfg, !cfg.inspect_mode, &lm)) >= 0) return rc;
+    rc = run_job(cfg.vtable, lm.model, &cfg);
+    unload_model(&lm);
+    tm_mark("gpu_shutdown + model_free");
+    if (g_tm_on) fprintf(stderr, "[Tuff timing] total main(): %.3f s (process age %.3f s)\n", tm_mono() - g_tm_start, proc_age_sec());
+    return rc;
 }
