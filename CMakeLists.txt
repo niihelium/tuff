@@ -149,6 +149,7 @@ add_executable(lfm25-router-test
     src/cpu_ops.c
     src/lfm25_model.c
     src/lfm25_gpu.cu
+    src/lfm25_expert_cache.c   # lfm25_gpu_shutdown releases the pinned expert store
     tests/test_lfm25_router.cu
 )
 set_target_properties(lfm25-router-test PROPERTIES
@@ -161,7 +162,7 @@ target_compile_options(lfm25-router-test PRIVATE
     $<$<COMPILE_LANGUAGE:C>:-g -O2 -Wall -Wextra -march=native -mfma -mavx2 -mf16c>
     $<$<COMPILE_LANGUAGE:CUDA>:-O3 ${TUFF_CUDA_STREAM_FLAG}>
 )
-target_link_libraries(lfm25-router-test PRIVATE CUDA::cudart OpenMP::OpenMP_C m)
+target_link_libraries(lfm25-router-test PRIVATE CUDA::cudart OpenMP::OpenMP_C Threads::Threads m)
 
 # MoE expert FFN test (Task 2.2): checks lfm25_gpu_moe_ffn against llama.cpp fixtures.
 # Calls lfm25_gpu_prepare (uploads all experts, ~4.8 GB VRAM).
@@ -170,6 +171,7 @@ add_executable(lfm25-moe-ffn-test
     src/cpu_ops.c
     src/lfm25_model.c
     src/lfm25_gpu.cu
+    src/lfm25_expert_cache.c   # lfm25_gpu_shutdown releases the pinned expert store
     tests/test_lfm25_moe_ffn.cu
 )
 set_target_properties(lfm25-moe-ffn-test PROPERTIES
@@ -182,7 +184,7 @@ target_compile_options(lfm25-moe-ffn-test PRIVATE
     $<$<COMPILE_LANGUAGE:C>:-g -O2 -Wall -Wextra -march=native -mfma -mavx2 -mf16c>
     $<$<COMPILE_LANGUAGE:CUDA>:-O3 ${TUFF_CUDA_STREAM_FLAG}>
 )
-target_link_libraries(lfm25-moe-ffn-test PRIVATE CUDA::cudart OpenMP::OpenMP_C m)
+target_link_libraries(lfm25-moe-ffn-test PRIVATE CUDA::cudart OpenMP::OpenMP_C Threads::Threads m)
 
 # Hybrid CPU-miss MoE FFN byte-identity test (vs the all-GPU lfm25_gpu_moe_ffn, every miss mask).
 add_executable(lfm25-cpu-expert-test
@@ -190,6 +192,7 @@ add_executable(lfm25-cpu-expert-test
     src/cpu_ops.c
     src/lfm25_model.c
     src/lfm25_gpu.cu
+    src/lfm25_expert_cache.c   # lfm25_gpu_shutdown releases the pinned expert store
     src/lfm25_cpu_expert.c
     tests/test_lfm25_cpu_expert.cu
 )
