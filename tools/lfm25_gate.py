@@ -15,6 +15,9 @@
              Rationale: near-tied router scores (4th vs 5th expert) make quantization noise flip
              which expert runs, giving heavy-tailed per-step error spikes in both runtimes; which
              runtime gets a flip on a given step is luck, so mean/worst-step are ill-posed there.
+             All modes: the RMS is shift-invariant -- each step's mean error over the vocab is
+             removed first, identically for both runtimes (softmax and argmax are invariant to a
+             uniform logit shift; on the 128k-vocab models it is 56-66 % of the squared error).
 
 Why not a long exact-match run: two correct Q8_1-activation runtimes carry different rounding
 noise (~0.1-0.2 logit RMS on LFM2.5-1.2B), and greedy decoding hits FP64 margins as small as
@@ -116,8 +119,14 @@ def cmd_tolerance(a):
     tu = load_logits(a.tuff, a.vocab)
     ll = load_logits(a.llama, a.vocab)
     n = min(a.n, len(fp), len(tu), len(ll))
-    rms = lambda x: np.sqrt(((x[:n].astype(np.float64) - fp[:n]) ** 2).mean(1))
-    r_tu, r_ll = rms(tu), rms(ll)
+    def rms(x):
+        e = x[:n].astype(np.float64) - fp[:n]
+        sh = e.mean(1)  # per-step uniform logit shift; softmax/argmax cannot see it
+        e = e - sh[:, None]
+        return np.sqrt((e ** 2).mean(1)), np.abs(sh).mean()
+
+    (r_tu, sh_tu), (r_ll, sh_ll) = rms(tu), rms(ll)
+    info_shift = f"mean |shift| tuff {sh_tu:.3f}, llama.cpp {sh_ll:.3f}"
     mean_ratio = r_tu.mean() / r_ll.mean()
     step_ratio = (r_tu / r_ll).max()
     if a.stat == "robust":
@@ -126,12 +135,12 @@ def cmd_tolerance(a):
         ok = med <= a.max_ratio and p90 <= a.max_p90_ratio and n == a.n
         print(f"  [3/3] FP64 tolerance (robust, MoE routing flips): median ratio {med:.2f} <= {a.max_ratio}; "
               f"p90 ratio {p90:.2f} <= {a.max_p90_ratio} (info: mean {mean_ratio:.2f}, "
-              f"worst step {step_ratio:.2f}) -> {'PASS' if ok else 'FAIL'}")
+              f"worst step {step_ratio:.2f}; {info_shift}; shift-invariant RMS) -> {'PASS' if ok else 'FAIL'}")
         return 0 if ok else 1
     ok = mean_ratio <= a.max_ratio and step_ratio <= a.max_step_ratio and n == a.n
-    print(f"  [3/3] FP64 tolerance: logit RMS vs FP64 over {n} steps: tuff {r_tu.mean():.4f}, "
+    print(f"  [3/3] FP64 tolerance: logit RMS vs FP64 (shift-invariant) over {n} steps: tuff {r_tu.mean():.4f}, "
           f"llama.cpp {r_ll.mean():.4f} (ratio {mean_ratio:.2f} <= {a.max_ratio}; "
-          f"worst step {step_ratio:.2f} <= {a.max_step_ratio}) -> {'PASS' if ok else 'FAIL'}")
+          f"worst step {step_ratio:.2f} <= {a.max_step_ratio}; info: {info_shift}) -> {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 
 
