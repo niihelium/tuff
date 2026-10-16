@@ -76,7 +76,8 @@ mode_setup() {
             MODEL="/run/media/nii/pohjola/models/unsloth/LFM2.5-1.2B-Thinking-GGUF/LFM2.5-1.2B-Thinking-Q4_K_M.gguf"
             REF="tests/ref_lfm25_dense_128.txt"
             CONFIGS=("graph=1|LFM25_CUDA_GRAPH=1" "graph=0|LFM25_CUDA_GRAPH=0"
-                     "tf-batch4||--tf-batch 4" "tf-batch8-rollback||--tf-batch 8 --tf-rollback") ;;
+                     "tf-batch4||--tf-batch 4" "tf-batch8-rollback||--tf-batch 8 --tf-rollback"
+                     "spec-ngram||--spec-draft ngram" "spec-ngram-k7||--spec-draft ngram --spec-k 7") ;;
         dense26)
             MODEL="/run/media/nii/pohjola/models/LiquidAI/LFM2.5-2.6B/LFM2.5-2.6B-Q4_K_M.gguf"
             REF="tests/ref_lfm25_dense26_128.txt"
@@ -89,12 +90,14 @@ mode_setup() {
                      "expert-cache-tiny|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300"
                      "expert-cache-tiny-alt|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300;LFM25_PREFETCH=1;LFM25_PINNED_EXPERTS=0;LFM25_CACHE_POLICY=lru"
                      "tf-batch4||--tf-batch 4"
-                     "tf-batch4-rollback-cache|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300|--tf-batch 4 --tf-rollback") ;;
+                     "tf-batch4-rollback-cache|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300|--tf-batch 4 --tf-rollback"
+                     "spec-ngram||--spec-draft ngram"
+                     "spec-ngram-cache|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300|--spec-draft ngram") ;;
         moe)
             MODEL="/run/media/nii/pohjola/models/LiquidAI/LFM2.5-24B-A2B-GGUF/LFM2.5-24B-A2B-Q4_K_M.gguf"
             REF="tests/ref_lfm25_moe_128.txt"
             CONFIGS=("graph=1|LFM25_CUDA_GRAPH=1" "graph=0|LFM25_CUDA_GRAPH=0" "prefetch|LFM25_PREFETCH=1"
-                     "tf-batch4||--tf-batch 4") ;;
+                     "tf-batch4||--tf-batch 4" "spec-ngram||--spec-draft ngram") ;;
     esac
 }
 

@@ -115,6 +115,12 @@ run_check() {
             if [ $rc -eq 0 ]; then CHK_RES=PASS
             elif [ $rc -eq 1 ]; then CHK_RES=FAIL
             else CHK_RES="ERROR:oracle exit $rc"; fi ;;
+        spec)
+            CHK_LABEL="spec-dense"
+            TUFF_BIN="$DIR/build/tuff" "$DIR/tests/verify_lfm25_spec.sh" dense > "$out" 2>&1; rc=$?
+            if [ $rc -eq 0 ]; then CHK_RES=PASS
+            elif grep -q "FAIL(" "$out"; then CHK_RES=FAIL      # a token stream differed
+            else CHK_RES="ERROR:spec check exit $rc without a stream difference"; fi ;;
         router8)   CHK_LABEL=router8;   "$DIR/build/lfm25-router-test"  "$M8"  "$DIR/tests/fixtures/lfm25_8b_router_cases.bin"  > "$out" 2>&1; rc=$? ;;
         router24)  CHK_LABEL=router24;  "$DIR/build/lfm25-router-test"  "$M24" "$DIR/tests/fixtures/lfm25_24b_router_cases.bin" > "$out" 2>&1; rc=$? ;;
         moeffn8)   CHK_LABEL=moeffn8;   "$DIR/build/lfm25-moe-ffn-test" "$M8"  "$DIR/tests/fixtures/lfm25_8b_moe_ffn_cases.bin"  > "$out" 2>&1; rc=$? ;;

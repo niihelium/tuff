@@ -25,7 +25,7 @@ Last updated: 2026-10-16. Branch: `lfm25-phase1` (pushed to `origin`; not merged
 | 4.3 — copy stream, pinned expert store, LFRU (24B); prefetch opt-in | done; A/B +3.4% (Hello) / +12.5% (translate) | see git log | golden PASS incl. tiny-cache + prefetch configs; 2 new cache controls |
 | 2.6B — dense 30-layer stepping stone | tooling done; **oracle stage 3 FAIL (worst step 2.44 > 2.0), uniform-shift artefact; user decision pending** | see git log | roadmap *Stepping stone 2* |
 | 5.1 — batched verify forward + conv rollback | done; verify(4) = 1.9× a token on 1.2B | see git log | golden PASS on tf-batch / rollback configs; 12/12 controls |
-| 5 — speculative decoding | not started | | |
+| 5.2 — lossless n-gram speculation, adaptive k | done; 1.2B ≤ 1.09×, 2.6B ≤ 2.12×, 8B ≈ 1.0×, 24B ≤ 1.14× (worst 0.979) | see git log | 18/18 spec streams identical; 13/13 controls |
 
 Decode speed (RTX 3070 Laptop, `-c 1024 -n 128 --runs 3`, `balanced` profile, interleaved A/B means):
 
@@ -189,7 +189,8 @@ Env knobs: `N` (128), `N_EXACT` (16), `N_FP` (32/32/72), `MIN_MARGIN` (0.5), `MA
 Everything at once (~1.3 min; ~3 min with the 8 negative controls):
 ```bash
 ./tests/verify_lfm25_all.sh            # golden x3 (byte-identity), oracle x3, 4 unit tests
-./tests/verify_lfm25_all.sh --controls # + tests/lfm25_negative_controls.sh
+./tests/verify_lfm25_all.sh --controls # + tests/lfm25_negative_controls.sh (13 controls, ~14 min)
+./tests/verify_lfm25_all.sh --spec     # + tests/verify_lfm25_spec.sh (speculation losslessness, ~6 min)
 ./tests/verify_lfm25_golden.sh dense|moe8|moe|all
 ./tests/verify_lfm25_golden.sh <mode> --update --reason "..."   # only for an intentional numerics change
 ```

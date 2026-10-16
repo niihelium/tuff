@@ -11,7 +11,7 @@
 #   file:    path relative to the repo root
 #   old/new: text to replace; "\n" is a newline, "\\" a backslash. Whitespace after "old: " is significant.
 #   targets: cmake targets to rebuild (space separated): tuff lfm25-router-test lfm25-moe-ffn-test
-#   checks:  golden:<mode> oracle:<mode> router8 router24 moeffn8 moeffn24   (all must FAIL on the mutant)
+#   checks:  golden:<mode> oracle:<mode> spec router8 router24 moeffn8 moeffn24   (all must FAIL on the mutant)
 
 id: conv-taps-swap
 tags: quick
@@ -112,3 +112,11 @@ old: (int)eng->model->n_conv_layers, n_keep - 1, dim,
 new: (int)eng->model->n_conv_layers, n_keep, dim,
 targets: tuff
 checks: golden:dense
+
+id: spec-accept-one-too-many
+desc: speculative verify accepts one draft token too many (emits a_{m+1}, rolls back to m+2)
+file: src/main.c
+old:     while (m < k && d[m] == am[m]) m++;\n
+new:     while (m < k && d[m] == am[m]) m++;\n    if (m < k) m++;\n
+targets: tuff
+checks: golden:dense spec

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # tests/verify_lfm25_all.sh - every LFM2.5 gate in one go; exit non-zero if anything fails.
 #
-# Usage: verify_lfm25_all.sh [--controls]
+# Usage: verify_lfm25_all.sh [--controls] [--spec]
 #
 #   golden dense|moe8|moe      byte-identity vs the frozen goldens (graph on/off, expert cache)
 #   oracle dense|moe8|moe      three-stage llama.cpp/FP64 gate with locked thresholds
 #   router8/24, moeffn8/24     kernel unit tests vs llama.cpp fixtures
 #   --controls                 also run the full negative-control suite (tests/lfm25_negative_controls.sh)
+#   --spec                     also run the speculative-decoding losslessness check (tests/verify_lfm25_spec.sh; slow, ~6 min)
 #
 # Env: TUFF_BIN (default ./build/tuff; the unit-test binaries are taken from the same build dir), PYTHON.
 # Builds nothing: run `cmake --build build -j16 --target tuff lfm25-llama-ref lfm25-router-test lfm25-moe-ffn-test` first.
@@ -15,10 +16,12 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 CONTROLS=0
+SPEC=0
 for a in "$@"; do
     case "$a" in
         --controls) CONTROLS=1 ;;
-        *) echo "Usage: $0 [--controls]" >&2; exit 2 ;;
+        --spec) SPEC=1 ;;
+        *) echo "Usage: $0 [--controls] [--spec]" >&2; exit 2 ;;
     esac
 done
 
@@ -49,6 +52,7 @@ step "router8"   "$BDIR/lfm25-router-test"  "$M8"  tests/fixtures/lfm25_8b_route
 step "router24"  "$BDIR/lfm25-router-test"  "$M24" tests/fixtures/lfm25_24b_router_cases.bin
 step "moeffn8"   "$BDIR/lfm25-moe-ffn-test" "$M8"  tests/fixtures/lfm25_8b_moe_ffn_cases.bin
 step "moeffn24"  "$BDIR/lfm25-moe-ffn-test" "$M24" tests/fixtures/lfm25_24b_moe_ffn_cases.bin
+[ "$SPEC" -eq 1 ] && step "spec lossless" ./tests/verify_lfm25_spec.sh
 [ "$CONTROLS" -eq 1 ] && step "negative controls" ./tests/lfm25_negative_controls.sh
 
 echo

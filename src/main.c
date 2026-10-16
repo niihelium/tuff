@@ -42,6 +42,7 @@ static void print_usage(const char *prog) {
         "  --spec-draft <mode>         speculation draft: ngram, mtp, ngram+mtp, external\n"
         "  --spec-ngram <n>            n-gram order for ngram draft (default: 3)\n"
         "  --spec-ngram-min <n>        minimum n-gram fallback order (default: 2)\n"
+        "  --spec-k <K>                LFM engines: max draft tokens per verify step, 1..7 (default: 4; LFM25_SPEC_K=<k> fixes k)\n"
         "  --spec-mtp                  enable MTP head speculation\n"
         "Memory / KV Cache Options:\n"
         "  --kv-quant <mode>           KV cache quant mode: f32 (native), q8_0 (default), q4_0\n"
@@ -148,6 +149,253 @@ static double vmrss_mib(void) {
     return vmrss;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Lossless n-gram (prompt-lookup) speculative decoding for the LFM2.5 engines (Task 5.2). Greedy only.
+// Draft = continuation of the most recent earlier occurrence of the last n tokens (n = nmax..nmin) of the token
+// history; verification = one engine_forward_batch([t, d1..dk]) whose per-position argmax is bit-identical to k+1
+// consecutive forward_token calls, so the emitted stream equals the non-speculative one exactly. A step without a
+// draft uses the (CUDA-graphed) engine_forward_token, never forward_batch(1).
+// Adaptive-k policy (LFM25_SPEC_K=<1..7> fixes k instead): with a draft of length dl and a per-position acceptance
+// estimate p (EMA of accepted/attempted per match-length bucket, with a prior), choose k in 0..dl maximising
+//   throughput(k) = (1 + p + p^2 + ... + p^k) / cost(k+1 tokens in one batch)      (k >= 1)
+//   throughput(0) = 1 / cost(one graphed single token)
+// where cost() is a table measured once at startup. Ties and no-gain cases choose k = 0 (no speculation).
+// ---------------------------------------------------------------------------------------------------------------
+#define SPEC_KMAX 7
+#define SPEC_NBUCKET 6
+#define SPEC_DECAY 0.85
+#define SPEC_PRIOR_W 2.0
+static const double SPEC_PRIOR_P[SPEC_NBUCKET] = {0.35, 0.45, 0.55, 0.70, 0.85, 0.92};
+
+static double g_spec_cost[SPEC_KMAX + 2];   // [1] = graphed single token, [n] = forward_batch(n), seconds
+static int    g_spec_cost_measured = 0;
+
+typedef struct {
+    const engine_vtable_t *vt;
+    void *eng;
+    int32_t *hist;
+    int n_hist, cap;
+    int nmax, nmin, kmax, k_fixed, ctx;
+    double acc[SPEC_NBUCKET], att[SPEC_NBUCKET];
+    double gain, t_first;   // guard: seconds saved (+) / lost (-) by batch steps vs single-token decoding
+    unsigned long long guarded, n_single;
+    double m1, mb;   // live cost scales (EMA): m1 = measured/table single-token time; mb = measured batch time / (table batch time x m1)
+    unsigned long long steps, drafted, accepted, no_spec_with_draft, hist_k[SPEC_KMAX + 1];
+} spec_t;
+
+static int spec_cmp_double(const void *a, const void *b) {
+    double x = *(const double*)a, y = *(const double*)b;
+    return (x > y) - (x < y);
+}
+
+// Measure the verify-cost table on a scratch engine (the real engine's state stays untouched).
+static void spec_measure_costs(const engine_vtable_t *vt, void *model, int ctx, const sampler_params_t *sp,
+                               const int32_t *prompt, int n_prompt, int kmax, int do_measure) {
+    // Static table: batch(n) = 0.9 n single-token times (the measured 8B/24B MoE verify cost, where experts run per
+    // token and only the trunk is shared), single = 1 unit. Dense engines measure the real table; MoE engines keep
+    // this table (measuring on a scratch engine perturbs the 24B expert cache) and rely on the live cost scale.
+    for (int n = 1; n <= SPEC_KMAX + 1; ++n) g_spec_cost[n] = 0.9 * n;
+    g_spec_cost[1] = 1.0;
+    if (!do_measure) {
+        for (int n = 1; n <= SPEC_KMAX + 1; ++n) g_spec_cost[n] *= 0.030;   // arbitrary unit -> ~30 ms/token (only ratios matter)
+        g_spec_cost_measured = 0;
+        return;
+    }
+    int sum_n = 0;
+    for (int n = 2; n <= kmax + 1; ++n) sum_n += n;
+    int reps = 5;
+    while (reps >= 1 && n_prompt + 12 + (reps + 1) * sum_n + 8 > ctx) reps--;
+    if (reps < 1) {
+        fprintf(stderr, "[Tuff] spec: context too small to measure the cost table; using the default table\n");
+        g_spec_cost_measured = 1;
+        return;
+    }
+    void *e = vt->engine_init(model, ctx);
+    vt->engine_set_sampler(e, sp);
+    int pos = 0;
+    int32_t t = prompt[0];
+    for (int i = 0; i < n_prompt; ++i) t = vt->engine_forward_token(e, prompt[i], pos++);
+    int32_t toks[SPEC_KMAX + 1], am[SPEC_KMAX + 1];
+    for (int i = 0; i < 3; ++i) t = vt->engine_forward_token(e, prompt[i % n_prompt], pos++);   // untimed warm-up
+    double t0 = omp_get_wtime();
+    for (int i = 0; i < 8; ++i) t = vt->engine_forward_token(e, prompt[i % n_prompt], pos++);
+    g_spec_cost[1] = (omp_get_wtime() - t0) / 8.0;
+    for (int n = 2; n <= kmax + 1; ++n) {
+        double ts[5] = {0};
+        for (int r = 0; r < reps + 1; ++r) {
+            for (int j = 0; j < n; ++j) toks[j] = prompt[(r + j) % n_prompt];
+            double a = omp_get_wtime();
+            if (vt->engine_forward_batch(e, toks, n, pos, am, NULL) != 0) break;
+            double b = omp_get_wtime();
+            pos += n;
+            if (r > 0) ts[r - 1] = b - a;   // first call per n is untimed
+        }
+        qsort(ts, (size_t)reps, sizeof(double), spec_cmp_double);
+        g_spec_cost[n] = ts[reps / 2];
+    }
+    (void)t;
+    vt->engine_free(e);
+    g_spec_cost_measured = 1;
+}
+
+static void spec_print_policy(const spec_t *s) {
+    fprintf(stderr, "[Tuff] spec: lossless n-gram speculation, orders %d..%d, k_max %d, %s\n", s->nmax, s->nmin, s->kmax,
+            s->k_fixed ? "FIXED k (LFM25_SPEC_K)" : "adaptive k");
+    if (!s->k_fixed) {
+        fprintf(stderr, "[Tuff] spec policy: per step pick k in 0..draft_len maximising (1+p+..+p^k)/cost(k+1) vs 1/cost(1 graphed token); "
+                        "p = acceptance EMA (decay %.2f, prior weight %.0f) per match-length bucket; costs = startup table x live measured/table scale (EMA) for single and batch steps\n", SPEC_DECAY, SPEC_PRIOR_W);
+        fprintf(stderr, "[Tuff] spec cost table (%s, ms): single %.3f", g_spec_cost_measured ? "measured" : "static, nominal ms",
+                g_spec_cost[1] * 1e3);
+        for (int n = 2; n <= s->kmax + 1; ++n) fprintf(stderr, ", batch%d %.3f (%.2fx single-token time)", n, g_spec_cost[n] * 1e3,
+                                                     g_spec_cost[n] / (g_spec_cost[1] * n));
+        fprintf(stderr, "\n");
+    }
+}
+
+static void spec_init(spec_t *s, const engine_vtable_t *vt, int ctx, int nmax, int nmin, int kmax, int k_fixed) {
+    memset(s, 0, sizeof(*s));
+    s->vt = vt; s->ctx = ctx; s->nmax = nmax; s->nmin = nmin; s->kmax = kmax; s->k_fixed = k_fixed;
+    s->cap = ctx + 16;
+    s->hist = (int32_t*)malloc((size_t)s->cap * sizeof(int32_t));
+}
+
+// Reset per-run state for a fresh engine.
+static void spec_begin_run(spec_t *s, void *eng) {
+    s->eng = eng; s->n_hist = 0; s->m1 = 1.0;
+    s->mb = g_spec_cost_measured ? 1.0 : 0.6;   // static table: optimistic start, the live scale corrects it
+    s->gain = 0.0; s->t_first = -1.0; s->guarded = 0; s->n_single = 0;
+    for (int b = 0; b < SPEC_NBUCKET; ++b) { s->acc[b] = 0.0; s->att[b] = 0.0; }
+    s->steps = s->drafted = s->accepted = s->no_spec_with_draft = 0;
+    memset(s->hist_k, 0, sizeof(s->hist_k));
+}
+
+static void spec_push(spec_t *s, int32_t t) {
+    if (s->n_hist < s->cap) s->hist[s->n_hist++] = t;
+}
+
+static int spec_bucket(int ml) {
+    return ml <= 2 ? 0 : ml == 3 ? 1 : ml <= 5 ? 2 : ml <= 8 ? 3 : ml <= 16 ? 4 : 5;
+}
+
+// Prompt lookup: returns the number of draft tokens written to d (0 = no match); *ml = match length (capped at 32).
+static int spec_lookup(const spec_t *s, int32_t *d, int kcap, int *ml_out) {
+    const int32_t *h = s->hist;
+    const int L = s->n_hist;
+    for (int n = s->nmax; n >= s->nmin; --n) {
+        if (L < n + 1) continue;
+        for (int j = L - 2; j >= n - 1; --j) {   // j = last index of the candidate occurrence; j+1 <= L-1 exists
+            int i = 0;
+            while (i < n && h[j - i] == h[L - 1 - i]) i++;
+            if (i < n) continue;
+            int ml = n;
+            while (ml < 32 && j - ml >= 0 && h[j - ml] == h[L - 1 - ml]) ml++;
+            int k = L - 1 - j;
+            if (k > kcap) k = kcap;
+            for (int q = 0; q < k; ++q) d[q] = h[j + 1 + q];
+            *ml_out = ml;
+            return k;
+        }
+    }
+    return 0;
+}
+
+static double spec_p(const spec_t *s, int b) {
+    return (s->acc[b] + SPEC_PRIOR_P[b] * SPEC_PRIOR_W) / (s->att[b] + SPEC_PRIOR_W);
+}
+
+static int spec_choose_k(const spec_t *s, int dl, int b) {
+    if (s->k_fixed) return dl < s->k_fixed ? dl : s->k_fixed;
+    const double p = spec_p(s, b);
+    int best = 0;
+    double best_rate = 1.0 / (g_spec_cost[1] * s->m1);
+    double pw = 1.0, sum = 1.0;
+    for (int k = 1; k <= dl; ++k) {
+        pw *= p; sum += pw;
+        double rate = sum / (g_spec_cost[k + 1] * s->m1 * s->mb);
+        if (rate > best_rate) { best_rate = rate; best = k; }
+    }
+    return best;
+}
+
+// One decoding step from token t at position pos with rem >= 1 tokens still wanted. Writes 1..rem tokens to out
+// (out[0] follows t); the state afterwards is "t and out[0..n-2] processed", out[n-1] is the next input token.
+static int spec_step(spec_t *s, int32_t t, int pos, int rem, int32_t *out) {
+    const engine_vtable_t *vt = s->vt;
+    if (s->t_first < 0.0) s->t_first = omp_get_wtime();
+    int kcap = s->kmax < rem - 1 ? s->kmax : rem - 1;
+    if (kcap > s->ctx - 1 - pos) kcap = s->ctx - 1 - pos;
+    int32_t d[SPEC_KMAX];
+    int ml = 0, dl = 0, k = 0, b = 0;
+    if (kcap > 0 && (g_spec_cost_measured || s->k_fixed || s->n_single >= 8)) {   // static table: calibrate m1 on 8 single steps first
+        dl = spec_lookup(s, d, kcap, &ml);
+        if (dl > 0) {
+            b = spec_bucket(ml);
+            k = spec_choose_k(s, dl, b);
+            // Loss guard: the worst case of a batch step (every draft rejected: one token for cost(k+1)) must fit in the
+            // budget  net gain so far + 0.5% of the elapsed time + one single-token time;  k shrinks until it does, so
+            // probing is rate-limited to ~0.5% of the run when drafts keep failing and free when they pay.
+            if (k > 0 && !s->k_fixed) {
+                const double c1 = g_spec_cost[1] * s->m1;
+                const double budget = s->gain + 0.005 * (omp_get_wtime() - s->t_first) + 1.0 * c1;
+                while (k > 0 && g_spec_cost[k + 1] * s->m1 * s->mb - c1 > budget) k--;
+                if (k == 0) s->guarded++;
+            }
+            if (k == 0) {   // draft skipped: let the evidence fade toward the prior so the bucket gets re-probed
+                s->acc[b] *= 0.9; s->att[b] *= 0.9;
+                s->no_spec_with_draft++;
+            }
+        }
+    }
+    s->steps++;
+    s->hist_k[k]++;
+    const double t0 = omp_get_wtime();
+    if (k == 0) {
+        out[0] = vt->engine_forward_token(s->eng, t, pos);
+        spec_push(s, out[0]);
+        if (!s->k_fixed) {
+            const double x = (omp_get_wtime() - t0) / g_spec_cost[1];
+            if (!g_spec_cost_measured && s->n_single == 0) s->m1 = x;   // static table is in nominal units: adopt the first reading
+            else { const double a = s->n_single < 19 ? 1.0 / (double)(s->n_single + 1) : 0.05; s->m1 += a * (x - s->m1); }
+            s->n_single++;
+        }
+        return 1;
+    }
+    int32_t toks[SPEC_KMAX + 1], am[SPEC_KMAX + 1];
+    toks[0] = t;
+    for (int i = 0; i < k; ++i) toks[1 + i] = d[i];
+    if (vt->engine_forward_batch(s->eng, toks, k + 1, pos, am, NULL) != 0) {
+        fprintf(stderr, "[Tuff] FATAL: speculative engine_forward_batch failed at position %d (k=%d)\n", pos, k);
+        exit(1);
+    }
+    int m = 0;
+    while (m < k && d[m] == am[m]) m++;
+    for (int i = 0; i <= m; ++i) { out[i] = am[i]; spec_push(s, am[i]); }
+    if (m < k && vt->engine_rollback(s->eng, m + 1) != 0) {
+        fprintf(stderr, "[Tuff] FATAL: speculative engine_rollback(%d) failed at position %d\n", m + 1, pos);
+        exit(1);
+    }
+    if (!s->k_fixed) {
+        const double dt = omp_get_wtime() - t0;
+        s->mb = 0.8 * s->mb + 0.2 * (dt / (g_spec_cost[k + 1] * s->m1));
+        s->gain += (double)(m + 1) * g_spec_cost[1] * s->m1 - dt;
+    }
+    s->drafted += (unsigned)k;
+    s->accepted += (unsigned)m;
+    s->acc[b] = s->acc[b] * SPEC_DECAY + m;
+    s->att[b] = s->att[b] * SPEC_DECAY + m + (m < k ? 1 : 0);
+    return m + 1;
+}
+
+static void spec_print_stats(const spec_t *s, unsigned long long tokens) {
+    fprintf(stderr, "[Tuff] spec stats: steps=%llu drafted=%llu accepted=%llu acceptance=%.1f%% tokens/step=%.3f "
+                    "(draft available but skipped: %llu) k-hist:",
+            s->steps, s->drafted, s->accepted, s->drafted ? 100.0 * (double)s->accepted / (double)s->drafted : 0.0,
+            s->steps ? (double)tokens / (double)s->steps : 0.0, s->no_spec_with_draft);
+    for (int k = 0; k <= s->kmax; ++k) fprintf(stderr, " k%d=%llu", k, s->hist_k[k]);
+    if (!s->k_fixed) fprintf(stderr, " | live cost scale single=%.3f batch/single=%.2f, net gain %.1f ms, loss-guard skips %llu", s->m1, s->mb, s->gain * 1e3, s->guarded);
+    fprintf(stderr, "\n");
+}
+
 int main(int argc, char **argv) {
     const char *model_path = "/run/media/nii/pohjola/models/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_S.gguf";
     const char *prompt = "Hello";
@@ -163,6 +411,8 @@ int main(int argc, char **argv) {
     bool dump_tokens_mode = false;
     bool spec_mtp_mode = true;
     bool spec_measure_mode = false;
+    bool spec_ngram_requested = false;   // explicit --spec-draft ngram (LFM engines only act on an explicit request)
+    int  spec_k_max = 4;                 // --spec-k (LFM engines)
     const char *spec_draft_model = NULL;
     const char *dump_logits_path = NULL; // non-NULL => --dump-logits mode
     int n_predict = -1; // resolved below based on mode
@@ -225,6 +475,7 @@ int main(int argc, char **argv) {
             spec_mtp_mode = true;
             g_spec_mtp = 1;
             const char *s = argv[i] + 13;
+            spec_ngram_requested = (strcmp(s, "ngram") == 0);
             if (strcmp(s, "ngram") == 0) {
                 g_spec_draft = SPEC_DRAFT_NGRAM;
             } else if (strcmp(s, "ngram+mtp") == 0 || strcmp(s, "mtp+ngram") == 0) {
@@ -242,6 +493,7 @@ int main(int argc, char **argv) {
                 return 2;
             }
         } else if (strcmp(argv[i], "--no-spec") == 0) {
+            spec_ngram_requested = false;
             g_spec_draft = SPEC_DRAFT_NONE;
             spec_mtp_mode = false;
             g_spec_mtp = 0;
@@ -249,6 +501,7 @@ int main(int argc, char **argv) {
             spec_mtp_mode = true;
             g_spec_mtp = 1;
             const char *s = argv[++i];
+            spec_ngram_requested = (strcmp(s, "ngram") == 0);
             if (strcmp(s, "ngram") == 0) {
                 g_spec_draft = SPEC_DRAFT_NGRAM;
             } else if (strcmp(s, "ngram+mtp") == 0 || strcmp(s, "mtp+ngram") == 0) {
@@ -281,6 +534,12 @@ int main(int argc, char **argv) {
             g_spec_draft_len = atoi(argv[++i]);
             if (g_spec_draft_len < 1 || g_spec_draft_len > 3) {
                 fprintf(stderr, "Error: --spec-draft-len must be between 1 and 3 (got %d)\n", g_spec_draft_len);
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--spec-k") == 0 && i + 1 < argc) {
+            spec_k_max = atoi(argv[++i]);
+            if (spec_k_max < 1 || spec_k_max > SPEC_KMAX) {
+                fprintf(stderr, "Error: --spec-k must be between 1 and %d (got %d)\n", SPEC_KMAX, spec_k_max);
                 return 2;
             }
         } else if (strcmp(argv[i], "--spec-measure") == 0) {
@@ -395,6 +654,27 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "[Tuff] Detected architecture: %s (%s engine)\n",
             tuff_arch_to_string(arch), vtable->name);
+
+    // LFM engines: lossless n-gram speculation is opt-in via an explicit --spec-draft ngram (greedy only).
+    bool lfm_spec = false;
+    int spec_nmax = g_spec_ngram_n, spec_nmin = g_spec_ngram_min, spec_kfix = 0;
+    if (spec_ngram_requested && vtable->engine_forward_batch && vtable->engine_rollback) {
+        if (sampler_params.temp > 0.0f) {
+            fprintf(stderr, "[Tuff] spec: speculation disabled (temp > 0; the LFM speculative path is greedy-only)\n");
+        } else {
+            lfm_spec = true;
+            if (spec_nmin > spec_nmax) spec_nmin = spec_nmax;
+            const char *ks = getenv("LFM25_SPEC_K");
+            if (ks && ks[0]) {
+                spec_kfix = atoi(ks);
+                if (spec_kfix < 1 || spec_kfix > SPEC_KMAX) {
+                    fprintf(stderr, "Error: LFM25_SPEC_K must be between 1 and %d (got '%s')\n", SPEC_KMAX, ks);
+                    return 2;
+                }
+                if (spec_kfix > spec_k_max) spec_k_max = spec_kfix;
+            }
+        }
+    }
 
     fprintf(stderr, "[Tuff] Loading GGUF model from: %s\n", model_path);
     void *model = vtable->model_load(model_path);
@@ -848,6 +1128,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[Tuff] --dump-tokens: generating %d tokens (%s reference oracle)...\n",
                 n_predict, vtable->name);
 
+        if (lfm_spec && !spec_kfix) spec_measure_costs(vtable, model, max_context_len, &sampler_params, prompt_tokens, n_prompt, spec_k_max,
+                                                   arch == TUFF_ARCH_LFM2 || getenv("LFM25_SPEC_MEASURE") != NULL);
         void *eng = vtable->engine_init(model, max_context_len);
         vtable->engine_set_sampler(eng, &sampler_params);
         int pos = 0;
@@ -855,10 +1137,33 @@ int main(int argc, char **argv) {
         for (int i = 0; i < n_prompt; ++i) {
             curr_token = vtable->engine_forward_token(eng, prompt_tokens[i], pos++);
         }
+        if (lfm_spec) {
+            spec_t sp;
+            spec_init(&sp, vtable, max_context_len, spec_nmax, spec_nmin, spec_k_max, spec_kfix);
+            spec_begin_run(&sp, eng);
+            spec_print_policy(&sp);
+            for (int i = 0; i < n_prompt; ++i) spec_push(&sp, prompt_tokens[i]);
+            spec_push(&sp, curr_token);
+            printf("%d\n", curr_token);
+            fflush(stdout);
+            int printed = 1;
+            while (printed < n_predict) {
+                int32_t out[SPEC_KMAX + 1];
+                int n = spec_step(&sp, curr_token, pos, n_predict - printed, out);
+                pos += n;
+                for (int q = 0; q < n; ++q) printf("%d\n", out[q]);
+                fflush(stdout);
+                printed += n;
+                curr_token = out[n - 1];
+            }
+            spec_print_stats(&sp, (unsigned long long)(printed - 1));
+            free(sp.hist);
+        } else {
         for (int i = 0; i < n_predict; ++i) {
             printf("%d\n", curr_token);
             fflush(stdout);
             curr_token = vtable->engine_forward_token(eng, curr_token, pos++);
+        }
         }
         vtable->engine_free(eng);
         tokenizer_free(tok);
@@ -882,6 +1187,14 @@ int main(int argc, char **argv) {
         drafter = drafter_init(spec_draft_model, 8, 0);
     }
 
+    spec_t lfm_sp;
+    if (lfm_spec) {
+        if (!spec_kfix) spec_measure_costs(vtable, model, max_context_len, &sampler_params, prompt_tokens, n_prompt, spec_k_max,
+                                                   arch == TUFF_ARCH_LFM2 || getenv("LFM25_SPEC_MEASURE") != NULL);
+        spec_init(&lfm_sp, vtable, max_context_len, spec_nmax, spec_nmin, spec_k_max, spec_kfix);
+        spec_print_policy(&lfm_sp);
+    }
+
     for (int run = 0; run < n_runs; ++run) {
         void *eng = vtable->engine_init(model, max_context_len);
         vtable->engine_set_sampler(eng, &sampler_params);
@@ -894,10 +1207,16 @@ int main(int argc, char **argv) {
         for (int i = 0; i < n_prompt; ++i) {
             curr_token = vtable->engine_forward_token(eng, prompt_tokens[i], pos++);
         }
+        if (lfm_spec) {
+            spec_begin_run(&lfm_sp, eng);
+            for (int i = 0; i < n_prompt; ++i) spec_push(&lfm_sp, prompt_tokens[i]);
+            spec_push(&lfm_sp, curr_token);
+        }
 
         for (int i = 0; i < n_warmup; ++i) {
             warmup_seq[n_prompt + i] = curr_token;
             curr_token = vtable->engine_forward_token(eng, curr_token, pos++);
+            if (lfm_spec) spec_push(&lfm_sp, curr_token);
         }
 
         if (drafter && arch == TUFF_ARCH_QWEN35MOE) {
@@ -925,6 +1244,21 @@ int main(int argc, char **argv) {
             if (run == 0) {
                 fputs(tokenizer_decode(tok, curr_token), stdout);
                 fflush(stdout);
+            }
+
+            if (lfm_spec) {
+                int32_t out[SPEC_KMAX + 1];
+                int n = spec_step(&lfm_sp, curr_token, pos, n_predict - n_generated, out);
+                if (run == 0) {
+                    for (int q = 0; q < n - 1; ++q) {
+                        fputs(tokenizer_decode(tok, out[q]), stdout);
+                        fflush(stdout);
+                    }
+                }
+                curr_token = out[n - 1];
+                pos += n;
+                n_generated += n;
+                continue;
             }
 
             if (spec_mtp_mode && !spec_measure_mode && arch == TUFF_ARCH_QWEN35MOE) {
@@ -987,8 +1321,10 @@ int main(int argc, char **argv) {
                     run + 1, n_runs, n_warmup, n_predict, elapsed, tok_per_sec[run]);
         }
 
+        if (lfm_spec) spec_print_stats(&lfm_sp, (unsigned long long)n_generated);
         vtable->engine_free(eng);
     }
+    if (lfm_spec) free(lfm_sp.hist);
     if (drafter) drafter_free(drafter);
 
     double mean = 0.0;
