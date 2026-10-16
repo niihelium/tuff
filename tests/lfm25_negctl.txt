@@ -96,3 +96,19 @@ old: slots[i] = s; c->slot_use[s] = c->tick; c->slot_prot[s] = c->tick;
 new: slots[i] = s;
 targets: tuff
 checks: golden:moe8
+
+id: batch-attn-sees-next-token
+desc: batched forward - token j's attention uses token j+1's position, so it attends j+1's K/V written in the same batch
+file: src/lfm25_engine.c
+old: const int *apos = bpos + 2 * j;
+new: const int *apos = bpos + 2 * (j + 1);
+targets: tuff
+checks: golden:dense
+
+id: rollback-off-by-one
+desc: rollback restores the conv snapshot after token n_keep instead of after token n_keep-1
+file: src/lfm25_engine.c
+old: (int)eng->model->n_conv_layers, n_keep - 1, dim,
+new: (int)eng->model->n_conv_layers, n_keep, dim,
+targets: tuff
+checks: golden:dense

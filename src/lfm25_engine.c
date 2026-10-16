@@ -8,6 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+static void lfm25_bench_batch(lfm25_engine_t *eng);
 
 lfm25_engine_t* lfm25_engine_init(lfm25_model_t *model, int max_context_len) {
     if (!model) return NULL;
@@ -92,6 +95,36 @@ lfm25_engine_t* lfm25_engine_init(lfm25_model_t *model, int max_context_len) {
     CUDA_CHECK(cudaMallocHost((void**)&eng->h_best, sizeof(int)));
     CUDA_CHECK(cudaMalloc((void**)&eng->d_tokpos, 2 * sizeof(int)));
 
+    // Batched-forward scratch (Task 5.1). Allocated before the expert cache so the cache's default size accounts for it.
+    {
+        const size_t B = LFM25_MAX_BATCH;
+        const size_t qdim = (size_t)n_head * head_dim, kvdim = (size_t)n_head_kv * head_dim;
+        CUDA_CHECK(cudaMalloc((void**)&eng->d_bx, B * d * sizeof(float)));
+        CUDA_CHECK(cudaMalloc((void**)&eng->d_bnorm, B * d * sizeof(float)));
+        CUDA_CHECK(cudaMalloc((void**)&eng->d_bin_proj, B * 3 * d * sizeof(float)));
+        CUDA_CHECK(cudaMalloc((void**)&eng->d_bq, B * qdim * sizeof(float)));
+        CUDA_CHECK(cudaMalloc((void**)&eng->d_bk, B * kvdim * sizeof(float)));
+        CUDA_CHECK(cudaMalloc((void**)&eng->d_bv, B * kvdim * sizeof(float)));
+        CUDA_CHECK(cudaMalloc((void**)&eng->d_bop_out, B * d * sizeof(float)));
+        CUDA_CHECK(cudaMalloc((void**)&eng->d_bffn_act, B * ffn_dim * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&eng->d_bq8_x, B * q8_x_bytes));
+        CUDA_CHECK(cudaMalloc(&eng->d_bq8_op, B * q8_x_bytes));
+        CUDA_CHECK(cudaMalloc(&eng->d_bq8_ffn, B * q8_ffn_bytes));
+        CUDA_CHECK(cudaMalloc((void**)&eng->d_blogits, B * vocab * sizeof(float)));
+        CUDA_CHECK(cudaMalloc((void**)&eng->d_bblock_max, B * grid_blocks * sizeof(float)));
+        CUDA_CHECK(cudaMalloc((void**)&eng->d_bblock_idx, B * grid_blocks * sizeof(int)));
+        CUDA_CHECK(cudaMalloc((void**)&eng->d_bbest, B * sizeof(int)));
+        CUDA_CHECK(cudaMalloc((void**)&eng->d_btokpos, (B + 1) * 2 * sizeof(int)));
+        CUDA_CHECK(cudaMemset(eng->d_btokpos, 0, (B + 1) * 2 * sizeof(int)));
+        CUDA_CHECK(cudaMallocHost((void**)&eng->h_btokpos, (B + 1) * 2 * sizeof(int)));
+        CUDA_CHECK(cudaMallocHost((void**)&eng->h_bbest, B * sizeof(int)));
+        size_t snap_bytes = (size_t)model->n_conv_layers * B * 2 * d * sizeof(float);
+        if (snap_bytes > 0) {
+            CUDA_CHECK(cudaMalloc((void**)&eng->d_conv_snap, snap_bytes));
+            CUDA_CHECK(cudaMemset(eng->d_conv_snap, 0, snap_bytes));
+        }
+    }
+
     // CUDA graph: only when there is no host round-trip inside the forward pass (no expert cache).
     {
         const char *g = getenv("LFM25_CUDA_GRAPH");
@@ -117,6 +150,7 @@ lfm25_engine_t* lfm25_engine_init(lfm25_model_t *model, int max_context_len) {
         if (!eng->expert_cache) { lfm25_engine_free(eng); return NULL; }
     }
 
+    { const char *bb = getenv("LFM25_BENCH_BATCH"); if (bb && bb[0] == '1') lfm25_bench_batch(eng); }
     return eng;
 }
 
@@ -164,6 +198,25 @@ void lfm25_engine_free(lfm25_engine_t *eng) {
     if (eng->h_tokpos)     cudaFreeHost(eng->h_tokpos);
     if (eng->h_best)       cudaFreeHost(eng->h_best);
     if (eng->d_tokpos)     cudaFree(eng->d_tokpos);
+    if (eng->d_bx)         cudaFree(eng->d_bx);
+    if (eng->d_bnorm)      cudaFree(eng->d_bnorm);
+    if (eng->d_bin_proj)   cudaFree(eng->d_bin_proj);
+    if (eng->d_bq)         cudaFree(eng->d_bq);
+    if (eng->d_bk)         cudaFree(eng->d_bk);
+    if (eng->d_bv)         cudaFree(eng->d_bv);
+    if (eng->d_bop_out)    cudaFree(eng->d_bop_out);
+    if (eng->d_bffn_act)   cudaFree(eng->d_bffn_act);
+    if (eng->d_bq8_x)      cudaFree(eng->d_bq8_x);
+    if (eng->d_bq8_op)     cudaFree(eng->d_bq8_op);
+    if (eng->d_bq8_ffn)    cudaFree(eng->d_bq8_ffn);
+    if (eng->d_blogits)    cudaFree(eng->d_blogits);
+    if (eng->d_bblock_max) cudaFree(eng->d_bblock_max);
+    if (eng->d_bblock_idx) cudaFree(eng->d_bblock_idx);
+    if (eng->d_bbest)      cudaFree(eng->d_bbest);
+    if (eng->d_btokpos)    cudaFree(eng->d_btokpos);
+    if (eng->d_conv_snap)  cudaFree(eng->d_conv_snap);
+    if (eng->h_btokpos)    cudaFreeHost(eng->h_btokpos);
+    if (eng->h_bbest)      cudaFreeHost(eng->h_bbest);
     if (eng->graph_exec)   cudaGraphExecDestroy(eng->graph_exec);
     if (eng->graph)        cudaGraphDestroy(eng->graph);
     if (eng->stream)       cudaStreamDestroy(eng->stream);
@@ -182,6 +235,55 @@ static inline void lfm25_gpu_mat_vec(const lfm25_tensor_t *t, const void *d_xq8,
         lfm25_gpu_mmvq_q6_K(t->dev, d_xq8, d_dst, in_dim, out_dim, accum);
     } else {
         lfm25_gpu_mmvq_q4_K(t->dev, d_xq8, d_dst, in_dim, out_dim, accum);
+    }
+}
+
+// Sparse MoE FFN for one token: sigmoid top-4 router on the normed FP32 input d_norm_x, then the expert FFN on d_q8_x
+// accumulated into the residual d_x. Used by the single-token step and, per token, by the batched forward.
+static void lfm25_enqueue_moe_ffn(lfm25_engine_t *eng, cudaStream_t stream, uint32_t l,
+                                  const float *d_norm_x, const void *d_q8_x, float *d_x) {
+    lfm25_model_t *m = eng->model;
+    lfm25_layer_t *L = &m->layers[l];
+    int dim = (int)m->embedding_length;
+    // Sparse MoE: sigmoid top-4 router on the normed FP32 input, then in-VRAM expert FFN accumulated into d_x
+    lfm25_gpu_router_top4(d_norm_x, (const float*)L->ffn_gate_inp.dev, (const float*)L->exp_probs_b.dev,
+                          eng->d_topk_ids, eng->d_topk_w, NULL, dim, (int)m->expert_count);
+    const size_t gs0 = (size_t)m->expert_ffn_dim * ggml_row_size(L->ffn_gate_exps.info.type, dim);
+    const size_t us0 = (size_t)m->expert_ffn_dim * ggml_row_size(L->ffn_up_exps.info.type, dim);
+    const size_t ds0 = (size_t)dim * ggml_row_size(L->ffn_down_exps.info.type, m->expert_ffn_dim);
+    if (eng->expert_cache) {
+        // Cache path. Optionally also run the NEXT MoE layer's router on this layer's normed activations to
+        // predict its experts (selection only), fetch both id sets with one sync, then resolve slots: misses are
+        // uploaded on the cache's copy stream and the FFN stream only waits for the slots it reads.
+        lfm25_expert_cache_t *ec = eng->expert_cache;
+        int pred_layer = -1;
+        if (eng->prefetch && l + 1 < m->block_count && m->layers[l + 1].ffn_type == LFM25_FFN_MOE) {
+            const lfm25_layer_t *N = &m->layers[l + 1];
+            lfm25_gpu_router_top4(d_norm_x, (const float*)N->ffn_gate_inp.dev, (const float*)N->exp_probs_b.dev,
+                                  eng->d_pred_ids, eng->d_pred_w, NULL, dim, (int)m->expert_count);
+            pred_layer = (int)l + 1;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(eng->h_moe_ids, eng->d_topk_ids, 4 * sizeof(int), cudaMemcpyDeviceToHost, stream));
+        if (pred_layer >= 0)
+            CUDA_CHECK(cudaMemcpyAsync(eng->h_moe_ids + 4, eng->d_pred_ids, 4 * sizeof(int), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        // After this sync every kernel enqueued before this layer's router has finished; only this layer's FFN
+        // (enqueued below) can read slots while the prefetch for the next layer is in flight.
+        lfm25_expert_cache_lookup(ec, (int)l, eng->h_moe_ids, 4, eng->h_slot_ids, stream);
+        // h_slot_ids is pinned and rewritten only after the next layer's sync, i.e. after this copy completed.
+        CUDA_CHECK(cudaMemcpyAsync(eng->d_slot_ids, eng->h_slot_ids, 4 * sizeof(int), cudaMemcpyHostToDevice, stream));
+        lfm25_gpu_moe_ffn(d_q8_x, eng->d_slot_ids, eng->d_topk_w, lfm25_expert_cache_pool_gate(ec),
+                          lfm25_expert_cache_pool_up(ec), lfm25_expert_cache_pool_down(ec),
+                          (int)L->ffn_down_exps.info.type, eng->d_moe_act, eng->d_moe_act_q8,
+                          d_x, true, dim, (int)m->expert_ffn_dim,
+                          lfm25_expert_cache_gate_slot_bytes(ec), lfm25_expert_cache_up_slot_bytes(ec),
+                          lfm25_expert_cache_down_slot_bytes(ec));
+        // Enqueued after the FFN so host-side staging work overlaps the GPU compute.
+        if (pred_layer >= 0) lfm25_expert_cache_prefetch(ec, pred_layer, eng->h_moe_ids + 4, eng->prefetch_n);
+    } else {
+        lfm25_gpu_moe_ffn(d_q8_x, eng->d_topk_ids, eng->d_topk_w, L->ffn_gate_exps.dev, L->ffn_up_exps.dev,
+                          L->ffn_down_exps.dev, (int)L->ffn_down_exps.info.type, eng->d_moe_act, eng->d_moe_act_q8,
+                          d_x, true, dim, (int)m->expert_ffn_dim, gs0, us0, ds0);
     }
 }
 
@@ -258,46 +360,7 @@ static void lfm25_enqueue_step(lfm25_engine_t *eng, cudaStream_t stream) {
             // down proj: ffn_dim -> 2048 (Q4_K or Q6_K depending on layer) with accum into residual d_x
             lfm25_gpu_mat_vec(&L->ffn_down, eng->d_q8_ffn_act, eng->d_x, ffn_dim, dim, true);
         } else {
-            // Sparse MoE: sigmoid top-4 router on the normed FP32 input, then in-VRAM expert FFN accumulated into d_x
-            lfm25_gpu_router_top4(eng->d_norm_x, (const float*)L->ffn_gate_inp.dev, (const float*)L->exp_probs_b.dev,
-                                  eng->d_topk_ids, eng->d_topk_w, NULL, dim, (int)m->expert_count);
-            const size_t gs0 = (size_t)m->expert_ffn_dim * ggml_row_size(L->ffn_gate_exps.info.type, dim);
-            const size_t us0 = (size_t)m->expert_ffn_dim * ggml_row_size(L->ffn_up_exps.info.type, dim);
-            const size_t ds0 = (size_t)dim * ggml_row_size(L->ffn_down_exps.info.type, m->expert_ffn_dim);
-            if (eng->expert_cache) {
-                // Cache path. Optionally also run the NEXT MoE layer's router on this layer's normed activations to
-                // predict its experts (selection only), fetch both id sets with one sync, then resolve slots: misses are
-                // uploaded on the cache's copy stream and the FFN stream only waits for the slots it reads.
-                lfm25_expert_cache_t *ec = eng->expert_cache;
-                int pred_layer = -1;
-                if (eng->prefetch && l + 1 < m->block_count && m->layers[l + 1].ffn_type == LFM25_FFN_MOE) {
-                    const lfm25_layer_t *N = &m->layers[l + 1];
-                    lfm25_gpu_router_top4(eng->d_norm_x, (const float*)N->ffn_gate_inp.dev, (const float*)N->exp_probs_b.dev,
-                                          eng->d_pred_ids, eng->d_pred_w, NULL, dim, (int)m->expert_count);
-                    pred_layer = (int)l + 1;
-                }
-                CUDA_CHECK(cudaMemcpyAsync(eng->h_moe_ids, eng->d_topk_ids, 4 * sizeof(int), cudaMemcpyDeviceToHost, stream));
-                if (pred_layer >= 0)
-                    CUDA_CHECK(cudaMemcpyAsync(eng->h_moe_ids + 4, eng->d_pred_ids, 4 * sizeof(int), cudaMemcpyDeviceToHost, stream));
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-                // After this sync every kernel enqueued before this layer's router has finished; only this layer's FFN
-                // (enqueued below) can read slots while the prefetch for the next layer is in flight.
-                lfm25_expert_cache_lookup(ec, (int)l, eng->h_moe_ids, 4, eng->h_slot_ids, stream);
-                // h_slot_ids is pinned and rewritten only after the next layer's sync, i.e. after this copy completed.
-                CUDA_CHECK(cudaMemcpyAsync(eng->d_slot_ids, eng->h_slot_ids, 4 * sizeof(int), cudaMemcpyHostToDevice, stream));
-                lfm25_gpu_moe_ffn(eng->d_q8_x, eng->d_slot_ids, eng->d_topk_w, lfm25_expert_cache_pool_gate(ec),
-                                  lfm25_expert_cache_pool_up(ec), lfm25_expert_cache_pool_down(ec),
-                                  (int)L->ffn_down_exps.info.type, eng->d_moe_act, eng->d_moe_act_q8,
-                                  eng->d_x, true, dim, (int)m->expert_ffn_dim,
-                                  lfm25_expert_cache_gate_slot_bytes(ec), lfm25_expert_cache_up_slot_bytes(ec),
-                                  lfm25_expert_cache_down_slot_bytes(ec));
-                // Enqueued after the FFN so host-side staging work overlaps the GPU compute.
-                if (pred_layer >= 0) lfm25_expert_cache_prefetch(ec, pred_layer, eng->h_moe_ids + 4, eng->prefetch_n);
-            } else {
-                lfm25_gpu_moe_ffn(eng->d_q8_x, eng->d_topk_ids, eng->d_topk_w, L->ffn_gate_exps.dev, L->ffn_up_exps.dev,
-                                  L->ffn_down_exps.dev, (int)L->ffn_down_exps.info.type, eng->d_moe_act, eng->d_moe_act_q8,
-                                  eng->d_x, true, dim, (int)m->expert_ffn_dim, gs0, us0, ds0);
-            }
+            lfm25_enqueue_moe_ffn(eng, stream, l, eng->d_norm_x, eng->d_q8_x, eng->d_x);
         }
     }
 
@@ -312,6 +375,7 @@ static void lfm25_enqueue_step(lfm25_engine_t *eng, cudaStream_t stream) {
 
 int32_t lfm25_engine_forward_token(lfm25_engine_t *eng, int32_t token, int pos) {
     if (!eng || !eng->model) return -1;
+    eng->batch_n = 0;   // a single-token step invalidates the rollback snapshots
     eng->h_tokpos[0] = token;
     eng->h_tokpos[1] = pos;
 
@@ -342,6 +406,182 @@ int32_t lfm25_engine_forward_token(lfm25_engine_t *eng, int32_t token, int pos) 
         tuff_logit_capture(eng->h_logits, eng->model->vocab_size);
     }
     return *eng->h_best;
+}
+
+// -----------------------------------------------------------------------------
+// Batched forward + conv-state rollback (Task 5.1)
+//
+// Weight-streaming matvecs run once for all n tokens (each weight block read once, applied to n activation vectors,
+// per-column arithmetic identical to the single-token kernels). Everything else is the single-token math, per token:
+// RMSNorm+Q8_1, QK-norm+RoPE+KV write, attention (token j attends positions <= pos0+j only), MoE router + experts.
+// ShortConv layers run the recurrence sequentially over the tokens and snapshot the state after every token.
+// Not graphed (the single-token graph path is untouched).
+// -----------------------------------------------------------------------------
+#define LFM25_Q8_BLOCK_BYTES 36
+
+static void lfm25_gpu_mat_vec_batch(const lfm25_tensor_t *t, const void *d_xq8, float *d_dst, int in_dim, int out_dim, bool accum, int nb) {
+    if (t->info.type == GGML_TYPE_Q6_K) {
+        lfm25_gpu_mmvq_q6_K_batch(t->dev, d_xq8, d_dst, in_dim, out_dim, accum, nb);
+    } else {
+        lfm25_gpu_mmvq_q4_K_batch(t->dev, d_xq8, d_dst, in_dim, out_dim, accum, nb);
+    }
+}
+
+int lfm25_engine_forward_batch(lfm25_engine_t *eng, const int32_t *tokens, int n, int pos0, int32_t *argmax_out, float *logits_out) {
+    if (!eng || !eng->model || !tokens || !argmax_out || n < 1 || n > LFM25_MAX_BATCH || pos0 < 0 ||
+        pos0 + n > eng->max_context_len) return -1;
+    lfm25_model_t *m = eng->model;
+    const int dim = (int)m->embedding_length;
+    const float eps = m->rms_norm_eps;
+    const int ffn_dim = (int)m->ffn_dim;
+    const int qdim = (int)m->head_count * (int)m->head_dim;
+    const int kvdim = (int)m->head_count_kv * (int)m->head_dim;
+    const int vocab = (int)m->vocab_size;
+    const size_t q8x_tok = (size_t)(dim / 32) * LFM25_Q8_BLOCK_BYTES;
+    cudaStream_t stream = eng->graph_enabled ? eng->stream : 0;
+    lfm25_gpu_set_stream(stream);
+    eng->batch_n = 0;
+
+    for (int j = 0; j < n; ++j) {
+        eng->h_btokpos[2 * j + 0] = tokens[j];
+        eng->h_btokpos[2 * j + 1] = pos0 + j;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(eng->d_btokpos, eng->h_btokpos, (size_t)2 * n * sizeof(int), cudaMemcpyHostToDevice, stream));
+    const int *bpos = eng->d_btokpos + 1;   // position of token j is bpos[2*j]
+
+    for (int j = 0; j < n; ++j)
+        lfm25_gpu_embed(eng->d_btokpos + 2 * j, eng->d_bx + (size_t)j * dim, &m->token_embd, dim);
+
+    int conv_idx = 0;
+    int attn_idx = 0;
+    for (uint32_t l = 0; l < m->block_count; ++l) {
+        lfm25_layer_t *L = &m->layers[l];
+
+        for (int j = 0; j < n; ++j)
+            lfm25_gpu_fused_rms_norm_quant(eng->d_bx + (size_t)j * dim, (const float*)L->attn_norm.dev, eng->d_bnorm + (size_t)j * dim,
+                                           (char*)eng->d_bq8_x + j * q8x_tok, dim, eps);
+
+        if (L->op_type == LFM25_OP_CONV) {
+            float *conv_state_ptr = eng->d_conv_state + (size_t)conv_idx * (2 * dim);
+            float *snap_ptr = eng->d_conv_snap + (size_t)conv_idx * LFM25_MAX_BATCH * (2 * dim);
+            lfm25_gpu_mat_vec_batch(&L->shortconv_in_proj, eng->d_bq8_x, eng->d_bin_proj, dim, 3 * dim, false, n);
+            lfm25_gpu_shortconv_seq(eng->d_bin_proj, conv_state_ptr, snap_ptr, (const float*)L->shortconv_conv.dev, eng->d_bq8_op, dim, n);
+            lfm25_gpu_mmvq_q4_K_batch(L->shortconv_out_proj.dev, eng->d_bq8_op, eng->d_bx, dim, dim, true, n);
+            conv_idx++;
+        } else {
+            lfm25_gpu_mmvq_q4_K_batch(L->attn_q.dev, eng->d_bq8_x, eng->d_bq, dim, qdim, false, n);
+            lfm25_gpu_mmvq_q4_K_batch(L->attn_k.dev, eng->d_bq8_x, eng->d_bk, dim, kvdim, false, n);
+            lfm25_gpu_mat_vec_batch(&L->attn_v, eng->d_bq8_x, eng->d_bv, dim, kvdim, false, n);
+
+            // K/V of all n tokens are written to their own positions before any attention runs.
+            for (int j = 0; j < n; ++j) {
+                const int *rpos = bpos + 2 * j;
+                lfm25_gpu_qk_norm_rope(eng->d_bq + (size_t)j * qdim, eng->d_bk + (size_t)j * kvdim,
+                                       (const float*)L->attn_q_norm.dev, (const float*)L->attn_k_norm.dev,
+                                       eng->d_k_cache, (int)m->head_count, (int)m->head_count_kv, (int)m->head_dim,
+                                       rpos, eng->max_context_len, m->rope_freq_base, eps, attn_idx);
+                lfm25_gpu_v_cache_write(eng->d_bv + (size_t)j * kvdim, eng->d_v_cache, (int)m->head_count_kv, (int)m->head_dim,
+                                        rpos, eng->max_context_len, attn_idx);
+            }
+            // Token j attends positions <= pos0+j (the kernel's own causal bound), so it never sees token j+1's K/V.
+            for (int j = 0; j < n; ++j) {
+                const int *apos = bpos + 2 * j;
+                lfm25_gpu_attention(eng->d_bq + (size_t)j * qdim, eng->d_k_cache, eng->d_v_cache, eng->d_bop_out + (size_t)j * dim,
+                                    (char*)eng->d_bq8_op + j * q8x_tok, (int)m->head_count, (int)m->head_count_kv,
+                                    (int)m->head_dim, apos, eng->max_context_len, attn_idx);
+            }
+            lfm25_gpu_mmvq_q4_K_batch(L->attn_output.dev, eng->d_bq8_op, eng->d_bx, dim, dim, true, n);
+            attn_idx++;
+        }
+
+        for (int j = 0; j < n; ++j)
+            lfm25_gpu_fused_rms_norm_quant(eng->d_bx + (size_t)j * dim, (const float*)L->ffn_norm.dev, eng->d_bnorm + (size_t)j * dim,
+                                           (char*)eng->d_bq8_x + j * q8x_tok, dim, eps);
+
+        if (L->ffn_type == LFM25_FFN_DENSE) {
+            lfm25_gpu_fused_swiglu_batch(L->ffn_gate.dev, L->ffn_up.dev, eng->d_bq8_x, eng->d_bffn_act, eng->d_bq8_ffn, dim, ffn_dim, n);
+            lfm25_gpu_mat_vec_batch(&L->ffn_down, eng->d_bq8_ffn, eng->d_bx, ffn_dim, dim, true, n);
+        } else {
+            // Router + experts per token with the single-token calls (cache path: per-layer lookup per token).
+            for (int j = 0; j < n; ++j)
+                lfm25_enqueue_moe_ffn(eng, stream, l, eng->d_bnorm + (size_t)j * dim, (char*)eng->d_bq8_x + j * q8x_tok,
+                                      eng->d_bx + (size_t)j * dim);
+        }
+    }
+
+    lfm25_gpu_output_norm_head_argmax_batch(eng->d_bx, (const float*)m->token_embd_norm.dev, m->output_weight.dev,
+                                            eng->d_bq8_x, eng->d_blogits, eng->d_bblock_max, eng->d_bblock_idx, eng->d_bbest,
+                                            dim, vocab, eps, n);
+    CUDA_CHECK(cudaMemcpyAsync(eng->h_bbest, eng->d_bbest, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (logits_out) {
+        CUDA_CHECK(cudaMemcpy(logits_out, eng->d_blogits, (size_t)n * vocab * sizeof(float), cudaMemcpyDeviceToHost));
+    }
+    for (int j = 0; j < n; ++j) argmax_out[j] = eng->h_bbest[j];
+    eng->batch_n = n;
+    return 0;
+}
+
+int lfm25_engine_rollback(lfm25_engine_t *eng, int n_keep) {
+    if (!eng || !eng->model || n_keep < 1 || n_keep > eng->batch_n) return -1;
+    // The live conv state already is "after all batch_n tokens" (the sequential kernel leaves it there); only a
+    // shorter keep needs the snapshot after token n_keep-1 copied back (one 2D copy over all conv layers).
+    if (n_keep < eng->batch_n && eng->model->n_conv_layers > 0) {
+        cudaStream_t stream = eng->graph_enabled ? eng->stream : 0;
+        lfm25_gpu_set_stream(stream);
+        const int dim = (int)eng->model->embedding_length;
+        lfm25_gpu_conv_state_restore(eng->d_conv_state, eng->d_conv_snap, (int)eng->model->n_conv_layers, n_keep - 1, dim,
+                                     (size_t)LFM25_MAX_BATCH * 2 * dim);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    eng->batch_n = n_keep;   // slots [0, n_keep) stay valid, so a further (shorter) rollback is still exact
+    return 0;
+}
+
+static double lfm25_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec * 1e-6;
+}
+
+// LFM25_BENCH_BATCH=1: wall time of forward_batch(n) vs n x forward_token for n = 1,2,4,8 (LFM25_BENCH_REPS, default 20).
+// Runs at engine init, then resets the conv state; the KV cache needs no reset (positions are overwritten).
+static void lfm25_bench_batch(lfm25_engine_t *eng) {
+    const char *rs = getenv("LFM25_BENCH_REPS");
+    int reps = rs && *rs ? atoi(rs) : 20;
+    if (reps < 1) reps = 1;
+    const int ns[4] = {1, 2, 4, 8};
+    const int base = 8, warm = 3;
+    int32_t toks[LFM25_MAX_BATCH], am[LFM25_MAX_BATCH];
+    uint32_t vocab = eng->model->vocab_size;
+    fprintf(stderr, "[BENCH-BATCH] reps=%d (+%d warmup), ctx pos %d.., ungraphed batch vs %s single-token\n", reps, warm, base,
+            eng->graph_enabled ? "graphed" : "ungraphed");
+    for (int ni = 0; ni < 4; ++ni) {
+        const int n = ns[ni];
+        double t_batch = 0.0, t_single = 0.0;
+        for (int r = -warm; r < reps; ++r) {
+            for (int j = 0; j < n; ++j) toks[j] = (int32_t)(1000u + (uint32_t)((r + warm) * 7919 + j * 104729) % (vocab - 2000u));
+            // Alternate which variant goes first so neither systematically benefits from the other's expert-cache warming.
+            double tb = 0.0, ts = 0.0;
+            for (int phase = 0; phase < 2; ++phase) {
+                double t0 = lfm25_now_ms();
+                if (((r & 1) == 0) == (phase == 0)) {
+                    if (lfm25_engine_forward_batch(eng, toks, n, base, am, NULL) != 0) { fprintf(stderr, "[BENCH-BATCH] forward_batch failed\n"); return; }
+                    tb = lfm25_now_ms() - t0;
+                } else {
+                    for (int j = 0; j < n; ++j) lfm25_engine_forward_token(eng, toks[j], base + j);
+                    ts = lfm25_now_ms() - t0;
+                }
+            }
+            if (r >= 0) { t_batch += tb; t_single += ts; }
+        }
+        t_batch /= reps; t_single /= reps;
+        fprintf(stderr, "[BENCH-BATCH] n=%d  forward_batch %8.3f ms (%.3f ms/tok)   n x forward_token %8.3f ms (%.3f ms/tok)   batch/single %.2f\n",
+                n, t_batch, t_batch / n, t_single, t_single / n, t_batch / t_single);
+    }
+    if (eng->d_conv_state)
+        CUDA_CHECK(cudaMemset(eng->d_conv_state, 0, (size_t)eng->model->n_conv_layers * eng->model->conv_state_len * eng->model->embedding_length * sizeof(float)));
+    eng->batch_n = 0;
 }
 
 // -----------------------------------------------------------------------------
@@ -402,6 +642,15 @@ static int32_t vtable_lfm25_engine_forward_token(void *engine, int32_t token, in
     return lfm25_engine_forward_token((lfm25_engine_t*)engine, token, pos);
 }
 
+static int vtable_lfm25_engine_forward_batch(void *engine, const int32_t *tokens, int n, int pos0,
+                                             int32_t *argmax_out, float *logits_out) {
+    return lfm25_engine_forward_batch((lfm25_engine_t*)engine, tokens, n, pos0, argmax_out, logits_out);
+}
+
+static int vtable_lfm25_engine_rollback(void *engine, int n_keep) {
+    return lfm25_engine_rollback((lfm25_engine_t*)engine, n_keep);
+}
+
 const engine_vtable_t lfm25_engine_vtable = {
     .arch                   = TUFF_ARCH_LFM2,
     .name                   = "lfm25",
@@ -418,4 +667,6 @@ const engine_vtable_t lfm25_engine_vtable = {
     .engine_free            = vtable_lfm25_engine_free,
     .engine_set_sampler     = vtable_lfm25_engine_set_sampler,
     .engine_forward_token   = vtable_lfm25_engine_forward_token,
+    .engine_forward_batch   = vtable_lfm25_engine_forward_batch,
+    .engine_rollback        = vtable_lfm25_engine_rollback,
 };

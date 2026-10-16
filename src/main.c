@@ -16,6 +16,8 @@
 #include <omp.h>
 #include <sys/resource.h>
 
+#define TF_MAX_BATCH 8   // == LFM25_MAX_BATCH
+
 static void print_usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s --model <path_to_gguf> [options]\n"
@@ -28,6 +30,8 @@ static void print_usage(const char *prog) {
         "  -n <tokens>                 number of tokens to generate (default: 128)\n"
         "  --warmup <tokens>           warmup tokens (default: 32)\n"
         "  --runs <n>                  benchmark runs (default: 3)\n"
+        "  --tf-batch <B>              with --teacher-force: feed the reference in chunks of B tokens (LFM2.5 batched forward)\n"
+        "  --tf-rollback               with --tf-batch B>=2: roll back to 1+(chunk%%B) tokens after every chunk and re-feed\n"
         "\n"
         "Interactive TUI Chat Options:\n"
         "  --chat, -i, --interactive   launch interactive terminal chat mode\n"
@@ -168,6 +172,8 @@ int main(int argc, char **argv) {
     sampler_params_t sampler_params = sampler_params_default();
 
     const char *teacher_force_path = NULL; // non-NULL => --teacher-force mode
+    int tf_batch = 1;                      // --tf-batch B: teacher-force in chunks of B tokens through engine_forward_batch
+    bool tf_rollback = false;              // --tf-rollback: after each chunk roll back to 1 + (chunk % B) tokens and re-feed
 
     const char *kvq_env = getenv("TUFF_KV_QUANT");
     if (kvq_env && kvq_env[0] != '\0') {
@@ -318,6 +324,14 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Error: --kv-quant must be f32, q8_0, or q4_0 (got '%s')\n", s);
                 return 2;
             }
+        } else if (strcmp(argv[i], "--tf-batch") == 0 && i + 1 < argc) {
+            tf_batch = atoi(argv[++i]);
+            if (tf_batch < 1 || tf_batch > TF_MAX_BATCH) {
+                fprintf(stderr, "Error: --tf-batch must be 1..%d\n", TF_MAX_BATCH);
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--tf-rollback") == 0) {
+            tf_rollback = true;
         } else if (strcmp(argv[i], "--teacher-force") == 0 && i + 1 < argc) {
             teacher_force_path = argv[++i];
         } else if (strcmp(argv[i], "--teacher-force") == 0) {
@@ -531,6 +545,117 @@ int main(int argc, char **argv) {
 
         void *eng = vtable->engine_init(model, max_context_len);
         vtable->engine_set_sampler(eng, &sampler_params);
+
+        if (tf_rollback && tf_batch < 2) {
+            fprintf(stderr, "[Tuff] FATAL: --tf-rollback requires --tf-batch >= 2\n");
+            vtable->engine_free(eng);
+            tokenizer_free(tok);
+            vtable->gpu_shutdown(model);
+            vtable->model_free(model);
+            return 2;
+        }
+        if (tf_batch > 1) {
+            if (!vtable->engine_forward_batch || (tf_rollback && !vtable->engine_rollback)) {
+                fprintf(stderr, "[Tuff] FATAL: --tf-batch/--tf-rollback are not supported by the %s engine\n", vtable->name);
+                vtable->engine_free(eng);
+                if (tf_dump) { fclose(tf_dump); remove(dump_logits_path); }
+                tokenizer_free(tok);
+                vtable->gpu_shutdown(model);
+                vtable->model_free(model);
+                return 2;
+            }
+            // Chunked teacher forcing. The token stream is prompt ++ reference[0..target_steps); the logits row computed
+            // for stream position q selected reference step i = q - (n_prompt - 1), exactly as in the single-token loop.
+            // Each chunk is run through forward_batch; with --tf-rollback the engine is then rolled back to
+            // n_keep = 1 + (chunk_index % B) (clamped to the chunk length) and the next chunk starts at p + n_keep, so the
+            // tail positions are computed again. Rows are consumed only for the n_keep accepted positions, i.e. every
+            // dumped row is the one from the LAST time its position was computed, in stream order.
+            int total = n_prompt + target_steps;
+            int32_t *seq = (int32_t*)malloc((size_t)total * sizeof(int32_t));
+            float *rows = (float*)malloc((size_t)tf_batch * tf_vocab * sizeof(float));
+            if (!seq || !rows) { fprintf(stderr, "[Tuff] FATAL: out of memory\n"); return 2; }
+            for (int q = 0; q < n_prompt; ++q) seq[q] = prompt_tokens[q];
+            for (int q = 0; q < target_steps; ++q) seq[n_prompt + q] = ref_tokens[q];
+
+            int matches = 0, first_divergence = -1, dump_ok = 1, n_batches = 0, n_rollbacks = 0;
+            int p = 0, chunk = 0;
+            while (p < total) {
+                int n = total - p < tf_batch ? total - p : tf_batch;
+                int32_t am[TF_MAX_BATCH];
+                if (vtable->engine_forward_batch(eng, seq + p, n, p, am, rows) != 0) {
+                    fprintf(stderr, "[Tuff] FATAL: engine_forward_batch failed at position %d (n=%d)\n", p, n);
+                    return 3;
+                }
+                n_batches++;
+                int keep = n;
+                if (tf_rollback) {
+                    keep = 1 + (chunk % tf_batch);
+                    if (keep > n) keep = n;
+                    if (vtable->engine_rollback(eng, keep) != 0) {
+                        fprintf(stderr, "[Tuff] FATAL: engine_rollback(%d) failed at position %d\n", keep, p);
+                        return 3;
+                    }
+                    if (keep < n) n_rollbacks++;
+                }
+                for (int j = 0; j < keep; ++j) {
+                    int i = p + j - (n_prompt - 1);
+                    if (i < 0 || i >= target_steps) continue;
+                    const float *lg = rows + (size_t)j * tf_vocab;
+                    int32_t expected = ref_tokens[i];
+                    int32_t pred_token = am[j];
+                    if (tf_dump && dump_ok) {
+                        if (fwrite(lg, sizeof(float), tf_vocab, tf_dump) != tf_vocab) dump_ok = 0;
+                        else tf_written++;
+                    }
+                    if (pred_token == expected) {
+                        matches++;
+                    } else {
+                        if (first_divergence < 0) first_divergence = i;
+                        char exp_piece[128];
+                        snprintf(exp_piece, sizeof exp_piece, "%s", tokenizer_decode(tok, expected));
+                        fprintf(stderr, "[TEACHER-FORCING] Mismatch at step %d: expected %d (%s, logit=%.4f), got %d (%s, logit=%.4f), diff=%.6f\n",
+                                i, expected, exp_piece, lg[expected], pred_token, tokenizer_decode(tok, pred_token), lg[pred_token],
+                                lg[pred_token] - lg[expected]);
+                    }
+                }
+                p += keep;
+                chunk++;
+            }
+            free(seq);
+            free(rows);
+            fprintf(stderr, "[Tuff] --tf-batch %d%s: %d batches, %d rollbacks\n", tf_batch, tf_rollback ? " --tf-rollback" : "",
+                    n_batches, n_rollbacks);
+
+            if (tf_dump) {
+                if (dump_ok && (fseek(tf_dump, 8, SEEK_SET) != 0 ||
+                                fwrite(&tf_written, sizeof(uint32_t), 1, tf_dump) != 1)) dump_ok = 0;
+                if (fclose(tf_dump) != 0) dump_ok = 0;
+                if (!dump_ok) {
+                    fprintf(stderr, "[Tuff] FATAL: failed writing teacher-forced logits to %s; removing it\n", dump_logits_path);
+                    remove(dump_logits_path);
+                    vtable->engine_free(eng);
+                    tokenizer_free(tok);
+                    vtable->gpu_shutdown(model);
+                    vtable->model_free(model);
+                    return 3;
+                }
+                fprintf(stderr, "[Tuff] wrote %u x %u teacher-forced logits to %s\n", tf_written, tf_vocab, dump_logits_path);
+            }
+            fprintf(stderr, "\n========================================================================\n");
+            fprintf(stderr, " Teacher-Forced Verification Result: %d / %d (%.2f%%) top-1 agreement\n",
+                    matches, target_steps, 100.0 * (double)matches / (double)target_steps);
+            if (matches == target_steps) {
+                fprintf(stderr, " [TEACHER-FORCING] PASS: 100%% per-step agreement over %d tokens\n", target_steps);
+            } else {
+                fprintf(stderr, " [TEACHER-FORCING] FAIL: first mismatch at step %d\n", first_divergence);
+            }
+            fprintf(stderr, "========================================================================\n");
+            vtable->engine_free(eng);
+            tokenizer_free(tok);
+            vtable->gpu_shutdown(model);
+            vtable->model_free(model);
+            return (matches == target_steps) ? 0 : 1;
+        }
 
         // Armed before the prompt so the vector that selected step 0 is captured too.
         tuff_logit_capture_enable(1);

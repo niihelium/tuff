@@ -251,9 +251,12 @@ Usable VRAM: **~7,880 MiB**
 ### Phase 5: Speculative Decoding Adaptations
 **Objective**: Lossless acceleration tailored to LFM's hybrid architecture.
 
-- [ ] **Task 5.1: Fast Rolling Ring-Buffer Rollback**
+- [x] **Task 5.1: Fast Rolling Ring-Buffer Rollback**
   - Conv rolling state is only $2 \times 2048$ floats (16 KiB/layer).
   - State rollback after draft token rejection is an $O(1)$ pointer/memcpy operation.
+  - Done: `lfm25_engine_forward_batch(tokens, n ≤ 8, pos0)` (optional vtable entry) + `lfm25_engine_rollback(n_keep)`. Batched Q4_K/Q6_K dense MMVQ, fused SwiGLU and Q6_K head kernels read each weight block once for all columns, with per-(row, column) accumulation order identical to the single-token kernels. Per-token ops (norm, RoPE, KV write, causal attention ≤ pos0+j, MoE router/FFN) run per token. Conv: batched in_proj, then a strictly sequential per-channel recurrence writing per-token state snapshots `d_conv_snap[layer][B][2d]`. Rollback = one `cudaMemcpy2DAsync` of snapshot n_keep−1; KV is position-based and needs none.
+  - **Byte-identical**: new golden configs `--tf-batch 4` (dense, moe8, moe), `--tf-batch 8 --tf-rollback` (dense), `--tf-batch 4 --tf-rollback` with an 8B 300 MB forced cache all reproduce the existing goldens (B = 2, 3, 5, 7 also `cmp`-identical on dense). `verify_lfm25_all.sh --controls` ALL PASS with 12/12 controls, including the new `batch-attn-sees-next-token` and `rollback-off-by-one`. memcheck 0/0 (1.2B, 8B), racecheck 0 hazards. Single-token path unchanged (A/B 1.2B 0.00 %, 8B +0.05 %, CI ∋ 0).
+  - Verify cost `forward_batch(n)` / (n × graphed single): 1.2B n=2 0.64, n=4 **0.49** (4 tokens ≈ 1.9× one token), n=8 0.47; 8B 0.90 / 0.84 / 0.83; 24B 0.89 / 0.85 / 0.95. On the MoE models the experts run per token, so only the trunk is shared.
 - [ ] **Task 5.2: Speculative Suite & Acceptance Rate Benchmark**
   - Run `scripts/bench_ngram_suite.sh` on LFM2.5.
   - Target: **$\ge 110 - 125$ tok/s** decode speed.

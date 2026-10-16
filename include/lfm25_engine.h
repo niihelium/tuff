@@ -72,6 +72,24 @@ typedef struct {
     cudaGraphExec_t graph_exec;
     int graph_enabled;       // eligible and not disabled by LFM25_CUDA_GRAPH=0
 
+    // Batched forward (speculative-decoding verification, Task 5.1). Token-major [LFM25_MAX_BATCH][...] scratch.
+    float *d_bx;             // [B * d] residual streams
+    float *d_bnorm;          // [B * d] normed input (router)
+    float *d_bin_proj;       // [B * 3d]
+    float *d_bq, *d_bk, *d_bv;           // [B * n_head*head_dim], [B * n_head_kv*head_dim] x2
+    float *d_bop_out;        // [B * d] attention output (float copy)
+    float *d_bffn_act;       // [B * ffn_dim]
+    void  *d_bq8_x, *d_bq8_op, *d_bq8_ffn;   // block_q8_1 per token
+    float *d_blogits;        // [B * vocab]
+    float *d_bblock_max;     // [B * ceil(vocab/4)]
+    int   *d_bblock_idx;     // [B * ceil(vocab/4)]
+    int   *d_bbest;          // [B]
+    int   *d_btokpos;        // [(B+1) * 2] (token,pos) pairs; one spare pair so pos pointers never run off the end
+    int   *h_btokpos;        // pinned copy of d_btokpos
+    int   *h_bbest;          // pinned [B]
+    float *d_conv_snap;      // [n_conv_layers][B][2d] conv state after each token of the last batch (rollback source)
+    int    batch_n;          // tokens in the last forward_batch (0 = no rollback possible)
+
     // Sampler
     sampler_params_t sampler;
 } lfm25_engine_t;
@@ -95,6 +113,14 @@ void lfm25_gpu_fused_swiglu(const void *dev_gate, const void *dev_up, const void
 void lfm25_gpu_output_norm_head_argmax(const float *d_res_x, const float *d_norm_w, const void *dev_output_w, void *d_xq8, float *d_logits, float *d_block_max, int *d_block_idx, int *d_best_token, int dim, int vocab_size, float eps);
 void lfm25_gpu_router_top4(const float *d_x, const float *d_w_gate_inp, const float *d_bias, int *d_topk_ids, float *d_topk_w, float *d_logits /* nullable */, int dim, int n_expert);
 void lfm25_gpu_quantize_q8_1(const float *d_x, void *d_q8, int n);
+// Batched (multi-token) launchers for speculative-decoding verification; column b is bit-identical to the single-token kernel.
+#define LFM25_MAX_BATCH 8
+void lfm25_gpu_mmvq_q4_K_batch(const void *dev_w, const void *d_xq8, float *d_dst, int in_dim, int out_dim, bool accum, int nb);
+void lfm25_gpu_mmvq_q6_K_batch(const void *dev_w, const void *d_xq8, float *d_dst, int in_dim, int out_dim, bool accum, int nb);
+void lfm25_gpu_fused_swiglu_batch(const void *dev_gate, const void *dev_up, const void *d_xq8, float *d_act, void *d_act_q8, int in_dim, int ffn_dim, int nb);
+void lfm25_gpu_shortconv_seq(const float *d_in_proj, float *d_conv_state, float *d_snap, const float *d_conv_w, void *d_conv_out_q8, int d, int nb);
+void lfm25_gpu_conv_state_restore(float *d_conv_state, const float *d_snap, int n_layers, int slot, int d, size_t snap_layer_stride);
+void lfm25_gpu_output_norm_head_argmax_batch(const float *d_res_x, const float *d_norm_w, const void *dev_output_w, void *d_xq8, float *d_logits, float *d_block_max, int *d_block_idx, int *d_best_token, int dim, int vocab_size, float eps, int nb);
 void lfm25_gpu_moe_ffn(const void *d_xq8, const int *d_topk_ids, const float *d_topk_w, const void *dev_gate_exps, const void *dev_up_exps, const void *dev_down_exps, int down_type, float *d_act /* [4*ffn_dim] */, void *d_act_q8 /* [4*ffn_dim/32] block_q8_1 */, float *d_dst, bool accum, int dim, int ffn_dim, size_t gate_stride, size_t up_stride, size_t down_stride /* bytes per expert / slot */);
 
 // Engine lifecycle
@@ -102,6 +128,13 @@ lfm25_engine_t* lfm25_engine_init(lfm25_model_t *model, int max_context_len);
 void            lfm25_engine_free(lfm25_engine_t *eng);
 void            lfm25_engine_set_sampler(lfm25_engine_t *eng, const sampler_params_t *params);
 int32_t         lfm25_engine_forward_token(lfm25_engine_t *eng, int32_t token, int pos);
+// Process tokens[0..n) at positions pos0..pos0+n-1 exactly as n consecutive forward_token calls would (bit-identical
+// logits) and return every position's greedy argmax (+ host logits [n*vocab] if logits_out != NULL). 1 <= n <= LFM25_MAX_BATCH.
+// Returns 0 on success, -1 on invalid arguments. The engine state afterwards is "all n tokens processed".
+int             lfm25_engine_forward_batch(lfm25_engine_t *eng, const int32_t *tokens, int n, int pos0, int32_t *argmax_out, float *logits_out);
+// After a forward_batch of n tokens: make the state equal to having processed only the first n_keep (1 <= n_keep <= n).
+// Conv states come from per-position snapshots; KV entries beyond are overwritten later. Returns 0 / -1.
+int             lfm25_engine_rollback(lfm25_engine_t *eng, int n_keep);
 
 #ifdef __cplusplus
 }

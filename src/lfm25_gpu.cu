@@ -738,6 +738,364 @@ __global__ void lfm_embed_q6_K_kernel(const uint8_t * __restrict__ base, const i
     y[blockIdx.x * QK_K + e] = __fmul_rn(__fmul_rn(d, (float)sc[(l >> 4) + 2 * g]), (float)(int8_t)q);
 }
 
+// =============================================================================
+// Batched (multi-token) variants for speculative-decoding verification (Task 5.1).
+//
+// Contract: for every (row, column b) the arithmetic is exactly the single-token kernel's - the same lane-level
+// accumulation `tmp += dot(block kbx, y_b, kqs)` over the same kbx in the same order, then the same
+// warp_reduce_sum_f, then the same store - so column b is bit-identical to a single-token launch on y_b.
+// What changes is only that each weight block is loaded once per lane and applied to all NB activation vectors.
+// The weight-only part of each dot product is split out (wpart) from the activation part; the arithmetic
+// expressions are copied verbatim from vec_dot_q4_K_q8_1_c / vec_dot_q6_K_q8_1_c.
+// =============================================================================
+struct q4k_wpart {
+    int     v0i[QR4_K];     // low/high-nibble ints of the two 32-bit weight words, per sub-block i
+    int     v1i[QR4_K];
+    uint8_t sc[QR4_K];
+    uint8_t m[QR4_K];
+    float   d, dmin;
+    int     bq8_offset;
+};
+
+static __device__ __forceinline__ void q4k_load_w(const block_q4_K * __restrict__ bq4_K, int iqs, q4k_wpart &w) {
+    int v[2];
+    const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
+    const int *q4 = (const int *)(bq4_K->qs + 16*bq8_offset + 4*((iqs/2)%4));
+    v[0] = q4[0];
+    v[1] = q4[4];
+
+    const uint16_t *scales = (const uint16_t *)bq4_K->scales;
+    uint16_t aux[2];
+    const int j = bq8_offset/2;
+    if (j < 2) {
+        aux[0] = scales[j+0] & 0x3f3f;
+        aux[1] = scales[j+2] & 0x3f3f;
+    } else {
+        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
+        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
+    }
+    const uint8_t *sc = (const uint8_t *)aux;
+    const uint8_t *m  = sc + 2;
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        w.v0i[i] = (v[0] >> (4*i)) & 0x0F0F0F0F;
+        w.v1i[i] = (v[1] >> (4*i)) & 0x0F0F0F0F;
+        w.sc[i] = sc[i];
+        w.m[i]  = m[i];
+    }
+    w.d = h2f(bq4_K->d);
+    w.dmin = h2f(bq4_K->dmin);
+    w.bq8_offset = bq8_offset;
+}
+
+static __device__ __forceinline__ float q4k_dot_y(const q4k_wpart &w, const block_q8_1_c * __restrict__ bq8_1, int iqs) {
+    int   u[2*QR4_K];
+    float d8[QR4_K];
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        const block_q8_1_c *bq8i = bq8_1 + w.bq8_offset + i;
+        d8[i] = __low2float(bq8i->ds);
+        const int *q8 = (const int *)bq8i->qs + ((iqs/2)%4);
+        u[2*i+0] = q8[0];
+        u[2*i+1] = q8[4];
+    }
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        const int dot1 = __dp4a(w.v1i[i], u[2*i+1], __dp4a(w.v0i[i], u[2*i+0], 0));
+        const int dot2 = __dp4a(0x01010101, u[2*i+1], __dp4a(0x01010101, u[2*i+0], 0));
+        sumf_d += d8[i] * (dot1 * w.sc[i]);
+        sumf_m += d8[i] * (dot2 * w.m[i]);
+    }
+    return w.d*sumf_d - w.dmin*sumf_m;
+}
+
+struct q6k_wpart {
+    int   vi[QR6_K];
+    int   sc[QR6_K];
+    float d;
+    int   bq8_offset;
+};
+
+static __device__ __forceinline__ void q6k_load_w(const block_q6_K * __restrict__ bq6_K, int iqs, q6k_wpart &w) {
+    const int bq8_offset   = 2*QR6_K*(iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
+    const int scale_offset = (QI6_K/4)*(iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
+    const int vh_shift     = 2*((iqs % (QI6_K/2)) / (QI6_K/4));
+
+    const int vl = get_int_b2_c(bq6_K->ql, iqs);
+    const int vh = get_int_b2_c(bq6_K->qh, (QI6_K/4)*(iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
+
+    const int8_t *scales = bq6_K->scales + scale_offset;
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+        w.sc[i] = scales[4*i];
+        const int vil = (vl >> (4*i)) & 0x0F0F0F0F;
+        const int vih = ((vh >> (4*i)) << 4) & 0x30303030;
+        w.vi[i] = __vsubss4((vil | vih), 0x20202020);
+    }
+    w.d = h2f(bq6_K->d);
+    w.bq8_offset = bq8_offset;
+}
+
+static __device__ __forceinline__ float q6k_dot_y(const q6k_wpart &w, const block_q8_1_c * __restrict__ bq8_1, int iqs) {
+    int   u[QR6_K];
+    float d8[QR6_K];
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+        u[i]  = get_int_b4_c(bq8_1[w.bq8_offset + 2*i].qs, iqs % QI8_1);
+        d8[i] = __low2float(bq8_1[w.bq8_offset + 2*i].ds);
+    }
+    float sumf = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+        sumf += d8[i] * (__dp4a(w.vi[i], u[i], 0) * w.sc[i]);
+    }
+    return w.d * sumf;
+}
+
+// y: NB activation vectors, vector b at y + b*y_stride (in q8_1 blocks); dst: column b at dst + b*out_dim.
+template <int NB, int rows_per_block, bool accum>
+__launch_bounds__(rows_per_block * 32, 1)
+__global__ void lfm_mmvq_q4_K_batch_kernel(
+        const block_q4_K * __restrict__ w,
+        const block_q8_1_c * __restrict__ y,
+        float * __restrict__ dst,
+        int out_dim, int nblk, int y_stride) {
+    constexpr int vdr = VDR_Q4_K_Q8_1_MMVQ;
+    constexpr int tpsb = QI4_K / vdr;
+    constexpr int blocks_per_iter = vdr * 32 / QI4_K;
+
+    const int row = blockIdx.x * rows_per_block + threadIdx.y;
+    if (row >= out_dim) return;
+
+    const block_q4_K * __restrict__ rw = w + (size_t)row * nblk;
+    const int kqs = vdr * (threadIdx.x % tpsb);
+    float tmp[NB];
+#pragma unroll
+    for (int b = 0; b < NB; ++b) tmp[b] = 0.0f;
+#pragma unroll 4
+    for (int kbx = threadIdx.x / tpsb; kbx < nblk; kbx += blocks_per_iter) {
+        q4k_wpart wp;
+        q4k_load_w(rw + kbx, kqs, wp);
+#pragma unroll
+        for (int b = 0; b < NB; ++b) {
+            tmp[b] += q4k_dot_y(wp, y + (size_t)b * y_stride + kbx * (QK_K / QK8_1), kqs);
+        }
+    }
+#pragma unroll
+    for (int b = 0; b < NB; ++b) {
+        const float t = warp_reduce_sum_f(tmp[b]);
+        if (threadIdx.x == 0) {
+            if (accum) dst[(size_t)b * out_dim + row] += t;
+            else       dst[(size_t)b * out_dim + row]  = t;
+        }
+    }
+}
+
+template <int NB, int rows_per_block, bool accum>
+__launch_bounds__(rows_per_block * 32, 1)
+__global__ void lfm_mmvq_q6_K_batch_kernel(
+        const block_q6_K * __restrict__ w,
+        const block_q8_1_c * __restrict__ y,
+        float * __restrict__ dst,
+        int out_dim, int nblk, int y_stride) {
+    constexpr int vdr = VDR_Q6_K_Q8_1_MMVQ;
+    constexpr int tpsb = QI6_K / vdr;
+    constexpr int blocks_per_iter = vdr * 32 / QI6_K;
+
+    const int row = blockIdx.x * rows_per_block + threadIdx.y;
+    if (row >= out_dim) return;
+
+    const block_q6_K * __restrict__ rw = w + (size_t)row * nblk;
+    const int kqs = vdr * (threadIdx.x % tpsb);
+    float tmp[NB];
+#pragma unroll
+    for (int b = 0; b < NB; ++b) tmp[b] = 0.0f;
+#pragma unroll 16
+    for (int kbx = threadIdx.x / tpsb; kbx < nblk; kbx += blocks_per_iter) {
+        q6k_wpart wp;
+        q6k_load_w(rw + kbx, kqs, wp);
+#pragma unroll
+        for (int b = 0; b < NB; ++b) {
+            tmp[b] += q6k_dot_y(wp, y + (size_t)b * y_stride + kbx * (QK_K / QK8_1), kqs);
+        }
+    }
+#pragma unroll
+    for (int b = 0; b < NB; ++b) {
+        const float t = warp_reduce_sum_f(tmp[b]);
+        if (threadIdx.x == 0) {
+            if (accum) dst[(size_t)b * out_dim + row] += t;
+            else       dst[(size_t)b * out_dim + row]  = t;
+        }
+    }
+}
+
+// Fused gate+up with SwiGLU epilogue for NB columns; d_act[b*out_dim + row].
+template <int NB, int rows_per_block>
+__launch_bounds__(rows_per_block * 32, 1)
+__global__ void lfm_fused_swiglu_mmvq_q4_K_batch_kernel(
+    const block_q4_K * __restrict__ wg,
+    const block_q4_K * __restrict__ wu,
+    const block_q8_1_c * __restrict__ y,
+    float * __restrict__ d_act,
+    int out_dim, int nblk, int y_stride) {
+    constexpr int vdr = VDR_Q4_K_Q8_1_MMVQ;
+    constexpr int tpsb = QI4_K / vdr;
+    constexpr int blocks_per_iter = vdr * 32 / QI4_K;
+
+    const int row = blockIdx.x * rows_per_block + threadIdx.y;
+    if (row >= out_dim) return;
+
+    const block_q4_K * __restrict__ rwg = wg + (size_t)row * nblk;
+    const block_q4_K * __restrict__ rwu = wu + (size_t)row * nblk;
+
+    const int kqs = vdr * (threadIdx.x % tpsb);
+    float tg[NB], tu[NB];
+#pragma unroll
+    for (int b = 0; b < NB; ++b) { tg[b] = 0.0f; tu[b] = 0.0f; }
+
+    for (int kbx = threadIdx.x / tpsb; kbx < nblk; kbx += blocks_per_iter) {
+        q4k_wpart wpg, wpu;
+        q4k_load_w(rwg + kbx, kqs, wpg);
+        q4k_load_w(rwu + kbx, kqs, wpu);
+#pragma unroll
+        for (int b = 0; b < NB; ++b) {
+            const block_q8_1_c *yb = y + (size_t)b * y_stride + kbx * (QK_K / QK8_1);
+            tg[b] += q4k_dot_y(wpg, yb, kqs);
+            tu[b] += q4k_dot_y(wpu, yb, kqs);
+        }
+    }
+#pragma unroll
+    for (int b = 0; b < NB; ++b) {
+        const float g = warp_reduce_sum_f(tg[b]);
+        const float u = warp_reduce_sum_f(tu[b]);
+        if (threadIdx.x == 0) {
+            float silu_g = g / (1.0f + expf(-g));
+            d_act[(size_t)b * out_dim + row] = silu_g * u;
+        }
+    }
+}
+
+// LM head Q6_K for NB columns: logits[b*out_dim + row], per-column block argmax in block_max/idx[b*gridDim.x + blockIdx.x].
+template <int NB, int rows_per_block>
+__launch_bounds__(rows_per_block * 32, 1)
+__global__ void lfm_mmvq_q6_K_head_argmax_batch_kernel(
+        const block_q6_K * __restrict__ w,
+        const block_q8_1_c * __restrict__ y,
+        float * __restrict__ dst,
+        float * __restrict__ block_max,
+        int * __restrict__ block_idx,
+        int out_dim, int nblk, int y_stride) {
+    constexpr int vdr = VDR_Q6_K_Q8_1_MMVQ;
+    constexpr int tpsb = QI6_K / vdr;
+    constexpr int blocks_per_iter = vdr * 32 / QI6_K;
+
+    const int row = blockIdx.x * rows_per_block + threadIdx.y;
+    const bool valid = (row < out_dim);
+
+    const block_q6_K * __restrict__ rw = valid ? (w + (size_t)row * nblk) : w;
+    const int kqs = vdr * (threadIdx.x % tpsb);
+    float tmp[NB];
+#pragma unroll
+    for (int b = 0; b < NB; ++b) tmp[b] = 0.0f;
+    if (valid) {
+        for (int kbx = threadIdx.x / tpsb; kbx < nblk; kbx += blocks_per_iter) {
+            q6k_wpart wp;
+            q6k_load_w(rw + kbx, kqs, wp);
+#pragma unroll
+            for (int b = 0; b < NB; ++b) {
+                tmp[b] += q6k_dot_y(wp, y + (size_t)b * y_stride + kbx * (QK_K / QK8_1), kqs);
+            }
+        }
+    }
+    __shared__ float s_max[NB][rows_per_block];
+    __shared__ int   s_idx[NB][rows_per_block];
+#pragma unroll
+    for (int b = 0; b < NB; ++b) {
+        const float t = warp_reduce_sum_f(tmp[b]);
+        if (threadIdx.x == 0) {
+            if (valid && dst) dst[(size_t)b * out_dim + row] = t;
+            s_max[b][threadIdx.y] = valid ? t : -1e30f;
+            s_idx[b][threadIdx.y] = valid ? row : 0;
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.y == 0 && threadIdx.x < NB) {
+        const int b = threadIdx.x;
+        float m = s_max[b][0];
+        int idx = s_idx[b][0];
+        for (int r = 1; r < rows_per_block; ++r) {
+            if (s_max[b][r] > m) {
+                m = s_max[b][r];
+                idx = s_idx[b][r];
+            }
+        }
+        block_max[(size_t)b * gridDim.x + blockIdx.x] = m;
+        block_idx[(size_t)b * gridDim.x + blockIdx.x] = idx;
+    }
+}
+
+// ShortConv recurrence for n consecutive tokens, strictly sequential per channel (each thread owns one channel and
+// walks the tokens in order) with the exact per-token math of lfm_shortconv_step_kernel. The state after token j is
+// written to snap[j] (rollback source); the live state is left at the state after the last token.
+// in_proj: [n][3d]; conv_out_q8: [n][d/32] blocks; snap: [n][2d].
+__global__ void lfm_shortconv_seq_kernel(
+    const float * __restrict__ in_proj,
+    float * __restrict__ conv_state,
+    float * __restrict__ snap,
+    const float * __restrict__ conv_w,
+    block_q8_1_c * __restrict__ conv_out_q8,
+    int d, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= d) return;
+
+    float s0 = conv_state[i];
+    float s1 = conv_state[d + i];
+
+    float k0 = conv_w[i * 3 + 0];
+    float k1 = conv_w[i * 3 + 1];
+    float k2 = conv_w[i * 3 + 2];
+
+    const int lane_id = threadIdx.x & 31;
+    for (int j = 0; j < n; ++j) {
+        const float *ip = in_proj + (size_t)j * 3 * d;
+        float b_val = ip[i];
+        float c_val = ip[d + i];
+        float x_val = ip[2 * d + i];
+
+        float u = b_val * x_val;
+        float y_conv = s0 * k0 + s1 * k1 + u * k2;
+
+        // Rolling state update: S0 <- S1, S1 <- u
+        s0 = s1;
+        s1 = u;
+        snap[(size_t)j * 2 * d + i] = s0;
+        snap[(size_t)j * 2 * d + d + i] = s1;
+
+        float g = c_val * y_conv;
+
+        const int b = i >> 5;
+        float amax = fabsf(g);
+        float sum  = g;
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, mask, 32));
+            sum += __shfl_xor_sync(0xffffffff, sum, mask, 32);
+        }
+        const float scale = amax / 127.0f;
+        const int8_t q = (amax == 0.0f) ? 0 : (int8_t)roundf(g / scale);
+        block_q8_1_c *o = conv_out_q8 + (size_t)j * (d / QK8_1);
+        o[b].qs[lane_id] = q;
+        if (lane_id == 0) {
+            o[b].ds = make_half2(__float2half(scale), __float2half(sum));
+        }
+    }
+    conv_state[i] = s0;
+    conv_state[d + i] = s1;
+}
+
 // -----------------------------------------------------------------------------
 // Host Dispatch Routines
 // -----------------------------------------------------------------------------
@@ -874,6 +1232,114 @@ void lfm25_gpu_output_norm_head_argmax(
     // 3. Second reduction kernel for global argmax
     lfm_argmax_reduction_kernel<<<1, 256, 0, g_lfm_stream>>>(d_block_max, d_block_idx, d_best_token, grid_blocks);
     CUDA_CHECK_LAST();
+}
+
+// -----------------------------------------------------------------------------
+// Batched host launchers (Task 5.1). nb = number of columns, 1..LFM25_MAX_BATCH. Activation vectors / outputs are
+// stored token-major: vector b of an `in_dim` input starts at q8 block b*(in_dim/32); column b of the output at b*out_dim.
+// -----------------------------------------------------------------------------
+#define LFM_DISPATCH_NB(CALL)                                                                          \
+    switch (nb) {                                                                                      \
+        case 1: CALL(1); break;  case 2: CALL(2); break;  case 3: CALL(3); break;  case 4: CALL(4); break; \
+        case 5: CALL(5); break;  case 6: CALL(6); break;  case 7: CALL(7); break;  case 8: CALL(8); break; \
+        default: fprintf(stderr, "[FATAL] %s: nb=%d out of range 1..%d\n", __func__, nb, LFM25_MAX_BATCH); abort(); \
+    }
+
+void lfm25_gpu_mmvq_q4_K_batch(const void *dev_w, const void *d_xq8, float *d_dst, int in_dim, int out_dim, bool accum, int nb) {
+    const int nblk = in_dim / QK_K;
+    const int ystride = in_dim / QK8_1;
+    dim3 grid((unsigned)((out_dim + MMVQ_ROWS_PER_BLOCK - 1) / MMVQ_ROWS_PER_BLOCK), 1u, 1u);
+    dim3 block(32u, (unsigned)MMVQ_ROWS_PER_BLOCK, 1u);
+#define LFM_L(NB) do { \
+        if (accum) lfm_mmvq_q4_K_batch_kernel<NB, MMVQ_ROWS_PER_BLOCK, true><<<grid, block, 0, g_lfm_stream>>>( \
+            (const block_q4_K*)dev_w, (const block_q8_1_c*)d_xq8, d_dst, out_dim, nblk, ystride); \
+        else lfm_mmvq_q4_K_batch_kernel<NB, MMVQ_ROWS_PER_BLOCK, false><<<grid, block, 0, g_lfm_stream>>>( \
+            (const block_q4_K*)dev_w, (const block_q8_1_c*)d_xq8, d_dst, out_dim, nblk, ystride); } while (0)
+    LFM_DISPATCH_NB(LFM_L)
+#undef LFM_L
+    CUDA_CHECK_LAST();
+}
+
+void lfm25_gpu_mmvq_q6_K_batch(const void *dev_w, const void *d_xq8, float *d_dst, int in_dim, int out_dim, bool accum, int nb) {
+    const int nblk = in_dim / QK_K;
+    const int ystride = in_dim / QK8_1;
+    dim3 grid((unsigned)((out_dim + MMVQ_ROWS_PER_BLOCK - 1) / MMVQ_ROWS_PER_BLOCK), 1u, 1u);
+    dim3 block(32u, (unsigned)MMVQ_ROWS_PER_BLOCK, 1u);
+#define LFM_L(NB) do { \
+        if (accum) lfm_mmvq_q6_K_batch_kernel<NB, MMVQ_ROWS_PER_BLOCK, true><<<grid, block, 0, g_lfm_stream>>>( \
+            (const block_q6_K*)dev_w, (const block_q8_1_c*)d_xq8, d_dst, out_dim, nblk, ystride); \
+        else lfm_mmvq_q6_K_batch_kernel<NB, MMVQ_ROWS_PER_BLOCK, false><<<grid, block, 0, g_lfm_stream>>>( \
+            (const block_q6_K*)dev_w, (const block_q8_1_c*)d_xq8, d_dst, out_dim, nblk, ystride); } while (0)
+    LFM_DISPATCH_NB(LFM_L)
+#undef LFM_L
+    CUDA_CHECK_LAST();
+}
+
+void lfm25_gpu_fused_swiglu_batch(const void *dev_gate, const void *dev_up, const void *d_xq8, float *d_act, void *d_act_q8, int in_dim, int ffn_dim, int nb) {
+    const int nblk = in_dim / QK_K;
+    const int ystride = in_dim / QK8_1;
+    dim3 grid((unsigned)((ffn_dim + MMVQ_ROWS_PER_BLOCK - 1) / MMVQ_ROWS_PER_BLOCK), 1u, 1u);
+    dim3 block(32u, (unsigned)MMVQ_ROWS_PER_BLOCK, 1u);
+#define LFM_L(NB) \
+    lfm_fused_swiglu_mmvq_q4_K_batch_kernel<NB, MMVQ_ROWS_PER_BLOCK><<<grid, block, 0, g_lfm_stream>>>( \
+        (const block_q4_K*)dev_gate, (const block_q4_K*)dev_up, (const block_q8_1_c*)d_xq8, d_act, ffn_dim, nblk, ystride)
+    LFM_DISPATCH_NB(LFM_L)
+#undef LFM_L
+    CUDA_CHECK_LAST();
+
+    if (d_act_q8) {
+        // ffn_dim is a multiple of 32, so a quantize over the whole [nb][ffn_dim] array yields the per-token blocks.
+        const int total = nb * ffn_dim;
+        lfm_quantize_q8_1_kernel<<<(total + 255) / 256, 256, 0, g_lfm_stream>>>(d_act, (block_q8_1_c*)d_act_q8, total);
+        CUDA_CHECK_LAST();
+    }
+}
+
+// in_proj: [nb][3d] (token-major); conv_out_q8: [nb][d/32] blocks; snap: [nb][2d]; conv_state: live [2d].
+void lfm25_gpu_shortconv_seq(const float *d_in_proj, float *d_conv_state, float *d_snap, const float *d_conv_w, void *d_conv_out_q8, int d, int nb) {
+    if (d % 32 != 0) { fprintf(stderr, "[FATAL] lfm25_gpu_shortconv_seq: d=%d unsupported\n", d); exit(EXIT_FAILURE); }
+    const int threads = 256;
+    const int blocks = (d + threads - 1) / threads;
+    lfm_shortconv_seq_kernel<<<blocks, threads, 0, g_lfm_stream>>>(
+        d_in_proj, d_conv_state, d_snap, d_conv_w, (block_q8_1_c*)d_conv_out_q8, d, nb);
+    CUDA_CHECK_LAST();
+}
+
+// Rollback: copy `n_layers` state slabs [2d floats each] from snap[l][slot] (layer stride snap_layer_stride floats)
+// into the live state [l][2d] with one 2D copy.
+void lfm25_gpu_conv_state_restore(float *d_conv_state, const float *d_snap, int n_layers, int slot, int d, size_t snap_layer_stride) {
+    CUDA_CHECK(cudaMemcpy2DAsync(d_conv_state, (size_t)2 * d * sizeof(float),
+                                 d_snap + (size_t)slot * 2 * d, snap_layer_stride * sizeof(float),
+                                 (size_t)2 * d * sizeof(float), (size_t)n_layers, cudaMemcpyDeviceToDevice, g_lfm_stream));
+}
+
+// Final RMSNorm (per token) + batched LM head + per-column argmax.
+//   d_res_x [nb][dim], d_xq8 [nb][dim/32] blocks, d_logits [nb][vocab], d_block_max/idx [nb][ceil(vocab/rows)], d_best_token [nb].
+void lfm25_gpu_output_norm_head_argmax_batch(
+    const float *d_res_x, const float *d_norm_w, const void *dev_output_w,
+    void *d_xq8, float *d_logits,
+    float *d_block_max, int *d_block_idx, int *d_best_token,
+    int dim, int vocab_size, float eps, int nb) {
+    for (int j = 0; j < nb; ++j) {
+        lfm25_gpu_fused_rms_norm_quant(d_res_x + (size_t)j * dim, d_norm_w, NULL,
+                                       (char*)d_xq8 + (size_t)j * (dim / QK8_1) * sizeof(block_q8_1_c), dim, eps);
+    }
+    const int nblk = dim / QK_K;
+    const int ystride = dim / QK8_1;
+    const int grid_blocks = (vocab_size + MMVQ_ROWS_PER_BLOCK - 1) / MMVQ_ROWS_PER_BLOCK;
+    dim3 grid((unsigned)grid_blocks, 1u, 1u);
+    dim3 block(32u, (unsigned)MMVQ_ROWS_PER_BLOCK, 1u);
+#define LFM_L(NB) \
+    lfm_mmvq_q6_K_head_argmax_batch_kernel<NB, MMVQ_ROWS_PER_BLOCK><<<grid, block, 0, g_lfm_stream>>>( \
+        (const block_q6_K*)dev_output_w, (const block_q8_1_c*)d_xq8, d_logits, d_block_max, d_block_idx, vocab_size, nblk, ystride)
+    LFM_DISPATCH_NB(LFM_L)
+#undef LFM_L
+    CUDA_CHECK_LAST();
+    for (int j = 0; j < nb; ++j) {
+        lfm_argmax_reduction_kernel<<<1, 256, 0, g_lfm_stream>>>(d_block_max + (size_t)j * grid_blocks,
+                                                               d_block_idx + (size_t)j * grid_blocks, d_best_token + j, grid_blocks);
+        CUDA_CHECK_LAST();
+    }
 }
 
 // -----------------------------------------------------------------------------

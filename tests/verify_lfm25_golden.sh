@@ -68,13 +68,15 @@ fi
 SCRATCH="$(mktemp -d /tmp/tuff_golden_run.XXXXXX)"
 trap 'rm -rf "$SCRATCH"' EXIT
 
-# Sets MODEL, REF, CONFIGS ("name|ENV=..;ENV=.." entries; the first is the one stored as the golden).
+# Sets MODEL, REF, CONFIGS ("name|ENV=..;ENV=..|extra tuff args" entries, the last field optional and appended to BOTH
+# tuff runs; the first entry is the one stored as the golden).
 mode_setup() {
     case "$1" in
         dense)
             MODEL="/run/media/nii/pohjola/models/unsloth/LFM2.5-1.2B-Thinking-GGUF/LFM2.5-1.2B-Thinking-Q4_K_M.gguf"
             REF="tests/ref_lfm25_dense_128.txt"
-            CONFIGS=("graph=1|LFM25_CUDA_GRAPH=1" "graph=0|LFM25_CUDA_GRAPH=0") ;;
+            CONFIGS=("graph=1|LFM25_CUDA_GRAPH=1" "graph=0|LFM25_CUDA_GRAPH=0"
+                     "tf-batch4||--tf-batch 4" "tf-batch8-rollback||--tf-batch 8 --tf-rollback") ;;
         dense26)
             MODEL="/run/media/nii/pohjola/models/LiquidAI/LFM2.5-2.6B/LFM2.5-2.6B-Q4_K_M.gguf"
             REF="tests/ref_lfm25_dense26_128.txt"
@@ -85,27 +87,38 @@ mode_setup() {
             CONFIGS=("graph=1|LFM25_CUDA_GRAPH=1" "graph=0|LFM25_CUDA_GRAPH=0"
                      "expert-cache|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=600"
                      "expert-cache-tiny|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300"
-                     "expert-cache-tiny-alt|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300;LFM25_PREFETCH=1;LFM25_PINNED_EXPERTS=0;LFM25_CACHE_POLICY=lru") ;;
+                     "expert-cache-tiny-alt|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300;LFM25_PREFETCH=1;LFM25_PINNED_EXPERTS=0;LFM25_CACHE_POLICY=lru"
+                     "tf-batch4||--tf-batch 4"
+                     "tf-batch4-rollback-cache|LFM25_FORCE_EXPERT_CACHE=1;LFM25_EXPERT_CACHE_MB=300|--tf-batch 4 --tf-rollback") ;;
         moe)
             MODEL="/run/media/nii/pohjola/models/LiquidAI/LFM2.5-24B-A2B-GGUF/LFM2.5-24B-A2B-Q4_K_M.gguf"
             REF="tests/ref_lfm25_moe_128.txt"
-            CONFIGS=("graph=1|LFM25_CUDA_GRAPH=1" "graph=0|LFM25_CUDA_GRAPH=0" "prefetch|LFM25_PREFETCH=1") ;;
+            CONFIGS=("graph=1|LFM25_CUDA_GRAPH=1" "graph=0|LFM25_CUDA_GRAPH=0" "prefetch|LFM25_PREFETCH=1"
+                     "tf-batch4||--tf-batch 4") ;;
     esac
 }
 
-# run_config <dir> <env-string>: writes <dir>/tokens and <dir>/logits. Returns 1 (with a reason on
+# split_entry <entry>: sets name, envs, xargs.
+split_entry() {
+    local entry="$1" rest
+    name="${entry%%|*}"; rest="${entry#*|}"
+    envs="${rest%%|*}"
+    if [[ "$rest" == *"|"* ]]; then xargs_="${rest#*|}"; else xargs_=""; fi
+}
+
+# run_config <dir> <env-string> [extra tuff args]: writes <dir>/tokens and <dir>/logits. Returns 1 (with a reason on
 # stderr) if tuff did not produce a complete output; tuff exits non-zero on the teacher-forced pass
 # by design (strict 128/128 check), so success is judged by the file, as in verify_lfm25_oracle.sh.
 run_config() {
-    local dir="$1" envs="${2//;/ }"
+    local dir="$1" envs="${2//;/ }" xa="${3:-}"
     mkdir -p "$dir"
     # shellcheck disable=SC2086
-    env $envs "$BIN" --model "$MODEL" --prompt "$PROMPT" -c "$CTX" -n "$N" --temp 0 --dump-tokens \
+    env $envs "$BIN" --model "$MODEL" --prompt "$PROMPT" -c "$CTX" -n "$N" --temp 0 --dump-tokens $xa \
         > "$dir/tokens" 2> "$dir/err1" || { tail -5 "$dir/err1" >&2; echo "greedy run failed" >&2; return 1; }
     [ "$(wc -l < "$dir/tokens")" -eq "$N" ] || { echo "greedy run produced $(wc -l < "$dir/tokens") tokens, want $N" >&2; return 1; }
     # shellcheck disable=SC2086
     env $envs "$BIN" --model "$MODEL" --prompt "$PROMPT" -c "$CTX" -n "$N" --temp 0 \
-        --teacher-force "$REF" --dump-logits "$dir/logits" > /dev/null 2> "$dir/err2" || true
+        --teacher-force "$REF" --dump-logits "$dir/logits" $xa > /dev/null 2> "$dir/err2" || true
     [ -s "$dir/logits" ] || { tail -5 "$dir/err2" >&2; echo "teacher-forced run produced no logits" >&2; return 1; }
     local vocab want got
     vocab="$(od -An -tu4 -j12 -N4 "$dir/logits" | xargs)"
@@ -115,7 +128,7 @@ run_config() {
 }
 
 check_mode() {
-    local mode="$1" golden="tests/golden/lfm25_$1.json" rc=0 entry name envs
+    local mode="$1" golden="tests/golden/lfm25_$1.json" rc=0 entry name envs xargs_
     mode_setup "$mode"
     if [ ! -f "$golden" ]; then
         echo "[golden] $mode: FAIL - $golden missing (create it with: $0 $mode --update --reason \"...\")"
@@ -125,9 +138,9 @@ check_mode() {
         echo "GOLDEN FAIL ($mode)"; return 1
     fi
     for entry in "${CONFIGS[@]}"; do
-        name="${entry%%|*}"; envs="${entry#*|}"
+        split_entry "$entry"
         rm -rf "$SCRATCH/$mode-$name"
-        if ! run_config "$SCRATCH/$mode-$name" "$envs"; then
+        if ! run_config "$SCRATCH/$mode-$name" "$envs" "$xargs_"; then
             echo "[golden] $mode $name: tuff run incomplete -> FAIL"; rc=1; continue
         fi
         "${GOLD_PY[@]}" check --golden "$golden" --config "$name" \
@@ -139,7 +152,7 @@ check_mode() {
 }
 
 update_mode() {
-    local mode="$1" golden="tests/golden/lfm25_$1.json" entry name envs first="" names=""
+    local mode="$1" golden="tests/golden/lfm25_$1.json" entry name envs xargs_ first="" names=""
     mode_setup "$mode"
     echo "[golden] $mode: update requested (reason: $REASON)"
     echo "[golden] $mode: step 1/3 - full oracle gate must pass first"
@@ -149,9 +162,9 @@ update_mode() {
     fi
     echo "[golden] $mode: step 2/3 - all configurations must agree byte-for-byte"
     for entry in "${CONFIGS[@]}"; do
-        name="${entry%%|*}"; envs="${entry#*|}"
+        split_entry "$entry"
         rm -rf "$SCRATCH/$mode-$name"
-        run_config "$SCRATCH/$mode-$name" "$envs" || { echo "[golden] $mode $name: tuff run incomplete - REFUSED"; return 1; }
+        run_config "$SCRATCH/$mode-$name" "$envs" "$xargs_" || { echo "[golden] $mode $name: tuff run incomplete - REFUSED"; return 1; }
         names="${names:+$names,}$name"
         if [ -z "$first" ]; then
             first="$name"

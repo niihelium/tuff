@@ -46,6 +46,13 @@ typedef struct engine_vtable {
 
     // Single-token greedy / sampled decode step (the inner loop call)
     int32_t         (*engine_forward_token)(void *engine, int32_t token, int pos);
+
+    // Optional (NULL when unsupported, e.g. the Qwen engine): batched multi-token forward for speculative-decoding
+    // verification, bit-identical to n consecutive forward_token calls; and rollback to the first n_keep tokens of
+    // the last batch. Return 0 on success.
+    int             (*engine_forward_batch)(void *engine, const int32_t *tokens, int n, int pos0,
+                                            int32_t *argmax_out, float *logits_out /* nullable, [n*vocab] host */);
+    int             (*engine_rollback)(void *engine, int n_keep);
 } engine_vtable_t;
 
 // VTable registry getters

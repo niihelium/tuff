@@ -24,6 +24,7 @@ Last updated: 2026-10-16. Branch: `lfm25-phase1` (pushed to `origin`; not merged
 | 4.2b — long-K Q6_K/Q4_K down matvec (unroll) | done; A/B 1.2B +4.26% (≈378 tok/s) | see git log | golden PASS ×3, 336/322 GB/s |
 | 4.3 — copy stream, pinned expert store, LFRU (24B); prefetch opt-in | done; A/B +3.4% (Hello) / +12.5% (translate) | see git log | golden PASS incl. tiny-cache + prefetch configs; 2 new cache controls |
 | 2.6B — dense 30-layer stepping stone | tooling done; **oracle stage 3 FAIL (worst step 2.44 > 2.0), uniform-shift artefact; user decision pending** | see git log | roadmap *Stepping stone 2* |
+| 5.1 — batched verify forward + conv rollback | done; verify(4) = 1.9× a token on 1.2B | see git log | golden PASS on tf-batch / rollback configs; 12/12 controls |
 | 5 — speculative decoding | not started | | |
 
 Decode speed (RTX 3070 Laptop, `-c 1024 -n 128 --runs 3`, `balanced` profile, interleaved A/B means):
@@ -269,8 +270,8 @@ $PY tools/lfm25_pack_moe_fixtures.py    /tmp/d24 tests/fixtures/lfm25_24b_moe_ff
 | `tools/debug/lfm25_moe_ffn_check.py` | numpy expert-FFN (Q8_1) semantics vs llama.cpp CUDA dumps |
 | `scripts/ab_interleaved.sh` | order-balanced paired A/B of two trees (`MODEL`, `TUFF_ARGS`) |
 | `scripts/check_power_state.sh` | power / clock gate for benchmarks |
-| tuff flags | `--teacher-force <ids>` (+`--dump-logits`), `--dump-tokens`, `--dump-logits`, `--runs`, `-c` |
-| tuff env | `LFM25_CUDA_GRAPH=0`, `LFM25_FORCE_EXPERT_CACHE=1`, `LFM25_EXPERT_CACHE_MB`, `LFM25_VRAM_RESERVE_MB` (512), `LFM25_CACHE_STATS=1`, `LFM25_PINNED_EXPERTS=0/1`, `LFM25_CACHE_POLICY=lru\|lfru`, `LFM25_PREFETCH=1`, `LFM25_PREFETCH_TOPN` |
+| tuff flags | `--teacher-force <ids>` (+`--dump-logits`, `--tf-batch B`, `--tf-rollback`), `--dump-tokens`, `--dump-logits`, `--runs`, `-c` |
+| tuff env | `LFM25_CUDA_GRAPH=0`, `LFM25_FORCE_EXPERT_CACHE=1`, `LFM25_EXPERT_CACHE_MB`, `LFM25_VRAM_RESERVE_MB` (512), `LFM25_CACHE_STATS=1`, `LFM25_PINNED_EXPERTS=0/1`, `LFM25_CACHE_POLICY=lru\|lfru`, `LFM25_PREFETCH=1`, `LFM25_PREFETCH_TOPN`, `LFM25_BENCH_BATCH=1` (+`LFM25_BENCH_REPS`) |
 
 ---
 
