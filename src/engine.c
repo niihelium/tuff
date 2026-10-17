@@ -82,7 +82,7 @@ typedef struct {
     block_q8_K *q8act;   // q8_K(act), the down projection's activation
 } moe_worker_t;
 
-#define MOE_MAX_MISS 16
+#define MOE_MAX_MISS 32
 
 typedef struct {
     const model_layer_t *L;
@@ -557,7 +557,7 @@ engine_t* engine_init(model_t *model, int max_seq_len) {
 
     eng->x             = (float*)gpu_host_alloc(dim * sizeof(float));
     eng->norm_x        = (float*)gpu_host_alloc(dim * sizeof(float));
-    eng->moe_buf       = (float*)gpu_host_alloc(dim * sizeof(float));
+    eng->moe_buf       = (float*)gpu_host_alloc(4 * (size_t)dim * sizeof(float));
     eng->router_logits = (float*)gpu_host_alloc(n_expert * sizeof(float));
     eng->top_indices   = (int*)malloc(n_expert_used * sizeof(int));
     eng->top_values    = (float*)malloc(n_expert_used * sizeof(float));
@@ -573,7 +573,7 @@ engine_t* engine_init(model_t *model, int max_seq_len) {
     eng->down_arr      = (float*)malloc(8 * (size_t)n_expert_used * dim * sizeof(float));
     eng->down_hit      = (float*)malloc(8 * (size_t)n_expert_used * dim * sizeof(float));
     eng->sh_up_exp     = (float*)malloc(sh_ffn_dim * sizeof(float));
-    eng->q8_normx      = (block_q8_K*)malloc(q8_K_row_bytes(dim));
+    eng->q8_normx      = (block_q8_K*)malloc(4 * q8_K_row_bytes(dim));
     eng->norm_x2        = (float*)gpu_host_alloc(dim * sizeof(float));
     eng->moe_buf2       = (float*)gpu_host_alloc(dim * sizeof(float));
     eng->router_logits2 = (float*)gpu_host_alloc(n_expert * sizeof(float));
@@ -605,8 +605,9 @@ engine_t* engine_init(model_t *model, int max_seq_len) {
             // Lossless verify: column 1's no-write delta graphs + the commit replay.
             if (g_spec_mtp || g_spec_draft != SPEC_DRAFT_NONE) {
                 gpu_capture_verify_graphs(model);
-                gpu_capture_verify_col_graphs(model);
-                gpu_capture_lockstep_graphs(model);
+                const char *ls = getenv("TUFF_VERIFY_LOCKSTEP");
+                if (ls && ls[0] == '0') gpu_capture_verify_col_graphs(model);
+                else gpu_capture_lockstep_graphs(model);
             }
         }
     }
@@ -1948,7 +1949,11 @@ int32_t engine_forward_token(engine_t *eng, int32_t token_id, int pos) {
 
 void engine_free(engine_t *eng) {
     engine_settle(eng);
-    if (eng && eng->vsnap) { gpu_expert_cache_snap_free(eng->vsnap); eng->vsnap = NULL; }
+    if (eng) {
+        for (int i = 0; i < 3; ++i) {
+            if (eng->vsnap[i]) { gpu_expert_cache_snap_free(eng->vsnap[i]); eng->vsnap[i] = NULL; }
+        }
+    }
     if (eng && getenv("TUFF_PROFILE")) {
         unsigned long long n, gap, behind; gpu_expert_cache_streamwait_stats(&n, &gap, &behind);
         fprintf(stderr, "[PROFILE] LES admission rejects: %llu\n", gpu_expert_cache_les_rejects());
@@ -2766,42 +2771,50 @@ int engine_exact_verify_available(const engine_t *eng) { return eng && verify2_s
 static void verify2_finalize(engine_t *eng, int keep) {
     if (!eng->vpend) return;
     eng->vpend = 0;
-    if (eng->v_lockstep && dflash_active()) dflash_commit_stage(keep >= 2 ? 2 : 1, eng->vpos0);
-    if (keep >= 2) {
-        gpu_launch_verify_commit();
-        gpu_expert_cache_fill_commit(1);
-        gpu_expert_cache_set_token(eng->vtok0 + 2);
+    const int n = eng->v_ncols;
+    if (keep > n) keep = n;
+    if (keep < 1) keep = 1;
+    if (keep == n) {
+        gpu_launch_verify_commit_slot(n == 4 ? 1 : 0);
         eng->n_verify_kept2++;
+    } else if (keep == n - 1) {
+        // GDN state already holds exact state after n - 1 tokens.
     } else {
-        gpu_expert_cache_fill_drop(1);
+        gpu_delta_rollback_n2();
+        if (keep == 2) gpu_launch_verify_commit_slot(0);
+    }
+    if (keep < n) {
+        for (int g = keep; g < n; ++g) gpu_expert_cache_fill_drop(g);
         const model_t *m = eng->model;
         for (uint32_t l = 0; l < m->block_count - m->nextn_predict_layers; ++l)
-            if (l >= (uint32_t)g_n_gpu_expert_layers) gpu_expert_cache_restore_layer(eng->vsnap, l);
-        gpu_expert_cache_set_token(eng->vtok0 + 1);
+            if (l >= (uint32_t)g_n_gpu_expert_layers) gpu_expert_cache_restore_layer(eng->vsnap[keep - 1], l);
     }
+    for (int g = 1; g < keep; ++g) gpu_expert_cache_fill_commit(g);
+    gpu_expert_cache_set_token(eng->vtok0 + (uint64_t)keep);
     gpu_expert_cache_bgfill_poll();
 }
 
 static void engine_settle(engine_t *eng) {
-    if (eng && eng->vpend) verify2_finalize(eng, 2);
+    if (eng && eng->vpend) verify2_finalize(eng, eng->v_ncols);
 }
 
 typedef struct {
     engine_t *eng;
     model_t  *m;
+    int ncols;
     uint32_t dim, n_expert, n_expert_used, ffn_dim, sh_ffn_dim;
     uint64_t T0;
     int cache_on;
     int col_graphs;
     float *d_res_x;
     const float *d_norm_x;
-    float *res[2], *shexp[2], *rl[2], *nx[2], *mb[2], *da[2];
-    block_q8_K *q8[2];
+    float *res[4], *shexp[4], *rl[4], *nx[4], *mb[4], *da[4];
+    block_q8_K *q8[4];
     // per-column MoE state of the layer in flight
-    int ti[2][8]; float tv[2][8];
-    int hit_slots[2][8], hit_pos[2][8], n_hit[2];
-    int miss_k[2][8], n_miss[2];
-    double t_sub[2];
+    int ti[4][8]; float tv[4][8];
+    int hit_slots[4][8], hit_pos[4][8], n_hit[4];
+    int miss_k[4][8], n_miss[4];
+    double t_sub[4];
 } v2_ctx_t;
 
 // Trunk of layer l for column c: its single-token graph on its own residual, then everything the
@@ -2913,62 +2926,73 @@ static void v2_moe_issue(v2_ctx_t *x, int c, uint32_t l) {
     (void)dim; (void)ffn_dim; (void)down_type;
 }
 
-// Lockstep layer l: one graph runs both columns' trunk (shared weight reads); then both columns'
-// cache operations in plain-decode order, both columns' CPU misses as one pool batch, the hits
-// (column 0's fills pushed in between), the join, and both combines.
+// Lockstep layer l: one graph runs all ncols columns' trunk (shared weight reads); then all columns'
+// cache operations in plain-decode order, all columns' CPU misses as one pool batch, the hits
+// (column 0's fills pushed after column 0's hits), the join, and all combines.
 static void v2_ls_layer(v2_ctx_t *x, uint32_t l) {
     engine_t *eng = x->eng;
     model_layer_t *layer = &x->m->layers[l];
+    const int n = x->ncols;
     const double tt0 = omp_get_wtime();
-    gpu_launch_lockstep(l);
+    gpu_launch_lockstep_n(n, l);
     gpu_event_record(eng->vev[0]);
     eng->tv_trunk += omp_get_wtime() - tt0;
     const double tw0 = omp_get_wtime();
     gpu_event_sync(eng->vev[0]);
     eng->t_expert_sync += omp_get_wtime() - tw0;
     eng->tv_sync += omp_get_wtime() - tw0;
-    v2_host_ops(x, 0, l);
-    v2_host_ops(x, 1, l);
-    const int total = x->n_miss[0] + x->n_miss[1];
+    int total = 0;
+    for (int c = 0; c < n; ++c) {
+        v2_host_ops(x, c, l);
+        total += x->n_miss[c];
+    }
     if (total > 0) {
         const double tp0 = omp_get_wtime();
         int j = v2_pool_fill(x, layer, 0, 0);
-        // An expert both columns miss is ONE entry: its weights are read once for both activations
-        // (the dual kernels compute each column with the single-column per-row dot product).
+        // Pair shared misses across columns up to 2 activations per batch entry (the dual kernels
+        // compute each column with the single-column per-row dot product).
         static int dual_env = -1;
         if (dual_env < 0) { const char *e = getenv("TUFF_VERIFY_DUAL_MISS"); dual_env = (e && e[0] == '0') ? 0 : 1; }
-        for (int i = 0; i < x->n_miss[1]; ++i) {
-            const int e1 = x->ti[1][x->miss_k[1][i]];
-            int shared = -1;
-            if (dual_env)
-                for (int i0 = 0; i0 < x->n_miss[0]; ++i0)
-                    if (x->ti[0][x->miss_k[0][i0]] == e1) { shared = i0; break; }
-            float *dst = x->da[1] + (size_t)x->miss_k[1][i] * x->dim;
-            if (shared >= 0) {
-                g_moe_batch.xk2[shared] = x->nx[1];
-                g_moe_batch.q8xk2[shared] = x->q8[1];
-                g_moe_batch.down_out2[shared] = dst;
-            } else {
-                g_moe_batch.experts[j]  = e1;
-                g_moe_batch.down_out[j] = dst;
-                g_moe_batch.xk[j]       = x->nx[1];
-                g_moe_batch.q8xk[j]     = x->q8[1];
-                g_moe_batch.xk2[j]      = NULL;
-                g_moe_batch.q8xk2[j]    = NULL;
-                g_moe_batch.down_out2[j]= NULL;
-                j++;
+        for (int c = 1; c < n; ++c) {
+            for (int i = 0; i < x->n_miss[c]; ++i) {
+                const int ec = x->ti[c][x->miss_k[c][i]];
+                int shared = -1;
+                if (dual_env) {
+                    for (int idx = 0; idx < j; ++idx) {
+                        if (g_moe_batch.experts[idx] == ec && g_moe_batch.xk2[idx] == NULL) {
+                            shared = idx;
+                            break;
+                        }
+                    }
+                }
+                float *dst = x->da[c] + (size_t)x->miss_k[c][i] * x->dim;
+                if (shared >= 0) {
+                    g_moe_batch.xk2[shared]       = x->nx[c];
+                    g_moe_batch.q8xk2[shared]     = x->q8[c];
+                    g_moe_batch.down_out2[shared] = dst;
+                } else {
+                    g_moe_batch.experts[j]   = ec;
+                    g_moe_batch.down_out[j]  = dst;
+                    g_moe_batch.xk[j]        = x->nx[c];
+                    g_moe_batch.q8xk[j]      = x->q8[c];
+                    g_moe_batch.xk2[j]       = NULL;
+                    g_moe_batch.q8xk2[j]     = NULL;
+                    g_moe_batch.down_out2[j] = NULL;
+                    j++;
+                }
             }
         }
         g_moe_batch.n = j;
-        g_moe_batch.n_xin = 2;
-        g_moe_batch.xin[0] = x->nx[0]; g_moe_batch.q8in[0] = x->q8[0];
-        g_moe_batch.xin[1] = x->nx[1]; g_moe_batch.q8in[1] = x->q8[1];
+        g_moe_batch.n_xin = n;
+        for (int c = 0; c < n; ++c) {
+            g_moe_batch.xin[c]  = x->nx[c];
+            g_moe_batch.q8in[c] = x->q8[c];
+        }
         moe_pool_submit();
         x->t_sub[0] = omp_get_wtime();
         eng->tv_pub += omp_get_wtime() - tp0;
     }
-    v2_hits(x, 0, l);
-    v2_hits(x, 1, l);
+    for (int c = 0; c < n; ++c) v2_hits(x, c, l);
     if (total > 0) {
         const double tj0 = omp_get_wtime();
         moe_pool_wait();
@@ -2978,7 +3002,7 @@ static void v2_ls_layer(v2_ctx_t *x, uint32_t l) {
         eng->nv_cpu_miss += (unsigned long long)total;
     }
     const double tr0 = omp_get_wtime();
-    for (int c = 0; c < 2; ++c) {
+    for (int c = 0; c < n; ++c) {
         float *host_miss_ptr = NULL;
         if (x->n_miss[c] > 0) {
             host_miss_sum(x->mb[c], x->da[c], x->miss_k[c], x->n_miss[c], x->tv[c], (int)x->dim);
@@ -2998,15 +3022,21 @@ static void v2_host_ops(v2_ctx_t *x, int c, uint32_t l) {
     gpu_expert_cache_set_token(x->T0 + (uint64_t)c);
     if (x->cache_on) {
         gpu_expert_cache_layer_begin(l);
-        if (c == 1) gpu_expert_cache_snap_layer(eng->vsnap, l);
+        if (c >= 1) gpu_expert_cache_snap_layer(eng->vsnap[c - 1], l);
     }
     moe_policy_t *pol = gpu_get_moe_policy();
     if (pol) moe_policy_observe(pol, (int)l, x->ti[c], (int)x->n_expert_used);
     x->n_hit[c] = 0; x->n_miss[c] = 0;
     for (uint32_t k = 0; k < x->n_expert_used; ++k) {
-        const int slot = x->cache_on ? gpu_expert_lookup(l, x->ti[c][k]) : -1;
-        if (slot >= 0) { x->hit_slots[c][x->n_hit[c]] = slot; x->hit_pos[c][x->n_hit[c]] = (int)k; x->n_hit[c]++; }
-        else x->miss_k[c][x->n_miss[c]++] = (int)k;
+        int slot = x->cache_on ? gpu_expert_lookup(l, x->ti[c][k]) : -1;
+        if (slot >= 0) {
+            if (c >= 2) slot = gpu_expert_cache_resolve_hit_slot(m, l, slot, x->ti[c][k]);
+            x->hit_slots[c][x->n_hit[c]] = slot;
+            x->hit_pos[c][x->n_hit[c]] = (int)k;
+            x->n_hit[c]++;
+        } else {
+            x->miss_k[c][x->n_miss[c]++] = (int)k;
+        }
     }
     if (x->cache_on && g_fill_budget > 0 && (l % (uint32_t)g_fill_stride) == 0) {
         for (int j = 0, filled = 0; j < x->n_miss[c] && filled < g_fill_budget; ++j)
@@ -3038,7 +3068,7 @@ static void v2_moe_finish(v2_ctx_t *x, int c) {
     eng->tv_comb += omp_get_wtime() - tr0;
 }
 
-static int engine_forward_verify2(engine_t *eng, const int32_t *tokens, int pos0, int32_t *argmax_out) {
+static int engine_forward_verify_n(engine_t *eng, const int32_t *tokens, int n, int pos0, int32_t *argmax_out) {
     model_t *m = eng->model;
     const uint32_t dim = m->embedding_length;
     const uint32_t vocab_size = m->vocab_size;
@@ -3047,47 +3077,57 @@ static int engine_forward_verify2(engine_t *eng, const int32_t *tokens, int pos0
 
     engine_settle(eng);
     if (!eng->d_res_v) {
-        gpu_n2_prepare((int)dim, (int)vocab_size);
+        if (!gpu_has_lockstep_graphs()) gpu_n2_prepare((int)dim, (int)vocab_size);
         eng->d_res_v = gpu_get_d_res_verify((int)dim);
-        eng->vev[0] = gpu_event_new();
-        eng->vev[1] = gpu_event_new();
+        for (int c = 0; c < 4; ++c) eng->vev[c] = gpu_event_new();
     }
-    if (!eng->vsnap) eng->vsnap = gpu_expert_cache_snap_alloc();
+    for (int i = 0; i < n - 1; ++i) {
+        if (!eng->vsnap[i]) eng->vsnap[i] = gpu_expert_cache_snap_alloc();
+    }
 
     v2_ctx_t X;
     v2_ctx_t *x = &X;
-    x->eng = eng; x->m = m; x->dim = dim;
+    x->eng = eng; x->m = m; x->ncols = n; x->dim = dim;
     x->n_expert = m->expert_count; x->n_expert_used = m->expert_used_count;
     x->ffn_dim = m->expert_ffn_length; x->sh_ffn_dim = m->expert_shared_ffn_len;
     x->cache_on = gpu_expert_cache_active();
     x->T0 = gpu_expert_cache_get_token();
     eng->vtok0 = x->T0;
     eng->vpos0 = pos0;
+    eng->v_ncols = n;
     x->d_res_x = gpu_get_d_res_x();
     x->d_norm_x = gpu_get_d_norm_x();
-    x->res[0] = eng->d_res_v; x->res[1] = eng->d_res_v + dim;
-    x->shexp[0] = (float*)gpu_get_shexp_dev_ptr(); x->shexp[1] = (float*)gpu_get_shexp2_dev_ptr();
     static int ls_env = -1;
     if (ls_env < 0) { const char *e = getenv("TUFF_VERIFY_LOCKSTEP"); ls_env = (e && e[0] == '0') ? 0 : 1; }
-    const int lockstep = ls_env && gpu_has_lockstep_graphs();
+    const int lockstep = (n >= 3 || ls_env) && gpu_has_lockstep_graphs();
     eng->v_lockstep = lockstep;
     x->col_graphs = gpu_has_verify_col_graphs();
     if (lockstep) {
-        x->res[0] = gpu_get_d_res_verify((int)dim); x->res[1] = x->res[0] + dim;
-        x->rl[0] = gpu_lockstep_host_rl(0); x->rl[1] = gpu_lockstep_host_rl(1);
-        x->nx[0] = gpu_lockstep_host_nx(0); x->nx[1] = gpu_lockstep_host_nx(1);
+        float *r0 = gpu_get_d_res_verify((int)dim);
+        for (int c = 0; c < n; ++c) {
+            x->res[c]   = r0 + (size_t)c * dim;
+            x->shexp[c] = gpu_lockstep_shexp(c);
+            x->rl[c]    = gpu_lockstep_host_rl(c);
+            x->nx[c]    = gpu_lockstep_host_nx(c);
+        }
     } else if (x->col_graphs) {
-        // The column graphs bind the verify residuals and these pinned landing buffers.
+        // The column graphs bind the verify residuals and these pinned landing buffers (n == 2).
         x->res[0] = gpu_get_d_res_verify((int)dim); x->res[1] = x->res[0] + dim;
+        x->shexp[0] = (float*)gpu_get_shexp_dev_ptr(); x->shexp[1] = (float*)gpu_get_shexp2_dev_ptr();
         x->rl[0] = gpu_verify_host_rl(0); x->rl[1] = gpu_verify_host_rl(1);
         x->nx[0] = gpu_verify_host_nx(0); x->nx[1] = gpu_verify_host_nx(1);
     } else {
+        x->res[0] = eng->d_res_v; x->res[1] = eng->d_res_v + dim;
+        x->shexp[0] = (float*)gpu_get_shexp_dev_ptr(); x->shexp[1] = (float*)gpu_get_shexp2_dev_ptr();
         x->rl[0] = eng->router_logits; x->rl[1] = eng->router_logits2;
         x->nx[0] = eng->norm_x; x->nx[1] = eng->norm_x2;
     }
-    x->q8[0] = eng->q8_normx; x->q8[1] = eng->q8_normx2;
-    x->mb[0] = eng->moe_buf; x->mb[1] = eng->moe_buf2;
-    x->da[0] = eng->down_arr; x->da[1] = eng->down_arr + (size_t)8 * dim;
+    const size_t q8_blocks = dim / QK_K;
+    for (int c = 0; c < n; ++c) {
+        x->q8[c] = eng->q8_normx + (size_t)c * q8_blocks;
+        x->mb[c] = eng->moe_buf  + (size_t)c * dim;
+        x->da[c] = eng->down_arr + (size_t)c * 8 * dim;
+    }
 
     if (eng->hist_tokens) { engine_hist_append(eng, tokens[0]); }
 
@@ -3095,18 +3135,13 @@ static int engine_forward_verify2(engine_t *eng, const int32_t *tokens, int pos0
     // second row cannot overwrite the first before its copy runs (eng->x is pinned: it would).
     const uint8_t *embd_base = (const uint8_t*)m->token_embd.data;
     const size_t embd_row_bytes = ggml_row_size((ggml_type_t)m->token_embd.info.type, dim);
-    for (int c = 0; c < 2; ++c) {
+    for (int c = 0; c < n; ++c) {
         float *hx = eng->batch_x + (size_t)c * dim;
         dequantize_row((ggml_type_t)m->token_embd.info.type, embd_base + (size_t)tokens[c] * embd_row_bytes, hx, dim);
         gpu_memcpy_h2d(x->res[c], hx, (size_t)dim * sizeof(float));
     }
-    gpu_verify_set_positions(pos0, 2);
+    gpu_verify_set_positions(pos0, n);
 
-    // Skewed two-column pipeline. Column 0's layer l+1 depends only on column 0's layer l, so the
-    // stream carries  T0(l) H0(l) T1(l) C0(l) T0(l+1) H1(l) C1(l) T1(l+1) ...  (T trunk, H hits,
-    // C combine) while the host alternates columns: the CPU computes column 0's misses while the
-    // GPU runs column 1's trunk, and column 1's misses while it runs column 0's next layer. The
-    // cache operations still run column 0 then column 1 at every layer.
     const uint32_t n_layers = m->block_count - m->nextn_predict_layers;
     const int async_head = !tuff_exact() && mmvq_dual_enabled();
     int32_t *htok = gpu_pinned_tokens();
@@ -3132,24 +3167,20 @@ static int engine_forward_verify2(engine_t *eng, const int32_t *tokens, int pos0
         }
     }
     }
-    gpu_expert_cache_set_token(x->T0 + 1);
-    if (lockstep && async_head) {
-        const double th = omp_get_wtime();
-        gpu_fused_output_argmax_async(&m->output_weight, x->res[0], (const float*)m->output_norm.dev,
-                                      (int)dim, (int)vocab_size, eps, htok + 0);
-        eng->tv_head += omp_get_wtime() - th;
-    }
-
-    // Output head per column (the single-token kernels on each column's residual).
+    gpu_expert_cache_set_token(x->T0 + (uint64_t)(n - 1));
     const double th0 = omp_get_wtime();
-    if (async_head) {
-        gpu_fused_output_argmax_async(&m->output_weight, x->res[1], (const float*)m->output_norm.dev,
-                                      (int)dim, (int)vocab_size, eps, htok + 1);
+    if (lockstep && async_head) {
+        gpu_lockstep_output_argmax_async_n(&m->output_weight, x->res, (const float*)m->output_norm.dev,
+                                           (int)dim, (int)vocab_size, eps, n, htok);
         gpu_stream_sync();
-        argmax_out[0] = htok[0];
-        argmax_out[1] = htok[1];
+        for (int c = 0; c < n; ++c) argmax_out[c] = htok[c];
+    } else if (async_head) {
+        gpu_fused_output_argmax_async(&m->output_weight, x->res[n - 1], (const float*)m->output_norm.dev,
+                                      (int)dim, (int)vocab_size, eps, htok + (n - 1));
+        gpu_stream_sync();
+        for (int c = 0; c < n; ++c) argmax_out[c] = htok[c];
     }
-    for (int c = 0; c < 2 && !async_head; ++c) {
+    for (int c = 0; c < n && !async_head; ++c) {
         if (!tuff_exact() && mmvq_dual_enabled()) {
             argmax_out[c] = gpu_fused_output_norm_quant_argmax_dev(
                 &m->output_weight, x->res[c], (const float*)m->output_norm.dev, (int)dim, (int)vocab_size, eps, NULL);
@@ -3162,9 +3193,9 @@ static int engine_forward_verify2(engine_t *eng, const int32_t *tokens, int pos0
 
     eng->tv_head += omp_get_wtime() - th0;
     if (getenv("TUFF_VERIFY_DEBUG"))
-        fprintf(stderr, "[VERIFY] pos0=%d T0=%llu in=(%d,%d) out=(%d,%d)\n", pos0, (unsigned long long)x->T0, tokens[0], tokens[1], argmax_out[0], argmax_out[1]);
+        fprintf(stderr, "[VERIFY] pos0=%d T0=%llu n=%d in0=%d out0=%d\n", pos0, (unsigned long long)x->T0, n, tokens[0], argmax_out[0]);
     eng->vpend = 1;
-    eng->batch_n = 2;
+    eng->batch_n = n;
     eng->n_verify++;
     const double dt = omp_get_wtime() - t0;
     eng->t_verify += dt;
@@ -3189,8 +3220,8 @@ int engine_forward_batch(engine_t *eng, const int32_t *tokens, int n, int pos0, 
             return -1;
         }
     }
-    if (n == 2 && !logits_out && verify2_supported(eng)) {
-        return engine_forward_verify2(eng, tokens, pos0, argmax_out);
+    if (n >= 2 && n <= 4 && !logits_out && verify2_supported(eng) && (n == 2 || gpu_has_lockstep_graphs())) {
+        return engine_forward_verify_n(eng, tokens, n, pos0, argmax_out);
     }
     engine_settle(eng);
 

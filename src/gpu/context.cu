@@ -168,7 +168,8 @@ void gpu_prepare_ex(model_t *m, int *p_max_seq, int fill_ram) {
     // VRAM, so the pool - and therefore the cache trajectory - is the same with spec on or off.
     {
         const char *dp = getenv("TUFF_DFLASH");
-        if (dp && *dp) dflash_load(dp, m);
+        if (dp && *dp && strcmp(dp, "0") != 0 && strcmp(dp, "off") != 0 && strcmp(dp, "none") != 0)
+            dflash_load(dp, m);
     }
     gpu_expert_cache_init_ex(m, p_max_seq, fill_ram);
     gpu_expert_cache_prefill(m);

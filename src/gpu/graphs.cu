@@ -289,11 +289,14 @@ extern "C" void gpu_launch_delta_layer_graph_n2(uint32_t delta_layer_idx) {
 // ---------------------------------------------------------------------------
 extern "C" void gpu_verify_set_positions(int pos0, int n);
 extern "C" float *gpu_get_d_res_verify(int dim);
+extern "C" void gpu_delta_commit_nw_slot(int slot, int layer_idx, const model_layer_t *L, float eps, float scale_q,
+                                         int n_k_heads, int n_v_heads, int head_k_dim, int head_v_dim,
+                                         int key_dim, int value_dim, int qkv_dim, int conv_kernel);
 static int *g_d_vpos;
 static cudaGraph_t     g_layer_graphs_nw[64];
 static cudaGraphExec_t g_layer_execs_nw[64];
-static cudaGraph_t     g_commit_graph = NULL;
-static cudaGraphExec_t g_commit_exec = NULL;
+static cudaGraph_t     g_commit_graph[2] = {NULL, NULL};
+static cudaGraphExec_t g_commit_exec[2]  = {NULL, NULL};
 static int g_verify_graphs_ready = 0;
 
 static void nw_delta_layer_body(model_t *m, model_layer_t *layer, uint32_t delta_layer_idx) {
@@ -319,41 +322,48 @@ static void nw_delta_layer_body(model_t *m, model_layer_t *layer, uint32_t delta
     gpu_router_logits_dev_only(&layer->ffn_gate_inp, g_d_norm_x, dim, (int)m->expert_count);
 }
 
-static void commit_body(model_t *m) {
+static void commit_body(model_t *m, int slot) {
     const float eps = m->rms_norm_eps;
     const float scale_q = 1.0f / sqrtf((float)m->ssm_head_k_dim);
     uint32_t di = 0;
     for (uint32_t l = 0; l < m->block_count - m->nextn_predict_layers; ++l) {
         model_layer_t *layer = &m->layers[l];
         if (layer->type == LAYER_TYPE_ATTENTION) continue;
-        gpu_delta_commit_nw((int)di, layer, eps, scale_q,
-                            (int)m->ssm_n_k_heads, (int)m->ssm_n_v_heads,
-                            (int)m->ssm_head_k_dim, (int)m->ssm_head_v_dim,
-                            (int)m->ssm_key_dim, (int)m->ssm_value_dim,
-                            (int)m->ssm_qkv_dim, (int)m->ssm_conv_kernel);
+        gpu_delta_commit_nw_slot(slot, (int)di, layer, eps, scale_q,
+                                 (int)m->ssm_n_k_heads, (int)m->ssm_n_v_heads,
+                                 (int)m->ssm_head_k_dim, (int)m->ssm_head_v_dim,
+                                 (int)m->ssm_key_dim, (int)m->ssm_value_dim,
+                                 (int)m->ssm_qkv_dim, (int)m->ssm_conv_kernel);
         di++;
     }
 }
 
 extern "C" void gpu_capture_verify_graphs(model_t *m) {
     if (!m || g_verify_graphs_ready || !g_layer_graphs_ready) return;
+    const char *ls = getenv("TUFF_VERIFY_LOCKSTEP");
+    const int need_nw_graphs = (ls && ls[0] == '0');
     uint32_t di = 0;
     for (uint32_t l = 0; l < m->block_count - m->nextn_predict_layers; ++l) {
         model_layer_t *layer = &m->layers[l];
         if (layer->type == LAYER_TYPE_ATTENTION) continue;
-        // Dry run (no state is written): every lazy cudaMalloc happens before capture.
-        nw_delta_layer_body(m, layer, di);
-        CUDA_CHECK(cudaStreamSynchronize(0));
-        CUDA_CHECK(cudaStreamBeginCapture(0, cudaStreamCaptureModeRelaxed));
-        nw_delta_layer_body(m, layer, di);
-        CUDA_CHECK(cudaStreamEndCapture(0, &g_layer_graphs_nw[l]));
-        CUDA_CHECK(cudaGraphInstantiate(&g_layer_execs_nw[l], g_layer_graphs_nw[l], NULL, NULL, 0));
+        if (di == 0 || need_nw_graphs) {
+            nw_delta_layer_body(m, layer, di);
+            CUDA_CHECK(cudaStreamSynchronize(0));
+        }
+        if (need_nw_graphs) {
+            CUDA_CHECK(cudaStreamBeginCapture(0, cudaStreamCaptureModeRelaxed));
+            nw_delta_layer_body(m, layer, di);
+            CUDA_CHECK(cudaStreamEndCapture(0, &g_layer_graphs_nw[l]));
+            CUDA_CHECK(cudaGraphInstantiate(&g_layer_execs_nw[l], g_layer_graphs_nw[l], NULL, NULL, 0));
+        }
         di++;
     }
-    CUDA_CHECK(cudaStreamBeginCapture(0, cudaStreamCaptureModeRelaxed));
-    commit_body(m);
-    CUDA_CHECK(cudaStreamEndCapture(0, &g_commit_graph));
-    CUDA_CHECK(cudaGraphInstantiate(&g_commit_exec, g_commit_graph, NULL, NULL, 0));
+    for (int slot = 0; slot < 2; ++slot) {
+        CUDA_CHECK(cudaStreamBeginCapture(0, cudaStreamCaptureModeRelaxed));
+        commit_body(m, slot);
+        CUDA_CHECK(cudaStreamEndCapture(0, &g_commit_graph[slot]));
+        CUDA_CHECK(cudaGraphInstantiate(&g_commit_exec[slot], g_commit_graph[slot], NULL, NULL, 0));
+    }
     g_verify_graphs_ready = 1;
     gpu_reset_delta_state();
     gpu_reset_kv();
@@ -371,8 +381,12 @@ extern "C" void gpu_launch_layer_graph_nw(uint32_t layer_idx) {
     }
 }
 
+extern "C" void gpu_launch_verify_commit_slot(int slot) {
+    if (slot >= 0 && slot < 2 && g_commit_exec[slot]) CUDA_CHECK(cudaGraphLaunch(g_commit_exec[slot], 0));
+}
+
 extern "C" void gpu_launch_verify_commit(void) {
-    if (g_commit_exec) CUDA_CHECK(cudaGraphLaunch(g_commit_exec, 0));
+    gpu_launch_verify_commit_slot(0);
 }
 
 // Lossless verify: per-column positions live on the device, so selecting column c's position for

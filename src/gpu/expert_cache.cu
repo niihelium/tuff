@@ -210,8 +210,9 @@ void gpu_expert_cache_init_ex(model_t *m, int *p_max_seq, int fill_ram) {
     }
 
     const size_t pool_bytes = (size_t)g_n_slots * g_slot_bytes;
-    CUDA_CHECK(cudaMalloc((void**)&g_pool, pool_bytes));
-    CUDA_CHECK(cudaMemset(g_pool, 0, pool_bytes));
+    const size_t alloc_pool_bytes = (size_t)(g_n_slots + 4) * g_slot_bytes;
+    CUDA_CHECK(cudaMalloc((void**)&g_pool, alloc_pool_bytes));
+    CUDA_CHECK(cudaMemset(g_pool, 0, alloc_pool_bytes));
 
     g_total_experts = (int)(m->block_count * m->expert_count);
     g_slots = (expert_slot_meta_t*)calloc((size_t)g_n_slots, sizeof(expert_slot_meta_t));
@@ -904,8 +905,9 @@ static float les_admit_margin(void) {
 }
 unsigned long long gpu_expert_cache_les_rejects(void) { return g_les_rejects; }
 
-// Logical half of a fill. group 0 is queued on the layer's pending list at once; group >= 1
-// (a speculative verify column) is not, until gpu_expert_cache_fill_commit(group) accepts it.
+// Logical half of a fill. Queued on the layer's pending list at once so subsequent columns in a
+// multi-column verify pass see the exact plain-decode cache state; physical copy for group >= 1
+// is held in g_unpushed until gpu_expert_cache_fill_commit(group) accepts the column.
 // Returns 1 if a slot was reserved.
 int gpu_expert_cache_fill_reserve(const model_t *m, uint32_t layer, int expert, int group) {
     if (!g_cache_ready || !g_bg_running || (int)layer >= g_n_lc) return 0;
@@ -930,7 +932,7 @@ int gpu_expert_cache_fill_reserve(const model_t *m, uint32_t layer, int expert, 
     g_fill_model = m;
     g_slots[slot].expert = expert;
     g_slots[slot].fill_token = g_ctok;
-    if (group == 0) lc->pend[lc->n_pend++] = slot;
+    lc->pend[lc->n_pend++] = slot;
     g_unpushed[g_n_unpushed].slot = slot;
     g_unpushed[g_n_unpushed].group = group;
     g_unpushed[g_n_unpushed].expert = expert;
@@ -949,15 +951,9 @@ void gpu_expert_cache_fill_push(int group) {
     g_n_unpushed = w;
 }
 
-// A verify column was accepted: its reserved fills join their layers' pending lists (in order)
-// and are pushed.
+// A verify column was accepted: its reserved fills are already in their layers' pending lists
+// (or claimed by a subsequent verify column) and are now pushed to the background fill thread.
 void gpu_expert_cache_fill_commit(int group) {
-    for (int i = 0; i < g_n_unpushed; ++i) {
-        if (g_unpushed[i].group != group) continue;
-        const int s = g_unpushed[i].slot;
-        layer_cache_t *lc = &g_lc[g_slots[s].layer];
-        if (lc->n_pend < LAYER_PEND_MAX) lc->pend[lc->n_pend++] = s;
-    }
     gpu_expert_cache_fill_push(group);
 }
 
@@ -969,6 +965,40 @@ void gpu_expert_cache_fill_drop(int group) {
         if (g_unpushed[i].group != group) g_unpushed[w++] = g_unpushed[i];
     }
     g_n_unpushed = w;
+}
+
+// If a speculative verify column c >= 2 hits on a slot whose fill was reserved by an earlier
+// speculative column (c' in 1..c-1) at the same layer, the slot's device memory still holds the
+// victim's weights (because c' is not yet committed). Stage the hit expert's weights into one of
+// the 8 scratch slots at the end of g_pool on stream 0 and return that scratch slot index.
+static int g_scratch_rr = 0;
+int gpu_expert_cache_resolve_hit_slot(const model_t *m, uint32_t layer, int slot, int expert) {
+    if (slot < 0) return slot;
+    int is_unpushed = 0;
+    for (int i = g_n_unpushed - 1; i >= 0; --i) {
+        if (g_unpushed[i].slot == slot) {
+            is_unpushed = (g_unpushed[i].group >= 1);
+            break;
+        }
+    }
+    if (!is_unpushed) return slot;
+    const int sc = g_n_slots + (g_scratch_rr++ & 3);
+    const model_layer_t *L = &m->layers[layer];
+    const int dim = (int)m->embedding_length;
+    const int ffn = (int)m->expert_ffn_length;
+    const ggml_type_t gtype = (ggml_type_t)L->ffn_gate_exps.info.type;
+    const ggml_type_t dtype = (ggml_type_t)L->ffn_down_exps.info.type;
+    const size_t gate_bytes = ggml_row_size(gtype, dim) * ffn;
+    const size_t up_bytes   = gate_bytes;
+    const size_t down_bytes = ggml_row_size(dtype, ffn) * dim;
+    char *base = g_pool + (size_t)sc * g_slot_bytes;
+    const uint8_t *gate = (const uint8_t*)L->ffn_gate_exps.data + (size_t)expert * gate_bytes;
+    const uint8_t *up   = (const uint8_t*)L->ffn_up_exps.data   + (size_t)expert * up_bytes;
+    const uint8_t *down = (const uint8_t*)L->ffn_down_exps.data + (size_t)expert * down_bytes;
+    CUDA_CHECK(cudaMemcpyAsync(base + g_tensor_off[0], gate, gate_bytes, cudaMemcpyHostToDevice, 0));
+    CUDA_CHECK(cudaMemcpyAsync(base + g_tensor_off[1], up,   up_bytes,   cudaMemcpyHostToDevice, 0));
+    CUDA_CHECK(cudaMemcpyAsync(base + g_tensor_off[2], down, down_bytes, cudaMemcpyHostToDevice, 0));
+    return sc;
 }
 
 int gpu_expert_cache_bgfill(const model_t *m, uint32_t layer, int expert) {
@@ -986,7 +1016,7 @@ void gpu_expert_cache_wait_slots(const int *slots, int n) {
     uint64_t need = 0;
     for (int i = 0; i < n; ++i) {
         const int s = slots[i];
-        if (s >= 0 && g_slot_ready[s] > need) need = g_slot_ready[s];
+        if (s >= 0 && s < g_n_slots && g_slot_ready[s] > need) need = g_slot_ready[s];
     }
     if (need == 0 || need <= g_bg_done) return;
     bg_advance_done();

@@ -79,11 +79,12 @@ typedef struct {
     // recurrent-state effects open until the caller says how many columns it keeps
     // (engine_rollback), or until the next engine call (both kept).
     int      vpend;
+    int      v_ncols;
     uint64_t vtok0;              // logical expert-cache token of column 0
     int      vpos0, v_lockstep;   // the pass's first position; whether it ran the lockstep graphs
-    struct expert_layer_snap *vsnap;
-    float   *d_res_v;            // device [2][dim]: the pass's per-column residual streams
-    void    *vev[2];             // per-column router-copy events
+    struct expert_layer_snap *vsnap[3];
+    float   *d_res_v;            // device [4][dim]: the pass's per-column residual streams
+    void    *vev[4];             // per-column router-copy events
     double   t_verify;
     double   tv_cpu; unsigned long long nv_cpu_miss;
     double   tv_trunk, tv_sync, tv_host, tv_pub, tv_hits, tv_pool, tv_comb, tv_head;

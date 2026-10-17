@@ -197,6 +197,7 @@ uint64_t gpu_expert_cache_get_token(void);
 void     gpu_expert_cache_token_end(void);
 void     gpu_expert_cache_layer_begin(uint32_t layer);
 int      gpu_expert_cache_fill_reserve(const model_t *m, uint32_t layer, int expert, int group);
+int      gpu_expert_cache_resolve_hit_slot(const model_t *m, uint32_t layer, int slot, int expert);
 void     gpu_expert_cache_fill_push(int group);
 void     gpu_expert_cache_fill_commit(int group);
 void     gpu_expert_cache_fill_drop(int group);
@@ -423,6 +424,7 @@ void  gpu_capture_verify_graphs(model_t *m);
 int   gpu_has_verify_graphs(void);
 void  gpu_launch_layer_graph_nw(uint32_t layer_idx);
 void  gpu_launch_verify_commit(void);
+void  gpu_launch_verify_commit_slot(int slot);
 void  gpu_verify_set_positions(int pos0, int n);
 void  gpu_verify_select_pos(int c);
 void  gpu_memcpy_d2d(void *dst, const void *src, size_t bytes);
@@ -439,8 +441,13 @@ void  gpu_stream_sync(void);
 void  gpu_capture_lockstep_graphs(model_t *m);
 int   gpu_has_lockstep_graphs(void);
 void  gpu_launch_lockstep(uint32_t l);
+void  gpu_launch_lockstep_n(int ncols, uint32_t l);
 float *gpu_lockstep_host_rl(int c);
 float *gpu_lockstep_host_nx(int c);
+float *gpu_lockstep_shexp(int c);
+void  gpu_lockstep_output_argmax_async_n(const tensor_t *output_weight, float * const res[4],
+                                         const float *d_norm_w, int in_dim, int vocab_size,
+                                         float eps, int ncols, int32_t *h_tok);
 void *gpu_event_new(void);
 void  gpu_event_record(void *ev);
 void  gpu_event_sync(void *ev);
@@ -453,6 +460,9 @@ void  gpu_delta_fused_gdn_dev_nw(int layer_idx, const model_layer_t *L, float *d
 void  gpu_delta_commit_nw(int layer_idx, const model_layer_t *L, float eps, float scale_q,
                           int n_k_heads, int n_v_heads, int head_k_dim, int head_v_dim,
                           int key_dim, int value_dim, int qkv_dim, int conv_kernel);
+void  gpu_delta_commit_nw_slot(int slot, int layer_idx, const model_layer_t *L, float eps, float scale_q,
+                               int n_k_heads, int n_v_heads, int head_k_dim, int head_v_dim,
+                               int key_dim, int value_dim, int qkv_dim, int conv_kernel);
 void  gpu_capture_delta_graphs_n2(model_t *m);
 void  gpu_launch_delta_layer_graph_n2(uint32_t delta_layer_idx);
 const float *gpu_get_shexp2_dev_ptr(void);

@@ -431,7 +431,7 @@ static void spec_init(spec_t *s, const engine_vtable_t *vt, int ctx, int nmax, i
 static void spec_set_engine_cap(spec_t *s, tuff_arch_t arch, void *eng) {
     if (arch != TUFF_ARCH_QWEN35MOE) return;
     static int warned = 0;
-    if (engine_exact_verify_available((const engine_t*)eng)) { s->k_cap = 1; return; }
+    if (engine_exact_verify_available((const engine_t*)eng)) { s->k_cap = dflash_active() ? 3 : 1; return; }
     s->k_cap = 0;
     if (!warned) {
         fprintf(stderr, "[Tuff] spec: exact verify unavailable in this configuration; speculation disabled (output stays lossless)\n");
@@ -571,29 +571,31 @@ static int spec_step(spec_t *s, int32_t t, int pos, int rem, int32_t *out) {
     if (kcap > s->ctx - 1 - pos) kcap = s->ctx - 1 - pos;
     int32_t d[SPEC_KMAX];
     int ml = 0, dl = 0, k = 0, b = 0;
-    if (kcap > 0 && (g_spec_cost_measured || s->k_fixed || is_copying || s->n_single >= 8)) {   // static table: calibrate m1 on 8 single steps first
+    if (kcap > 0 && (dflash_active() || g_spec_cost_measured || s->k_fixed || is_copying || s->n_single >= 8)) {   // static table: calibrate m1 on 8 single steps first
         if (dflash_active()) {   // DFlash2 block drafter (Qwen): always has a draft
-            dl = dflash_draft(t, pos, kcap, d);
+            const int k_req = (s->k_fixed && s->k_fixed < kcap) ? s->k_fixed : kcap;
+            dl = dflash_draft(t, pos, k_req, d);
+            k = dl;
             ml = 6;
         } else {
             dl = spec_lookup(s, d, kcap, &ml);
-        }
-        if (dl > 0) {
-            b = spec_bucket(ml);
-            k = (is_copying && !s->k_fixed) ? dl : spec_choose_k(s, dl, b);
-            // Loss guard: the worst case of a batch step (every draft rejected: one token for cost(k+1)) must fit in the
-            // budget  net gain so far + 0.5% of the elapsed time + one single-token time;  k shrinks until it does, so
-            // probing is rate-limited to ~0.5% of the run when drafts keep failing and free when they pay.
-            // Bypassed during active copying (Phase Q3).
-            if (k > 0 && !s->k_fixed && !is_copying) {
-                const double c1 = g_spec_cost[1] * s->m1;
-                const double budget = s->gain + 0.005 * (omp_get_wtime() - s->t_first) + 1.0 * c1;
-                while (k > 0 && g_spec_cost[k + 1] * s->m1 * s->mb - c1 > budget) k--;
-                if (k == 0) s->guarded++;
-            }
-            if (k == 0) {   // draft skipped: let the evidence fade toward the prior so the bucket gets re-probed
-                s->acc[b] *= 0.9; s->att[b] *= 0.9;
-                s->no_spec_with_draft++;
+            if (dl > 0) {
+                b = spec_bucket(ml);
+                k = (is_copying && !s->k_fixed) ? dl : spec_choose_k(s, dl, b);
+                // Loss guard: the worst case of a batch step (every draft rejected: one token for cost(k+1)) must fit in the
+                // budget  net gain so far + 0.5% of the elapsed time + one single-token time;  k shrinks until it does, so
+                // probing is rate-limited to ~0.5% of the run when drafts keep failing and free when they pay.
+                // Bypassed during active copying (Phase Q3).
+                if (k > 0 && !s->k_fixed && !is_copying) {
+                    const double c1 = g_spec_cost[1] * s->m1;
+                    const double budget = s->gain + 0.005 * (omp_get_wtime() - s->t_first) + 1.0 * c1;
+                    while (k > 0 && g_spec_cost[k + 1] * s->m1 * s->mb - c1 > budget) k--;
+                    if (k == 0) s->guarded++;
+                }
+                if (k == 0) {   // draft skipped: let the evidence fade toward the prior so the bucket gets re-probed
+                    s->acc[b] *= 0.9; s->att[b] *= 0.9;
+                    s->no_spec_with_draft++;
+                }
             }
         }
     }
@@ -627,6 +629,7 @@ static int spec_step(spec_t *s, int32_t t, int pos, int rem, int32_t *out) {
     int m = 0;
     while (m < k && d[m] == am[m]) m++;
     for (int i = 0; i <= m; ++i) { out[i] = am[i]; spec_push(s, am[i]); }
+    if (dflash_active()) dflash_commit_stage(m + 1, pos);
     if (m < k && vt->engine_rollback(s->eng, m + 1) != 0) {
         fprintf(stderr, "[Tuff] FATAL: speculative engine_rollback(%d) failed at position %d\n", m + 1, pos);
         job_exit(1);
@@ -999,11 +1002,15 @@ static int job_prepare(job_cfg_t *cfg) {
 
     cfg->is_lfm = arch_is_lfm(cfg->arch);
 
-    // Qwen: lossless n-gram speculation is the default for greedy generation (2026-10-17: the
-    // exact two-token verify makes the output token-identical to --no-spec; corpus A/B +0.7%
-    // geomean, see ITERATION_LOG). --no-spec / any --spec-* flag overrides; TUFF_NO_SPEC=1 too.
+    // Qwen: lossless DFlash2 speculation (k=3, 4-col lockstep verify, Q8_0 drafter) is the default
+    // for greedy generation when the DFlash2 drafter GGUF is present (falls back to n-gram spec
+    // otherwise). --no-spec / any --spec-* flag overrides; TUFF_NO_SPEC=1 or --dflash none too.
     if (cfg->arch == TUFF_ARCH_QWEN35MOE && !cfg->spec_explicit && !getenv("TUFF_NO_SPEC") &&
         cfg->sampler_params.temp <= 0.0f && !cfg->teacher_force_path && !cfg->dump_logits_path && !cfg->chat_mode) {
+        if (!tuff_exact() && !getenv("TUFF_DFLASH")) {
+            const char *def_df = "/run/media/nii/pohjola/models/incoai/Qwen3.6-35B-A3B-DFlash2/Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf";
+            if (access(def_df, R_OK) == 0) setenv("TUFF_DFLASH", def_df, 0);
+        }
         cfg->spec_ngram_requested = true;
         cfg->spec_mtp_mode = true;
         cfg->g_spec_mtp = 1;
