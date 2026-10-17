@@ -82,7 +82,9 @@ typedef struct {
     uint64_t vtok0;              // logical expert-cache token of column 0
     struct expert_layer_snap *vsnap;
     float   *d_res_v;            // device [2][dim]: the pass's per-column residual streams
+    void    *vev[2];             // per-column router-copy events
     double   t_verify;
+    double   tv_trunk, tv_sync, tv_host, tv_pub, tv_hits, tv_pool, tv_comb, tv_head;
     unsigned long long n_verify, n_verify_kept2;
 } engine_t;
 

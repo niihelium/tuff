@@ -506,13 +506,24 @@ static unsigned long long g_bg_committed = 0;
 // Apply the claims every earlier logical token owes this layer. Lazy, but the observable state is
 // the old token-boundary commit's: claims land in reservation order, before the first access of a
 // later token, and nothing else touches the layer in between.
+// TUFF_FILL_LAG (default 0): a fill reserved at token t is claimed by token t + 1 + lag. With
+// lag 0 it is the old next-token commit; with lag 1 a copy always has a whole token to land, and in
+// a two-token verify column 1 never needs a fill column 0 issued in the same pass (that copy would
+// otherwise queue behind every upload already on the copy engine, and stall the stream).
+static uint64_t fill_lag(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TUFF_FILL_LAG"); v = (e && *e) ? atoi(e) : 0; if (v < 0) v = 0; }
+    return (uint64_t)v;
+}
+
 static void layer_begin(uint32_t layer) {
     layer_cache_t *lc = &g_lc[layer];
     if (lc->begun_tok == g_ctok + 1) return;
+    const uint64_t lag = fill_lag();
     int w = 0;
     for (int i = 0; i < lc->n_pend; ++i) {
         const int s = lc->pend[i];
-        if (g_slots[s].fill_token < g_ctok) {
+        if (g_slots[s].fill_token + lag < g_ctok) {
             expert_slot_claim(s, layer, g_slots[s].expert);
             g_bg_committed++;
         } else {
@@ -819,9 +830,19 @@ static void bgfill_stop(void) {
     g_bg_running = 0;
 }
 
+static unsigned long long g_sw_n = 0, g_sw_gap = 0, g_sw_behind = 0;
+static double g_bg_wait_s = 0.0;
+static unsigned long long g_bg_wait_n = 0;
 static void bg_wait_submitted(unsigned long seq) {
+    if (__atomic_load_n(&g_bg_sub, __ATOMIC_ACQUIRE) > seq) return;
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
     while (__atomic_load_n(&g_bg_sub, __ATOMIC_ACQUIRE) <= seq) sched_yield();
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    g_bg_wait_s += (double)(b.tv_sec - a.tv_sec) + 1e-9 * (double)(b.tv_nsec - a.tv_nsec);
+    g_bg_wait_n++;
 }
+void gpu_expert_cache_wait_stats(double *s, unsigned long long *n) { *s = g_bg_wait_s; *n = g_bg_wait_n; }
 
 // Advance g_bg_done over completed requests (non-blocking).
 static void bg_advance_done(void) {
@@ -875,6 +896,13 @@ static int expert_slot_reserve(uint32_t layer) {
 }
 
 static const model_t *g_fill_model = NULL;
+static unsigned long long g_les_rejects = 0;
+static float les_admit_margin(void) {
+    static float v = -2.0f;
+    if (v < -1.5f) { const char *e = getenv("TUFF_LES_ADMIT"); v = (e && *e) ? (float)atof(e) : -1.0f; }
+    return v;
+}
+unsigned long long gpu_expert_cache_les_rejects(void) { return g_les_rejects; }
 
 // Logical half of a fill. group 0 is queued on the layer's pending list at once; group >= 1
 // (a speculative verify column) is not, until gpu_expert_cache_fill_commit(group) accepts it.
@@ -884,6 +912,18 @@ int gpu_expert_cache_fill_reserve(const model_t *m, uint32_t layer, int expert, 
     layer_begin(layer);
     layer_cache_t *lc = &g_lc[layer];
     if (lc->n_pend >= LAYER_PEND_MAX || g_n_unpushed >= UNPUSHED_MAX) return 0;
+    // LES admission (TUFF_LES_ADMIT=<margin>, off when unset): an eviction is a 1.95 MiB PCIe copy,
+    // so only make it when the incoming expert's LES score beats the victim's by the margin. Both
+    // scores are this layer's own (decayed routing frequency), so the decision stays a function of
+    // the layer's token history and the speculative verify remains lossless.
+    if (les_admit_margin() >= 0.0f && g_moe_policy && lc->n_free == 0) {
+        float sv = 0.0f;
+        if (select_tail_victim_slot_score(layer, &sv) >= 0 &&
+            moe_policy_score(g_moe_policy, (int)layer, expert) <= sv + les_admit_margin()) {
+            g_les_rejects++;
+            return 0;
+        }
+    }
     const int slot = expert_slot_reserve(layer);
     if (slot < 0) return 0;
     g_fill_model = m;
@@ -952,7 +992,13 @@ void gpu_expert_cache_wait_slots(const int *slots, int n) {
     if (need <= g_bg_done) return;
     const unsigned long seq = (unsigned long)(need - 1);
     bg_wait_submitted(seq);
+    g_sw_n++;
+    g_sw_gap += (unsigned long long)(g_bg_prod - g_bg_done);
+    g_sw_behind += (unsigned long long)(need - g_bg_done);
     CUDA_CHECK(cudaStreamWaitEvent(0, g_bg[seq % BGFILL_QUEUE].ev, 0));
+}
+void gpu_expert_cache_streamwait_stats(unsigned long long *n, unsigned long long *gap, unsigned long long *behind) {
+    *n = g_sw_n; *gap = g_sw_gap; *behind = g_sw_behind;
 }
 
 // --- Logical snapshot of one layer (a speculative column's cache operations are undone if the
