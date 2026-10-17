@@ -305,6 +305,10 @@ typedef struct {
     unsigned long long guarded, n_single;
     double m1, mb;   // live cost scales (EMA): m1 = measured/table single-token time; mb = measured batch time / (table batch time x m1)
     unsigned long long steps, drafted, accepted, no_spec_with_draft, hist_k[SPEC_KMAX + 1];
+    // Phase Q3: Dynamic Long Block & Sticky Hold
+    int copy_full_accept_streak;
+    int copy_sticky_hold;
+    int k_long;
 } spec_t;
 
 static int spec_cmp_double(const void *a, const void *b) {
@@ -315,9 +319,20 @@ static int spec_cmp_double(const void *a, const void *b) {
 // Static cost table (also the fallback whenever measuring fails): batch(n) = 0.9 n single-token times (the measured
 // 8B/24B MoE verify cost, where experts run per token and only the trunk is shared), single = 1 unit, scaled to a
 // nominal ~30 ms/token (only ratios matter; the live cost scale corrects the absolute level).
-static void spec_static_costs(void) {
-    for (int n = 1; n <= SPEC_KMAX + 1; ++n) g_spec_cost[n] = 0.9 * n;
-    g_spec_cost[1] = 1.0;
+static void spec_static_costs(tuff_arch_t arch) {
+    if (arch == TUFF_ARCH_QWEN35MOE) {
+        // Measured verify costs for Qwen 35b-a3b with expert union (Task Q1.2 / Q1.3):
+        // N=1: 1.00x, N=2: 1.75x, N=3: 2.55x, N=4: 3.35x, N=5: 4.10x, N=6: 4.75x, N=7: 5.30x, N=8: 5.80x
+        static const double qwen_cost_ratios[SPEC_KMAX + 2] = {
+            0.0, 1.00, 1.75, 2.55, 3.35, 4.10, 4.75, 5.30, 5.80
+        };
+        for (int n = 1; n <= SPEC_KMAX + 1; ++n) {
+            g_spec_cost[n] = (n <= 8) ? qwen_cost_ratios[n] : (5.80 + 0.6 * (n - 8));
+        }
+    } else {
+        for (int n = 1; n <= SPEC_KMAX + 1; ++n) g_spec_cost[n] = 0.9 * n;
+        g_spec_cost[1] = 1.0;
+    }
     for (int n = 1; n <= SPEC_KMAX + 1; ++n) g_spec_cost[n] *= 0.030;
     g_spec_cost_measured = 0;
 }
@@ -326,9 +341,9 @@ static void spec_static_costs(void) {
 // the real table; MoE engines keep the static one (measuring on a scratch engine perturbs the 24B expert cache) and
 // rely on the live cost scale. Any failure (context too small, engine init / forward error, non-positive timing)
 // falls back to the static table, so no cost is ever zero (the policy divides by them).
-static void spec_measure_costs(const engine_vtable_t *vt, void *model, int ctx, const sampler_params_t *sp,
+static void spec_measure_costs(tuff_arch_t arch, const engine_vtable_t *vt, void *model, int ctx, const sampler_params_t *sp,
                                const int32_t *prompt, int n_prompt, int kmax, int do_measure) {
-    spec_static_costs();
+    spec_static_costs(arch);
     if (!do_measure) return;
     int sum_n = 0;
     for (int n = 2; n <= kmax + 1; ++n) sum_n += n;
@@ -389,6 +404,9 @@ static void spec_print_policy(const spec_t *s) {
         for (int n = 2; n <= s->kmax + 1; ++n) fprintf(stderr, ", batch%d %.3f (%.2fx single-token time)", n, g_spec_cost[n] * 1e3,
                                                      g_spec_cost[n] / (g_spec_cost[1] * n));
         fprintf(stderr, "\n");
+        if (s->k_long > s->kmax) {
+            fprintf(stderr, "[Tuff] spec policy (Q3): dynamic long-block trigger (k=%d on 2x full accept, sticky hold 3)\n", s->k_long);
+        }
     }
 }
 
@@ -397,6 +415,11 @@ static void spec_init(spec_t *s, const engine_vtable_t *vt, int ctx, int nmax, i
     s->vt = vt; s->ctx = ctx; s->nmax = nmax; s->nmin = nmin; s->kmax = kmax; s->k_fixed = k_fixed;
     s->cap = ctx + 16;
     s->hist = (int32_t*)malloc((size_t)s->cap * sizeof(int32_t));
+    s->copy_full_accept_streak = 0;
+    s->copy_sticky_hold = 0;
+    const char *env_kl = getenv("TUFF_LONG_BLOCK");
+    s->k_long = (env_kl && env_kl[0]) ? atoi(env_kl) : SPEC_KMAX;
+    if (s->k_long < 1 || s->k_long > SPEC_KMAX) s->k_long = SPEC_KMAX;
 }
 
 // Reset per-run state for a fresh engine.
@@ -407,6 +430,11 @@ static void spec_begin_run(spec_t *s, void *eng) {
     for (int b = 0; b < SPEC_NBUCKET; ++b) { s->acc[b] = 0.0; s->att[b] = 0.0; }
     s->steps = s->drafted = s->accepted = s->no_spec_with_draft = 0;
     memset(s->hist_k, 0, sizeof(s->hist_k));
+    s->copy_full_accept_streak = 0;
+    s->copy_sticky_hold = 0;
+    const char *env_kl = getenv("TUFF_LONG_BLOCK");
+    s->k_long = (env_kl && env_kl[0]) ? atoi(env_kl) : SPEC_KMAX;
+    if (s->k_long < 1 || s->k_long > SPEC_KMAX) s->k_long = SPEC_KMAX;
 }
 
 static void spec_push(spec_t *s, int32_t t) {
@@ -417,26 +445,68 @@ static int spec_bucket(int ml) {
     return ml <= 2 ? 0 : ml == 3 ? 1 : ml <= 5 ? 2 : ml <= 8 ? 3 : ml <= 16 ? 4 : 5;
 }
 
-// Prompt lookup: returns the number of draft tokens written to d (0 = no match); *ml = match length (capped at 32).
+// Prompt lookup (Phase Q2): longest match with recency tie-break, up to nmax cap (HyperQwen: 12),
+// with overlap support for periodic repetition (list markers, code indentation).
+// Returns the number of draft tokens written to d (0 = no match); *ml_out = match length.
 static int spec_lookup(const spec_t *s, int32_t *d, int kcap, int *ml_out) {
     const int32_t *h = s->hist;
     const int L = s->n_hist;
-    for (int n = s->nmax; n >= s->nmin; --n) {
-        if (L < n + 1) continue;
-        for (int j = L - 2; j >= n - 1; --j) {   // j = last index of the candidate occurrence; j+1 <= L-1 exists
-            int i = 0;
-            while (i < n && h[j - i] == h[L - 1 - i]) i++;
-            if (i < n) continue;
-            int ml = n;
-            while (ml < 32 && j - ml >= 0 && h[j - ml] == h[L - 1 - ml]) ml++;
-            int k = L - 1 - j;
-            if (k > kcap) k = kcap;
-            for (int q = 0; q < k; ++q) d[q] = h[j + 1 + q];
-            *ml_out = ml;
-            return k;
+    const int nmin = s->nmin > 0 ? s->nmin : 2;
+    const int nmax = s->nmax >= nmin ? s->nmax : 12;
+    if (L < nmin + 2 || kcap <= 0) return 0;
+
+    const int search_max = 8192;
+    const int lo = (L - search_max > nmin - 1) ? (L - search_max) : (nmin - 1);
+    const int hi = L - 1;
+
+    int best_ml = 0;
+    int best_e = -1;
+
+    const int32_t last_tok = h[L - 1];
+    const int32_t min_tok = h[L - nmin];
+
+    for (int e = hi - 1; e >= lo; --e) {
+        // Fast early rejection on 2 anchor tokens
+        if (h[e] != last_tok || h[e - (nmin - 1)] != min_tok) continue;
+
+        // Verify remaining NMIN prefix
+        int match = 1;
+        for (int j = 1; j < nmin - 1; ++j) {
+            if (h[e - j] != h[L - 1 - j]) { match = 0; break; }
+        }
+        if (!match) continue;
+
+        // Extension loop from NMIN up to NMAX
+        int ml = nmin;
+        while (ml < nmax && (e - ml >= 0) && (h[e - ml] == h[L - 1 - ml])) {
+            ml++;
+        }
+
+        // Longest match with recency tie-break:
+        // Iterating backwards from hi-1 down to lo with strict '>' ensures the newest candidate wins ties.
+        if (ml > best_ml) {
+            best_ml = ml;
+            best_e = e;
+            if (best_ml >= nmax) break; // Reached cap
         }
     }
-    return 0;
+
+    if (best_ml < nmin || best_e < 0) return 0;
+
+    // Period-p repetition handling (Task Q2.2): allow overlap
+    const int p = L - 1 - best_e;
+    const int k = kcap;
+    for (int q = 0; q < k; ++q) {
+        if (best_e + 1 + q < L) {
+            d[q] = h[best_e + 1 + q];
+        } else if (p > 0) {
+            d[q] = d[q - p];
+        } else {
+            d[q] = h[best_e];
+        }
+    }
+    *ml_out = best_ml;
+    return k;
 }
 
 static double spec_p(const spec_t *s, int b) {
@@ -462,19 +532,37 @@ static int spec_choose_k(const spec_t *s, int dl, int b) {
 static int spec_step(spec_t *s, int32_t t, int pos, int rem, int32_t *out) {
     const engine_vtable_t *vt = s->vt;
     if (s->t_first < 0.0) s->t_first = omp_get_wtime();
-    int kcap = s->kmax < rem - 1 ? s->kmax : rem - 1;
+
+    // Phase Q3: Dynamic Long-Block Trigger & Sticky Hold
+    int eff_kmax = s->kmax;
+    int is_copying = 0;
+    if (!s->k_fixed) {
+        if (s->copy_full_accept_streak >= 2) {
+            is_copying = 1;
+            s->copy_sticky_hold = 3;
+        } else if (s->copy_sticky_hold > 0) {
+            is_copying = 1;
+            s->copy_sticky_hold--;
+        }
+        if (is_copying && s->k_long > eff_kmax) {
+            eff_kmax = s->k_long;
+        }
+    }
+
+    int kcap = eff_kmax < rem - 1 ? eff_kmax : rem - 1;
     if (kcap > s->ctx - 1 - pos) kcap = s->ctx - 1 - pos;
     int32_t d[SPEC_KMAX];
     int ml = 0, dl = 0, k = 0, b = 0;
-    if (kcap > 0 && (g_spec_cost_measured || s->k_fixed || s->n_single >= 8)) {   // static table: calibrate m1 on 8 single steps first
+    if (kcap > 0 && (g_spec_cost_measured || s->k_fixed || is_copying || s->n_single >= 8)) {   // static table: calibrate m1 on 8 single steps first
         dl = spec_lookup(s, d, kcap, &ml);
         if (dl > 0) {
             b = spec_bucket(ml);
-            k = spec_choose_k(s, dl, b);
+            k = (is_copying && !s->k_fixed) ? dl : spec_choose_k(s, dl, b);
             // Loss guard: the worst case of a batch step (every draft rejected: one token for cost(k+1)) must fit in the
             // budget  net gain so far + 0.5% of the elapsed time + one single-token time;  k shrinks until it does, so
             // probing is rate-limited to ~0.5% of the run when drafts keep failing and free when they pay.
-            if (k > 0 && !s->k_fixed) {
+            // Bypassed during active copying (Phase Q3).
+            if (k > 0 && !s->k_fixed && !is_copying) {
                 const double c1 = g_spec_cost[1] * s->m1;
                 const double budget = s->gain + 0.005 * (omp_get_wtime() - s->t_first) + 1.0 * c1;
                 while (k > 0 && g_spec_cost[k + 1] * s->m1 * s->mb - c1 > budget) k--;
@@ -490,6 +578,7 @@ static int spec_step(spec_t *s, int32_t t, int pos, int rem, int32_t *out) {
     s->hist_k[k]++;
     const double t0 = omp_get_wtime();
     if (k == 0) {
+        s->copy_full_accept_streak = 0;
         out[0] = vt->engine_forward_token(s->eng, t, pos);
         if (out[0] < 0) {
             fprintf(stderr, "[Tuff] FATAL: engine_forward_token failed at position %d\n", pos);
@@ -518,6 +607,12 @@ static int spec_step(spec_t *s, int32_t t, int pos, int rem, int32_t *out) {
     if (m < k && vt->engine_rollback(s->eng, m + 1) != 0) {
         fprintf(stderr, "[Tuff] FATAL: speculative engine_rollback(%d) failed at position %d\n", m + 1, pos);
         job_exit(1);
+    }
+    // Phase Q3: Track full block acceptance streak
+    if (k > 0 && m == k) {
+        s->copy_full_accept_streak++;
+    } else {
+        s->copy_full_accept_streak = 0;
     }
     if (!s->k_fixed) {
         const double dt = omp_get_wtime() - t0;
@@ -593,7 +688,7 @@ static void cfg_init(job_cfg_t *cfg) {
     cfg->system_prompt = "You are a helpful, respectful and honest AI assistant.";
     cfg->max_context_len = 131072;
     cfg->max_gen_tokens = 1024;
-    cfg->spec_mtp_mode = true;
+    cfg->spec_mtp_mode = false;   // speculation is opt-in (see g_spec_mtp in engine.c)
     cfg->spec_k_max = 4;
     cfg->n_predict = -1;
     cfg->n_warmup = 32;
@@ -660,6 +755,7 @@ static int parse_args(int argc, char **argv, job_cfg_t *cfg, int *rc) {
         } else if (strcmp(argv[i], "--spec-mtp") == 0) {
             cfg->spec_mtp_mode = true;
             cfg->g_spec_mtp = 1;
+            if (cfg->g_spec_draft == SPEC_DRAFT_NONE) cfg->g_spec_draft = SPEC_DRAFT_NGRAM;   // the pre-opt-in default
         } else if (strncmp(argv[i], "--spec-draft=", 13) == 0) {
             cfg->spec_mtp_mode = true;
             cfg->g_spec_mtp = 1;
@@ -709,20 +805,20 @@ static int parse_args(int argc, char **argv, job_cfg_t *cfg, int *rc) {
             }
         } else if ((strcmp(argv[i], "--spec-ngram") == 0 || strcmp(argv[i], "--spec-ngram-max") == 0) && i + 1 < argc) {
             cfg->g_spec_ngram_n = atoi(argv[++i]);
-            if (cfg->g_spec_ngram_n < 1 || cfg->g_spec_ngram_n > 8) {
-                fprintf(stderr, "Error: --spec-ngram must be between 1 and 8 (got %d)\n", cfg->g_spec_ngram_n);
+            if (cfg->g_spec_ngram_n < 1 || cfg->g_spec_ngram_n > 16) {
+                fprintf(stderr, "Error: --spec-ngram must be between 1 and 16 (got %d)\n", cfg->g_spec_ngram_n);
                 { *rc = 2; return 0; }
             }
         } else if (strcmp(argv[i], "--spec-ngram-min") == 0 && i + 1 < argc) {
             cfg->g_spec_ngram_min = atoi(argv[++i]);
-            if (cfg->g_spec_ngram_min < 1 || cfg->g_spec_ngram_min > 8) {
-                fprintf(stderr, "Error: --spec-ngram-min must be between 1 and 8 (got %d)\n", cfg->g_spec_ngram_min);
+            if (cfg->g_spec_ngram_min < 1 || cfg->g_spec_ngram_min > 16) {
+                fprintf(stderr, "Error: --spec-ngram-min must be between 1 and 16 (got %d)\n", cfg->g_spec_ngram_min);
                 { *rc = 2; return 0; }
             }
         } else if ((strcmp(argv[i], "--spec-draft-len") == 0 || strcmp(argv[i], "--draft-len") == 0) && i + 1 < argc) {
             cfg->g_spec_draft_len = atoi(argv[++i]);
-            if (cfg->g_spec_draft_len < 1 || cfg->g_spec_draft_len > 3) {
-                fprintf(stderr, "Error: --spec-draft-len must be between 1 and 3 (got %d)\n", cfg->g_spec_draft_len);
+            if (cfg->g_spec_draft_len < 1 || cfg->g_spec_draft_len > SPEC_KMAX) {
+                fprintf(stderr, "Error: --spec-draft-len must be between 1 and %d (got %d)\n", SPEC_KMAX, cfg->g_spec_draft_len);
                 { *rc = 2; return 0; }
             }
         } else if (strcmp(argv[i], "--spec-k") == 0 && i + 1 < argc) {
@@ -1016,7 +1112,7 @@ static int run_job(const engine_vtable_t *vtable, void *model, job_cfg_t *cfg) {
     }
     if (n_runs < 1 || n_warmup < 0 || n_predict < 1) return 2;   // job_prepare() rejects these already
 
-    spec_static_costs();   // the cost table is per-job state: never inherit a previous job's measurement
+    spec_static_costs(arch);   // the cost table is per-job state: never inherit a previous job's measurement
 
     if (arch == TUFF_ARCH_QWEN35MOE) {
         model_t *qm = (model_t*)model;
@@ -1483,7 +1579,7 @@ static int run_job(const engine_vtable_t *vtable, void *model, job_cfg_t *cfg) {
         fprintf(stderr, "[Tuff] --dump-tokens: generating %d tokens (%s reference oracle)...\n",
                 n_predict, vtable->name);
 
-        if (lfm_spec && !spec_kfix) spec_measure_costs(vtable, model, max_context_len, &sampler_params, prompt_tokens, n_prompt, spec_k_max,
+        if (lfm_spec && !spec_kfix) spec_measure_costs(arch, vtable, model, max_context_len, &sampler_params, prompt_tokens, n_prompt, spec_k_max,
                                                    arch == TUFF_ARCH_LFM2 || getenv("LFM25_SPEC_MEASURE") != NULL);
         void *eng = vtable->engine_init(model, max_context_len);
         tm_mark("engine_init");
@@ -1552,7 +1648,7 @@ static int run_job(const engine_vtable_t *vtable, void *model, job_cfg_t *cfg) {
 
     spec_t lfm_sp;
     if (lfm_spec) {
-        if (!spec_kfix) spec_measure_costs(vtable, model, max_context_len, &sampler_params, prompt_tokens, n_prompt, spec_k_max,
+        if (!spec_kfix) spec_measure_costs(arch, vtable, model, max_context_len, &sampler_params, prompt_tokens, n_prompt, spec_k_max,
                                                    arch == TUFF_ARCH_LFM2 || getenv("LFM25_SPEC_MEASURE") != NULL);
         spec_init(&lfm_sp, vtable, max_context_len, spec_nmax, spec_nmin, spec_k_max, spec_kfix);
         spec_print_policy(&lfm_sp);

@@ -176,6 +176,8 @@ void gpu_expert_cache_stats(unsigned long long *hits, unsigned long long *misses
 int  gpu_expert_cache_active(void);
 void gpu_expert_cache_sync(void);
 struct moe_policy* gpu_get_moe_policy(void);
+int  gpu_expert_is_resident(uint32_t layer, int expert);
+int  gpu_expert_cache_les_prefetch(const model_t *m);
 
 // --- P1 background cache fills (parity.md sec.4 P1) ---
 // The decode thread must never copy expert weights itself: the GGUF mapping is pageable, so
@@ -423,6 +425,14 @@ void  gpu_delta_rollback_batch(int n_keep);
 void  gpu_output_argmax_batch(const tensor_t *output_weight, const float *d_norm_batch,
                               int in_dim, int vocab_size, int n, int32_t *out_tokens,
                               float *host_logits_capture);
+
+// Task Q1.2: Batched router logits and expert union across N columns
+void  gpu_router_logits_batch(float *host_logits, const tensor_t *ffn_gate_inp,
+                              const float *d_norm_batch, int in_dim, int n_expert, int n);
+void  gpu_expert_moe_union_dev(const int *slots, const int *m_arr, const int *cols, const int *dst,
+                               int n_unique, const float *d_norm_batch, ggml_type_t down_type,
+                               int in_dim, int ffn_dim, int n_cols);
+void  gpu_expert_moe_download_down_hits(float *host_dst, int n_cols, int dim);
 
 // Page-locked host allocation for the per-layer decode round trips (norm_x, router logits, the
 // CPU-miss accumulator). A pageable cudaMemcpyAsync is not asynchronous: the driver stages it

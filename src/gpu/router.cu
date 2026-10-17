@@ -51,6 +51,33 @@ extern "C" void gpu_router_logits_copy_out_n2(float *logits0, float *nx0, float 
     CUDA_CHECK(cudaMemcpyAsync(nx1, d_norm_x2 + (size_t)in_dim, (size_t)in_dim * sizeof(float), cudaMemcpyDeviceToHost));
 }
 
+extern "C" void gpu_router_logits_batch(float *host_logits, const tensor_t *ffn_gate_inp,
+                                        const float *d_norm_batch, int in_dim, int n_expert, int n) {
+    if (!g_d_router_logits_batch) {
+        CUDA_CHECK(cudaMalloc(&g_d_router_logits_batch, (size_t)BATCH_COLS_MAX * 256 * sizeof(float)));
+    }
+    if (router_q8_enabled() && ffn_gate_inp->dev_q8) {
+        launch_mmvq_q8_0_dense_ncols((const block_q8_0*)ffn_gate_inp->dev_q8,
+                                    (const block_q8_1_c*)g_d_nx_batch_q8,
+                                    g_d_router_logits_batch, n_expert, in_dim / QK8_0, n);
+    } else {
+        for (int c = 0; c < n; ++c) {
+            launch_mat_vec_f32((const float*)ffn_gate_inp->dev,
+                               d_norm_batch + (size_t)c * in_dim,
+                               g_d_router_logits_batch + (size_t)c * n_expert,
+                               in_dim, n_expert);
+        }
+    }
+    if (host_logits) {
+        CUDA_CHECK(cudaMemcpyAsync(host_logits, g_d_router_logits_batch,
+                                   (size_t)n * n_expert * sizeof(float),
+                                   cudaMemcpyDeviceToHost));
+    }
+    if (!g_router_d2h_event)
+        CUDA_CHECK(cudaEventCreateWithFlags(&g_router_d2h_event, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventRecord(g_router_d2h_event, 0));
+}
+
 // H7 stage 1 measurement: cost of a dense Q8_0 projection over 1, 2 and 4 activation columns.
 // Weight bytes are read once per launch regardless of ncols, so if the card is bandwidth-bound
 // the per-column cost should collapse. Reports wall time per launch and GB/s of weight bytes.

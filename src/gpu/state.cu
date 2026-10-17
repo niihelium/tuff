@@ -127,6 +127,11 @@ int *g_d_exdst = NULL;
 int g_batch_active = 0;
 void *g_exgx_q8 = NULL;
 void *g_exdx_q8 = NULL;
+int *g_d_union_slots = NULL;
+int *g_d_union_m = NULL;
+int *g_d_union_cols = NULL;
+int *g_d_union_dst = NULL;
+float *g_d_router_logits_batch = NULL;
 
 cudaGraph_t     g_layer_graphs[64];
 cudaGraphExec_t g_layer_execs[64];

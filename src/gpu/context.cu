@@ -252,6 +252,7 @@ void gpu_shutdown(model_t *m) {
     if (g_d_logits2)      { CUDA_CHECK(cudaFree(g_d_logits2));      g_d_logits2 = NULL; }
     if (g_d_shexp_out2)   { CUDA_CHECK(cudaFree(g_d_shexp_out2));   g_d_shexp_out2 = NULL; }
     if (g_d_router_logits2){ CUDA_CHECK(cudaFree(g_d_router_logits2)); g_d_router_logits2 = NULL; }
+    if (g_d_router_logits_batch){ CUDA_CHECK(cudaFree(g_d_router_logits_batch)); g_d_router_logits_batch = NULL; }
     if (g_dstate_snap)    { CUDA_CHECK(cudaFree(g_dstate_snap));    g_dstate_snap = NULL; }
     if (g_dconv_snap)     { CUDA_CHECK(cudaFree(g_dconv_snap));     g_dconv_snap = NULL; }
     g_n2_dim = 0;

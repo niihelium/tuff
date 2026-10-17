@@ -21,6 +21,7 @@
 #include "mmvq.cuh"
 
 #define EXPERT_BATCH_MAX 8
+#define BATCH_COLS_MAX   8
 #define GPU_IN_FLOATS   4096
 #define GPU_OUT_FLOATS  262144
 
@@ -158,6 +159,11 @@ extern int *g_d_exdst;
 extern int g_batch_active;
 extern void *g_exgx_q8;
 extern void *g_exdx_q8;
+extern int *g_d_union_slots;
+extern int *g_d_union_m;
+extern int *g_d_union_cols;
+extern int *g_d_union_dst;
+extern float *g_d_router_logits_batch;
 
 // CUDA Graphs
 extern cudaGraph_t     g_layer_graphs[64];

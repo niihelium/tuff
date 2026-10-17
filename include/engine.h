@@ -70,9 +70,10 @@ typedef struct {
     // Qwen bit-identical CPU miss evaluator
     qwen_cpu_expert_t *qwen_cpu_exp;
 
-    // Batched verify / speculative state (Task Q1.1)
+    // Batched verify / speculative state (Task Q1.1, Q1.2)
     int      batch_n;
     float   *batch_x;
+    float   *router_logits_batch;
 } engine_t;
 
 int engine_forward_batch(engine_t *eng, const int32_t *tokens, int n, int pos0, int32_t *argmax_out, float *logits_out);
