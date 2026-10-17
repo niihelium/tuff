@@ -15,6 +15,7 @@ void tuff_logit_capture(const float *logits, uint32_t vocab_size) { (void)logits
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <chrono>
 
 int main(int argc, char **argv) {
     if (argc < 2) {
@@ -181,8 +182,43 @@ int main(int argc, char **argv) {
         return 1;
     }
     printf("  Rollback PASS!\n");
-
     engine_free(eng);
+
+    // 7. Benchmark verify cost forward_verify(N) vs N * single for N = 1, 2, 4, 8
+    printf("\n[test_qwen_batch] Running A/B Benchmarks for verify cost...\n");
+    eng = engine_init(m, max_seq);
+    engine_set_sampler(eng, &sp);
+    // warmup 4 tokens
+    for (int p = 0; p < 4; ++p) engine_forward_token(eng, ref_inputs[p % 8], p);
+    auto t0 = std::chrono::high_resolution_clock::now();
+    int n_single_steps = 32;
+    for (int p = 4; p < 4 + n_single_steps; ++p) engine_forward_token(eng, ref_inputs[p % 8], p);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double t_single_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / n_single_steps;
+    engine_free(eng);
+    printf("  Single token forward: %.3f ms (%.1f tok/s)\n", t_single_ms, 1000.0 / t_single_ms);
+
+    int test_ns[] = { 1, 2, 4, 8 };
+    for (int tn : test_ns) {
+        eng = engine_init(m, max_seq);
+        engine_set_sampler(eng, &sp);
+        int32_t bout[8];
+        // warmup
+        engine_forward_batch(eng, ref_inputs, tn, 0, bout, NULL);
+        auto tb0 = std::chrono::high_resolution_clock::now();
+        int n_steps = 10;
+        for (int s = 0; s < n_steps; ++s) {
+            engine_forward_batch(eng, ref_inputs, tn, (s + 1) * tn, bout, NULL);
+        }
+        auto tb1 = std::chrono::high_resolution_clock::now();
+        double t_batch_ms = std::chrono::duration<double, std::milli>(tb1 - tb0).count() / n_steps;
+        engine_free(eng);
+
+        double ratio_single = t_batch_ms / t_single_ms;
+        double ratio_n_single = t_batch_ms / (tn * t_single_ms);
+        printf("  Batch N=%d verify: %.3f ms (%.2fx single-token latency, %.2fx verify cost ratio, equiv %.1f tok/s)\n",
+               tn, t_batch_ms, ratio_single, ratio_n_single, (1000.0 / t_batch_ms) * tn);
+    }
     gpu_shutdown(m);
     model_free(m);
 

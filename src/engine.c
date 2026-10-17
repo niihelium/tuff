@@ -15,10 +15,12 @@
 extern int g_n_gpu_expert_layers;
 
 // --spec-mtp: evaluate the blk.40 MTP draft head after each token (declared in engine.h).
-int g_spec_mtp = 1;
+// Off by default: the 2-column verify (engine_forward_batch) costs ~3.6x a graphed single token,
+// so speculation is a net loss at any realistic acceptance (corpus A/B: 44.5 vs 52.7 tok/s).
+int g_spec_mtp = 0;
 
 // H17/H29: --spec-draft=ngram|mtp|ngram+mtp; --spec-draft-len sets candidate depth (1..3).
-int g_spec_draft     = SPEC_DRAFT_NGRAM;
+int g_spec_draft     = SPEC_DRAFT_NONE;
 int g_spec_draft_len = 2;
 int g_spec_ngram_n   = 3;
 int g_spec_ngram_min = 2;
@@ -298,6 +300,16 @@ static void moe_worker_free(moe_worker_t *w) {
     w->gate = w->up = w->act = NULL; w->q8act = NULL;
 }
 
+// TUFF_QWEN_BITID=1: evaluate single-token CPU misses with qwen_cpu_expert_eval (bit-identical to the
+// GPU expert path, so the output does not depend on cache residency). Off by default: it runs
+// synchronously with two stream syncs per layer instead of overlapping the hit GEMVs, and measured
+// -37% on the 5-prompt corpus (33.3 vs 52.7 tok/s).
+static int qwen_bitid_single(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TUFF_QWEN_BITID"); v = (e && *e) ? atoi(e) != 0 : 0; }
+    return v;
+}
+
 static void moe_pool_init(const model_t *m) {
     if (g_moe_nw >= 0) return;
     const char *s = getenv("TUFF_MOE_WORKERS");
@@ -542,8 +554,8 @@ engine_t* engine_init(model_t *model, int max_seq_len) {
     eng->gate_arr      = (float*)malloc(n_expert_used * ffn_dim * sizeof(float));
     eng->up_arr        = (float*)malloc(n_expert_used * ffn_dim * sizeof(float));
     eng->act_arr       = (float*)malloc(n_expert_used * ffn_dim * sizeof(float));
-    eng->down_arr      = (float*)malloc(n_expert_used * dim * sizeof(float));
-    eng->down_hit      = (float*)malloc(n_expert_used * dim * sizeof(float));
+    eng->down_arr      = (float*)malloc(8 * (size_t)n_expert_used * dim * sizeof(float));
+    eng->down_hit      = (float*)malloc(8 * (size_t)n_expert_used * dim * sizeof(float));
     eng->sh_up_exp     = (float*)malloc(sh_ffn_dim * sizeof(float));
     eng->q8_normx      = (block_q8_K*)malloc(q8_K_row_bytes(dim));
     eng->norm_x2        = (float*)gpu_host_alloc(dim * sizeof(float));
@@ -584,6 +596,7 @@ engine_t* engine_init(model_t *model, int max_seq_len) {
 
     eng->qwen_cpu_exp = qwen_cpu_expert_create(0, (int)dim, (int)ffn_dim);
     eng->batch_x = (float*)malloc(8 * (size_t)dim * sizeof(float));
+    eng->router_logits_batch = (float*)malloc(8 * 256 * sizeof(float));
     eng->batch_n = 0;
 
     return eng;
@@ -1026,28 +1039,55 @@ int32_t engine_forward_token(engine_t *eng, int32_t token_id, int pos) {
 
             // 6. If CPU misses exist, submit to worker pool (norm_x is already on host!)
             double tpub0 = omp_get_wtime();
+            const int use_bitid = eng->qwen_cpu_exp && qwen_bitid_single();
             if (n_miss > 0) {
-                g_moe_batch.L      = layer;
-                g_moe_batch.x      = norm_x;
-                g_moe_batch.q8x    = q8_normx;
-                g_moe_batch.dim    = (int)dim;
-                g_moe_batch.ffn    = (int)ffn_dim;
-                g_moe_batch.gtype  = (ggml_type_t)layer->ffn_gate_exps.info.type;
-                g_moe_batch.dtype  = down_type;
-                g_moe_batch.gate_bytes = ggml_row_size(g_moe_batch.gtype, dim) * ffn_dim;
-                g_moe_batch.up_bytes   = g_moe_batch.gate_bytes;
-                g_moe_batch.down_bytes = ggml_row_size(down_type, ffn_dim) * dim;
-                for (int j = 0; j < n_miss; ++j) {
-                    g_moe_batch.experts[j]  = top_indices[miss_k[j]];
-                    g_moe_batch.down_out[j] = down_arr + (size_t)miss_k[j] * dim;
-                    g_moe_batch.xk[j]       = norm_x;
-                    g_moe_batch.q8xk[j]     = q8_normx;
-                    g_moe_batch.xk2[j]      = NULL;   // H15: single-token path has no second column
-                    g_moe_batch.q8xk2[j]    = NULL;
-                    g_moe_batch.down_out2[j]= NULL;
+                if (use_bitid) {
+                    gpu_expert_moe_normx_quant_col(d_norm_x, (int)dim, 0);
+                    unsigned miss_mask = 0;
+                    const void *hg[8] = {0}, *hu[8] = {0}, *hd[8] = {0};
+                    const size_t gate_bytes = ggml_row_size((ggml_type_t)layer->ffn_gate_exps.info.type, dim) * ffn_dim;
+                    const size_t up_bytes   = gate_bytes;
+                    const size_t down_bytes = ggml_row_size(down_type, ffn_dim) * dim;
+                    for (int j = 0; j < n_miss; ++j) {
+                        int k = miss_k[j];
+                        miss_mask |= (1u << k);
+                        int e = top_indices[k];
+                        hg[k] = (const uint8_t*)layer->ffn_gate_exps.data + (size_t)e * gate_bytes;
+                        hu[k] = (const uint8_t*)layer->ffn_up_exps.data   + (size_t)e * up_bytes;
+                        hd[k] = (const uint8_t*)layer->ffn_down_exps.data + (size_t)e * down_bytes;
+                    }
+                    qwen_cpu_expert_eval(eng->qwen_cpu_exp, gpu_get_expert_stream(),
+                                         gpu_get_expert_xq8_dev_ptr(0), (int)down_type,
+                                         (int)dim, (int)ffn_dim, miss_mask, hg, hu, hd);
+                    for (int j = 0; j < n_miss; ++j) {
+                        int k = miss_k[j];
+                        memcpy(down_arr + (size_t)k * dim,
+                               qwen_cpu_expert_host_pre_y(eng->qwen_cpu_exp) + (size_t)k * dim,
+                               (size_t)dim * sizeof(float));
+                    }
+                } else {
+                    g_moe_batch.L      = layer;
+                    g_moe_batch.x      = norm_x;
+                    g_moe_batch.q8x    = q8_normx;
+                    g_moe_batch.dim    = (int)dim;
+                    g_moe_batch.ffn    = (int)ffn_dim;
+                    g_moe_batch.gtype  = (ggml_type_t)layer->ffn_gate_exps.info.type;
+                    g_moe_batch.dtype  = down_type;
+                    g_moe_batch.gate_bytes = ggml_row_size(g_moe_batch.gtype, dim) * ffn_dim;
+                    g_moe_batch.up_bytes   = g_moe_batch.gate_bytes;
+                    g_moe_batch.down_bytes = ggml_row_size(down_type, ffn_dim) * dim;
+                    for (int j = 0; j < n_miss; ++j) {
+                        g_moe_batch.experts[j]  = top_indices[miss_k[j]];
+                        g_moe_batch.down_out[j] = down_arr + (size_t)miss_k[j] * dim;
+                        g_moe_batch.xk[j]       = norm_x;
+                        g_moe_batch.q8xk[j]     = q8_normx;
+                        g_moe_batch.xk2[j]      = NULL;   // H15: single-token path has no second column
+                        g_moe_batch.q8xk2[j]    = NULL;
+                        g_moe_batch.down_out2[j]= NULL;
+                    }
+                    g_moe_batch.n = n_miss;
+                    moe_pool_submit();
                 }
-                g_moe_batch.n = n_miss;
-                moe_pool_submit();
             }
             eng->t_cpumoe_pub += omp_get_wtime() - tpub0;
 
@@ -1062,9 +1102,11 @@ int32_t engine_forward_token(engine_t *eng, int32_t token_id, int pos) {
             // 9. Join CPU miss workers and sum miss contributions
             float *host_miss_ptr = NULL;
             if (n_miss > 0) {
-                double tw0 = omp_get_wtime();
-                moe_pool_wait();
-                eng->t_cpumoe += omp_get_wtime() - tw0;
+                if (!use_bitid) {
+                    double tw0 = omp_get_wtime();
+                    moe_pool_wait();
+                    eng->t_cpumoe += omp_get_wtime() - tw0;
+                }
                 memset(moe_buf, 0, dim * sizeof(float));
                 for (int j = 0; j < n_miss; ++j) {
                     int k = miss_k[j];
@@ -1150,6 +1192,9 @@ int32_t engine_forward_token(engine_t *eng, int32_t token_id, int pos) {
         moe_policy_t *pol = gpu_get_moe_policy();
         if (pol) {
             moe_policy_step(pol);
+        }
+        if (cache_on && g_fill_budget > 0 && !exact) {
+            gpu_expert_cache_les_prefetch(m);
         }
 
         eng->t_total += omp_get_wtime() - t_token;
@@ -1917,6 +1962,10 @@ void engine_free(engine_t *eng) {
         free(eng->batch_x);
         eng->batch_x = NULL;
     }
+    if (eng->router_logits_batch) {
+        free(eng->router_logits_batch);
+        eng->router_logits_batch = NULL;
+    }
     sampler_free(&eng->sampler);
 
     free(eng);
@@ -2437,8 +2486,8 @@ __attribute__((unused)) static void verify_moe_stage_n2(engine_t *eng, uint32_t 
 // state back to the snapshot taken before the call; the KV cache needs no
 // rollback because it is written before it is read at every position, so the
 // stale entries at pos+1 are overwritten by the next step.
-static void verify_moe_stage_col(engine_t *eng, uint32_t l, model_layer_t *layer,
-                                 const float *d_norm_c, float *d_res_c, int cache_on, int c) {
+static void verify_moe_stage_batch(engine_t *eng, uint32_t l, model_layer_t *layer,
+                                   const float *d_norm_batch, float *d_res_batch, int cache_on, int n) {
     model_t *m = eng->model;
     uint32_t dim            = m->embedding_length;
     uint32_t n_expert       = m->expert_count;
@@ -2447,102 +2496,169 @@ static void verify_moe_stage_col(engine_t *eng, uint32_t l, model_layer_t *layer
     uint32_t sh_ffn_dim     = m->expert_shared_ffn_len;
     const ggml_type_t down_type = (ggml_type_t)layer->ffn_down_exps.info.type;
 
-    float *d_shexp_c = gpu_get_d_shexp_batch() + (size_t)c * dim;
-    gpu_set_norm_q8_valid(0);
-    gpu_shared_expert_dev(d_shexp_c, layer, d_norm_c, (int)dim, (int)sh_ffn_dim);
+    // 1. Quantize d_norm_batch for the router MMVQ
+    gpu_batch_quantize_norm_x(d_norm_batch, (int)dim, n);
 
-    gpu_router_logits_launch(eng->router_logits, NULL, &layer->ffn_gate_inp, d_norm_c, (int)dim, (int)n_expert);
-    gpu_router_logits_wait();
+    // 2. Batched router projection: launch first so async D2H transfer overlaps with shared expert compute
+    gpu_router_logits_batch(eng->router_logits_batch, &layer->ffn_gate_inp, d_norm_batch, (int)dim, (int)n_expert, n);
 
-    int top_idx[8];
-    float top_val[8];
-    for (uint32_t k = 0; k < n_expert_used; ++k) { top_idx[k] = (int)k; top_val[k] = eng->router_logits[k]; }
-    for (uint32_t i = n_expert_used; i < n_expert; ++i) {
-        float val = eng->router_logits[i];
-        uint32_t min_pos = 0;
-        float min_val = top_val[0];
-        for (uint32_t k = 1; k < n_expert_used; ++k) {
-            if (top_val[k] < min_val) { min_val = top_val[k]; min_pos = k; }
-        }
-        if (val > min_val) { top_val[min_pos] = val; top_idx[min_pos] = (int)i; }
-    }
-    softmax(top_val, (int)n_expert_used);
-
-    int hit_slots[8], hit_pos[8], miss_k[8];
-    int n_batch = 0, n_miss = 0;
-    unsigned miss_mask = 0;
-    for (uint32_t k = 0; k < n_expert_used; ++k) {
-        int slot = cache_on ? gpu_expert_lookup(l, top_idx[k]) : -1;
-        if (slot >= 0) {
-            hit_slots[n_batch] = slot;
-            hit_pos[n_batch] = (int)k;
-            n_batch++;
-        } else {
-            miss_k[n_miss++] = (int)k;
-            miss_mask |= (1u << k);
-        }
+    // 3. Shared expert for all n columns on GPU (runs concurrently with router D2H PCIe copy)
+    for (int c = 0; c < n; ++c) {
+        float *d_shexp_c = gpu_get_d_shexp_batch() + (size_t)c * dim;
+        const float *d_norm_c = d_norm_batch + (size_t)c * dim;
+        gpu_set_norm_q8_valid(0);
+        gpu_shared_expert_dev(d_shexp_c, layer, d_norm_c, (int)dim, (int)sh_ffn_dim);
     }
 
-    if (n_miss > 0 && eng->qwen_cpu_exp) {
-        gpu_expert_moe_normx_quant_col(d_norm_c, (int)dim, 0);
+    // 4. Wait for router D2H to land on host (already overlapped!)
+    gpu_router_logits_wait_event();
 
-        if (n_batch > 0) {
-            gpu_expert_moe_gateup_swiglu(hit_slots, n_batch, NULL, (int)dim, (int)ffn_dim);
-            gpu_expert_moe_down(n_batch, down_type, (int)ffn_dim, (int)dim, eng->down_hit);
-        }
+    // 4. Top-K routing per column on host
+    int top_idx[8][8];
+    float top_val[8][8];
+    moe_policy_t *pol = gpu_get_moe_policy();
 
-        const void *hg[8] = {0}, *hu[8] = {0}, *hd[8] = {0};
-        const size_t gate_bytes = ggml_row_size((ggml_type_t)layer->ffn_gate_exps.info.type, dim) * ffn_dim;
-        const size_t up_bytes   = gate_bytes;
-        const size_t down_bytes = ggml_row_size(down_type, ffn_dim) * dim;
-        for (int j = 0; j < n_miss; ++j) {
-            int k = miss_k[j];
-            int e = top_idx[k];
-            hg[k] = (const uint8_t*)layer->ffn_gate_exps.data + (size_t)e * gate_bytes;
-            hu[k] = (const uint8_t*)layer->ffn_up_exps.data   + (size_t)e * up_bytes;
-            hd[k] = (const uint8_t*)layer->ffn_down_exps.data + (size_t)e * down_bytes;
+    for (int c = 0; c < n; ++c) {
+        const float *rlogits = eng->router_logits_batch + (size_t)c * n_expert;
+        for (uint32_t k = 0; k < n_expert_used; ++k) {
+            top_idx[c][k] = (int)k;
+            top_val[c][k] = rlogits[k];
         }
-        qwen_cpu_expert_eval(eng->qwen_cpu_exp, gpu_get_expert_stream(),
-                             gpu_get_expert_xq8_dev_ptr(0), (int)down_type,
-                             (int)dim, (int)ffn_dim, miss_mask, hg, hu, hd);
+        for (uint32_t i = n_expert_used; i < n_expert; ++i) {
+            float val = rlogits[i];
+            uint32_t min_pos = 0;
+            float min_val = top_val[c][0];
+            for (uint32_t k = 1; k < n_expert_used; ++k) {
+                if (top_val[c][k] < min_val) { min_val = top_val[c][k]; min_pos = k; }
+            }
+            if (val > min_val) {
+                top_val[c][min_pos] = val;
+                top_idx[c][min_pos] = (int)i;
+            }
+        }
+        softmax(top_val[c], (int)n_expert_used);
 
-        for (int j = 0; j < n_batch; ++j) {
-            memcpy(eng->down_arr + (size_t)hit_pos[j] * dim, eng->down_hit + (size_t)j * dim, (size_t)dim * sizeof(float));
+        if (pol) {
+            moe_policy_observe(pol, (int)l, top_idx[c], (int)n_expert_used);
         }
-        for (int j = 0; j < n_miss; ++j) {
-            int k = miss_k[j];
-            memcpy(eng->down_arr + (size_t)k * dim,
-                   qwen_cpu_expert_host_pre_y(eng->qwen_cpu_exp) + (size_t)k * dim,
-                   (size_t)dim * sizeof(float));
-        }
-    } else {
-        if (n_batch > 0) {
-            gpu_expert_moe_normx_quant_col(d_norm_c, (int)dim, 0);
-            gpu_expert_moe_gateup_swiglu(hit_slots, n_batch, NULL, (int)dim, (int)ffn_dim);
-            gpu_expert_moe_down(n_batch, down_type, (int)ffn_dim, (int)dim, eng->down_hit);
-            for (int j = 0; j < n_batch; ++j) {
-                memcpy(eng->down_arr + (size_t)hit_pos[j] * dim, eng->down_hit + (size_t)j * dim, (size_t)dim * sizeof(float));
+    }
+
+    // 5. Build expert union:
+    int u_hit_slots[64];
+    int u_hit_m[64];
+    int u_hit_cols[64 * 8];
+    int u_hit_dst[64 * 8];
+    int n_unique_hits = 0;
+
+    int is_hit[8][8] = {{0}};
+    int col_has_miss[8] = {0};
+    unsigned col_miss_mask[8] = {0};
+
+    int exp_to_uhit[256];
+    for (int i = 0; i < 256; ++i) exp_to_uhit[i] = -1;
+
+    for (int c = 0; c < n; ++c) {
+        for (uint32_t k = 0; k < n_expert_used; ++k) {
+            int e = top_idx[c][k];
+            int slot = cache_on ? gpu_expert_lookup(l, e) : -1;
+            if (slot >= 0) {
+                is_hit[c][k] = 1;
+                int u = exp_to_uhit[e];
+                if (u < 0) {
+                    u = n_unique_hits++;
+                    exp_to_uhit[e] = u;
+                    u_hit_slots[u] = slot;
+                    u_hit_m[u] = 0;
+                }
+                int m_idx = u_hit_m[u]++;
+                u_hit_cols[u * 8 + m_idx] = c;
+                u_hit_dst[u * 8 + m_idx] = (int)k;
+            } else {
+                col_has_miss[c] = 1;
+                col_miss_mask[c] |= (1u << k);
             }
         }
     }
 
-    memset(eng->moe_buf, 0, dim * sizeof(float));
-    for (uint32_t k = 0; k < n_expert_used; ++k) {
-        float weight = top_val[k];
-        const float *dd = eng->down_arr + (size_t)k * dim;
-        for (uint32_t i = 0; i < dim; ++i) eng->moe_buf[i] += weight * dd[i];
+    // 6. Launch GPU Union for all hits across all columns
+    if (n_unique_hits > 0) {
+        gpu_expert_moe_union_dev(u_hit_slots, u_hit_m, u_hit_cols, u_hit_dst,
+                                 n_unique_hits, d_norm_batch, down_type,
+                                 (int)dim, (int)ffn_dim, n);
     }
 
-    gpu_upload_moe_buf(c, eng->moe_buf, (int)dim);
-    float *d_moe_buf_c = gpu_get_d_moe_buf_batch() + (size_t)c * dim;
-    gpu_residual_accum(d_res_c, d_moe_buf_c, (int)dim);
-    gpu_residual_accum(d_res_c, d_shexp_c, (int)dim);
+    // 7. Evaluate CPU misses for columns that have misses
+    const size_t gate_bytes = ggml_row_size((ggml_type_t)layer->ffn_gate_exps.info.type, dim) * ffn_dim;
+    const size_t up_bytes   = gate_bytes;
+    const size_t down_bytes = ggml_row_size(down_type, ffn_dim) * dim;
 
-    if (cache_on && g_fill_budget > 0 && (l % (uint32_t)g_fill_stride) == 0) {
-        for (int j = 0, filled = 0; j < n_miss && filled < g_fill_budget; ++j) {
-            filled += gpu_expert_cache_bgfill(m, l, top_idx[miss_k[j]]);
+    for (int c = 0; c < n; ++c) {
+        if (col_has_miss[c] && eng->qwen_cpu_exp) {
+            gpu_expert_moe_normx_quant_col(d_norm_batch + (size_t)c * dim, (int)dim, c);
+
+            const void *hg[8] = {0}, *hu[8] = {0}, *hd[8] = {0};
+            for (uint32_t k = 0; k < n_expert_used; ++k) {
+                if ((col_miss_mask[c] >> k) & 1u) {
+                    int e = top_idx[c][k];
+                    hg[k] = (const uint8_t*)layer->ffn_gate_exps.data + (size_t)e * gate_bytes;
+                    hu[k] = (const uint8_t*)layer->ffn_up_exps.data   + (size_t)e * up_bytes;
+                    hd[k] = (const uint8_t*)layer->ffn_down_exps.data + (size_t)e * down_bytes;
+                }
+            }
+            qwen_cpu_expert_eval(eng->qwen_cpu_exp, gpu_get_expert_stream(),
+                                 gpu_get_expert_xq8_dev_ptr(c), (int)down_type,
+                                 (int)dim, (int)ffn_dim, col_miss_mask[c], hg, hu, hd);
+
+            for (uint32_t k = 0; k < n_expert_used; ++k) {
+                if ((col_miss_mask[c] >> k) & 1u) {
+                    memcpy(eng->down_arr + ((size_t)c * 8 + k) * dim,
+                           qwen_cpu_expert_host_pre_y(eng->qwen_cpu_exp) + (size_t)k * dim,
+                           (size_t)dim * sizeof(float));
+                }
+            }
         }
     }
+
+    // 8. Download hit down outputs to host
+    if (n_unique_hits > 0) {
+        gpu_expert_moe_download_down_hits(eng->down_hit, n, (int)dim);
+
+        for (int c = 0; c < n; ++c) {
+            for (uint32_t k = 0; k < n_expert_used; ++k) {
+                if (is_hit[c][k]) {
+                    memcpy(eng->down_arr + ((size_t)c * 8 + k) * dim,
+                           eng->down_hit + ((size_t)c * 8 + k) * dim,
+                           (size_t)dim * sizeof(float));
+                }
+            }
+        }
+    }
+
+    // 9. Combine and residual accumulation for each column
+    for (int c = 0; c < n; ++c) {
+        memset(eng->moe_buf, 0, dim * sizeof(float));
+        for (uint32_t k = 0; k < n_expert_used; ++k) {
+            float weight = top_val[c][k];
+            const float *dd = eng->down_arr + ((size_t)c * 8 + k) * dim;
+            for (uint32_t i = 0; i < dim; ++i) eng->moe_buf[i] += weight * dd[i];
+        }
+
+        gpu_upload_moe_buf(c, eng->moe_buf, (int)dim);
+        float *d_moe_buf_c = gpu_get_d_moe_buf_batch() + (size_t)c * dim;
+        float *d_shexp_c   = gpu_get_d_shexp_batch()   + (size_t)c * dim;
+        float *d_res_c     = d_res_batch               + (size_t)c * dim;
+        gpu_residual_accum(d_res_c, d_moe_buf_c, (int)dim);
+        gpu_residual_accum(d_res_c, d_shexp_c, (int)dim);
+
+        if (cache_on && g_fill_budget > 0 && (l % (uint32_t)g_fill_stride) == 0 && col_has_miss[c]) {
+            for (uint32_t k = 0, filled = 0; k < n_expert_used && (int)filled < g_fill_budget; ++k) {
+                if ((col_miss_mask[c] >> k) & 1u) {
+                    filled += gpu_expert_cache_bgfill(m, l, top_idx[c][k]);
+                }
+            }
+        }
+    }
+
     gpu_set_norm_q8_valid(0);
 }
 
@@ -2637,12 +2753,18 @@ int engine_forward_batch(engine_t *eng, const int32_t *tokens, int n, int pos0, 
             delta_layer_idx++;
         }
 
-        for (int c = 0; c < n; ++c) {
-            verify_moe_stage_col(eng, l, layer, d_norm_batch + (size_t)c * dim, d_res_batch + (size_t)c * dim, cache_on, c);
-        }
+        verify_moe_stage_batch(eng, l, layer, d_norm_batch, d_res_batch, cache_on, n);
     }
 
     gpu_expert_cache_bgfill_poll();
+
+    moe_policy_t *pol = gpu_get_moe_policy();
+    if (pol) {
+        moe_policy_step(pol);
+    }
+    if (cache_on && g_fill_budget > 0) {
+        gpu_expert_cache_les_prefetch(m);
+    }
 
     gpu_rms_norm_dev_batch(d_norm_batch, d_res_batch, (const float*)m->output_norm.dev, (int)dim, eps, n);
     gpu_output_argmax_batch(&m->output_weight, d_norm_batch, (int)dim, (int)vocab_size, n, argmax_out, logits_out);

@@ -81,15 +81,19 @@ void gpu_expert_cache_init_ex(model_t *m, int *p_max_seq, int fill_ram) {
     g_ex_stride_slots = (size_t)EXPERT_BATCH_MAX;
     g_ex_stride_gxq8  = (size_t)(dim / 32) * 36;
     g_ex_stride_dxq8  = (size_t)EXPERT_BATCH_MAX * (ffn / 32) * 36;
-    if (!g_exdx)   CUDA_CHECK(cudaMalloc(&g_exdx,   2 * g_ex_stride_dx * sizeof(float)));
+    if (!g_exdx)   CUDA_CHECK(cudaMalloc(&g_exdx,   BATCH_COLS_MAX * g_ex_stride_dx * sizeof(float)));
     if (!g_exdy)   CUDA_CHECK(cudaMalloc(&g_exdy,   (size_t)dim  * sizeof(float)));
     if (!g_exgbat) CUDA_CHECK(cudaMalloc(&g_exgbat, (size_t)EXPERT_BATCH_MAX * ffn * sizeof(float)));
     if (!g_exubbat) CUDA_CHECK(cudaMalloc(&g_exubbat, (size_t)EXPERT_BATCH_MAX * ffn * sizeof(float)));
-    if (!g_exdbat) CUDA_CHECK(cudaMalloc(&g_exdbat, 2 * g_ex_stride_dbat * sizeof(float)));
-    if (!g_exslots) CUDA_CHECK(cudaMalloc(&g_exslots, 2 * g_ex_stride_slots * sizeof(int)));
-    if (!g_d_exdst) CUDA_CHECK(cudaMalloc(&g_d_exdst, 4 * EXPERT_BATCH_MAX * sizeof(int)));
-    if (!g_exgx_q8) CUDA_CHECK(cudaMalloc(&g_exgx_q8, 2 * g_ex_stride_gxq8));
-    if (!g_exdx_q8) CUDA_CHECK(cudaMalloc(&g_exdx_q8, 2 * g_ex_stride_dxq8));
+    if (!g_exdbat) CUDA_CHECK(cudaMalloc(&g_exdbat, BATCH_COLS_MAX * g_ex_stride_dbat * sizeof(float)));
+    if (!g_exslots) CUDA_CHECK(cudaMalloc(&g_exslots, BATCH_COLS_MAX * g_ex_stride_slots * sizeof(int)));
+    if (!g_d_exdst) CUDA_CHECK(cudaMalloc(&g_d_exdst, BATCH_COLS_MAX * EXPERT_BATCH_MAX * sizeof(int)));
+    if (!g_exgx_q8) CUDA_CHECK(cudaMalloc(&g_exgx_q8, BATCH_COLS_MAX * g_ex_stride_gxq8));
+    if (!g_exdx_q8) CUDA_CHECK(cudaMalloc(&g_exdx_q8, BATCH_COLS_MAX * g_ex_stride_dxq8));
+    if (!g_d_union_slots) CUDA_CHECK(cudaMalloc(&g_d_union_slots, 64 * sizeof(int)));
+    if (!g_d_union_m)     CUDA_CHECK(cudaMalloc(&g_d_union_m,     64 * sizeof(int)));
+    if (!g_d_union_cols)  CUDA_CHECK(cudaMalloc(&g_d_union_cols,  64 * 8 * sizeof(int)));
+    if (!g_d_union_dst)   CUDA_CHECK(cudaMalloc(&g_d_union_dst,   64 * 8 * sizeof(int)));
     if (!g_expert_stream) CUDA_CHECK(cudaStreamCreate(&g_expert_stream));
 
     // H56: Ampere L2 Cache Persistence window (sm_86, 4 MB L2).
@@ -364,6 +368,10 @@ void gpu_expert_cache_free(void) {
     if (g_d_exdst)   { CUDA_CHECK(cudaFree(g_d_exdst)); g_d_exdst = NULL; }
     if (g_exgx_q8)   { CUDA_CHECK(cudaFree(g_exgx_q8)); g_exgx_q8 = NULL; }
     if (g_exdx_q8)   { CUDA_CHECK(cudaFree(g_exdx_q8)); g_exdx_q8 = NULL; }
+    if (g_d_union_slots) { CUDA_CHECK(cudaFree(g_d_union_slots)); g_d_union_slots = NULL; }
+    if (g_d_union_m)     { CUDA_CHECK(cudaFree(g_d_union_m));     g_d_union_m = NULL; }
+    if (g_d_union_cols)  { CUDA_CHECK(cudaFree(g_d_union_cols));  g_d_union_cols = NULL; }
+    if (g_d_union_dst)   { CUDA_CHECK(cudaFree(g_d_union_dst));   g_d_union_dst = NULL; }
     if (g_expert_stream) { CUDA_CHECK(cudaStreamDestroy(g_expert_stream)); g_expert_stream = 0; }
     free(g_slots); g_slots = NULL;
     free(g_expert_map); g_expert_map = NULL;
@@ -497,14 +505,15 @@ void gpu_expert_cache_fill_down(int slot, const model_t *m, uint32_t layer, int 
     CUDA_CHECK(cudaMemcpyAsync(base + g_tensor_off[2], down, down_bytes, cudaMemcpyHostToDevice, g_upload_stream));
 }
 
-static int select_tail_victim_slot(void) {
+static int select_tail_victim_slot_score(float *out_score) {
+    if (out_score) *out_score = 0.0f;
     if (!g_moe_policy || getenv("TUFF_NO_LES")) {
         return g_lru_tail;
     }
-    int cands[16];
+    int cands[64];
     int n_cands = 0;
     int cur = g_lru_tail;
-    while (cur >= 0 && n_cands < 16) {
+    while (cur >= 0 && n_cands < 64) {
         if (g_slots[cur].valid) cands[n_cands++] = cur;
         cur = g_lru_prev[cur];
     }
@@ -520,7 +529,19 @@ static int select_tail_victim_slot(void) {
             if (min_score <= 0.0f) break;
         }
     }
+    if (out_score) *out_score = min_score;
     return cands[best_i];
+}
+
+static int select_tail_victim_slot(void) {
+    return select_tail_victim_slot_score(NULL);
+}
+
+// Pure query: check if an expert is currently resident without modifying LRU or counters
+int gpu_expert_is_resident(uint32_t layer, int expert) {
+    if (!g_cache_ready) return 0;
+    if ((size_t)layer * 256 + (size_t)expert >= (size_t)g_total_experts) return 0;
+    return g_expert_map[layer * 256 + expert] >= 0;
 }
 
 // Reserve a slot for a new expert (miss): free slot first, else policy/LRU victim. Does NOT upload.
@@ -715,6 +736,74 @@ int gpu_expert_cache_bgfill(const model_t *m, uint32_t layer, int expert) {
     pthread_mutex_unlock(&g_bg_mtx);
     g_bg_issued++;
     return 1;
+}
+
+static int expert_is_resident_cb(void *ctx, int layer, int expert) {
+    (void)ctx;
+    return gpu_expert_is_resident((uint32_t)layer, expert);
+}
+
+static int bgfill_is_in_flight(uint32_t layer, int expert) {
+    const unsigned long prod = __atomic_load_n(&g_bg_prod, __ATOMIC_ACQUIRE);
+    for (unsigned long i = g_bg_commit; i < prod; ++i) {
+        const bgfill_req_t *r = &g_bg[i % BGFILL_QUEUE];
+        if (r->layer == layer && r->expert == expert) return 1;
+    }
+    return 0;
+}
+
+// Advanced LES: Long-Lead Asynchronous Inter-Token Expert Prefetching
+// Schedules high-probability non-resident experts over PCIe on g_upload_stream
+// during the inter-token / dense execution window.
+int gpu_expert_cache_les_prefetch(const model_t *m) {
+    if (!g_cache_ready || !g_bg_running || !g_moe_policy) return 0;
+    // Opt-in: corpus A/B measured the inter-token prefetch at -2.3% (52.92 vs 54.12 tok/s), the
+    // extra PCIe fills contend with the decode path's own traffic (same finding as iteration 37).
+    static int enabled = -1;
+    if (enabled < 0) { const char *e = getenv("TUFF_LES_PREFETCH"); enabled = (e && *e) ? atoi(e) != 0 : 0; }
+    if (!enabled || getenv("TUFF_NO_LES")) return 0;
+
+    // Do not queue prefetches if queue is half full
+    if (g_bg_prod - g_bg_commit >= BGFILL_QUEUE / 2) return 0;
+
+    const char *e_budget = getenv("TUFF_LES_PREFETCH_BUDGET");
+    int budget = (e_budget && *e_budget) ? atoi(e_budget) : 2;
+    if (budget <= 0) return 0;
+    if (budget > 8) budget = 8;
+
+    const char *e_thresh = getenv("TUFF_LES_THRESHOLD");
+    float min_thresh = (e_thresh && *e_thresh) ? (float)atof(e_thresh) : 0.005f;
+
+    int plan_layers[8];
+    int plan_experts[8];
+    int n_planned = moe_policy_prefetch_plan(g_moe_policy, budget, min_thresh,
+                                             expert_is_resident_cb, NULL,
+                                             plan_layers, plan_experts);
+    if (n_planned <= 0) return 0;
+
+    int issued = 0;
+    for (int p = 0; p < n_planned; ++p) {
+        int l = plan_layers[p];
+        int e = plan_experts[p];
+        if (bgfill_is_in_flight((uint32_t)l, e)) continue;
+
+        float score_new = moe_policy_score(g_moe_policy, l, e);
+        float score_victim = 0.0f;
+        int victim_slot = -1;
+        if (g_free_head < 0) {
+            victim_slot = select_tail_victim_slot_score(&score_victim);
+        }
+
+        // Only evict if incoming score beats victim score by threshold
+        if (victim_slot >= 0 && score_new <= score_victim + min_thresh) {
+            continue;
+        }
+
+        if (gpu_expert_cache_bgfill(m, (uint32_t)l, e)) {
+            issued++;
+        }
+    }
+    return issued;
 }
 
 void gpu_expert_cache_bgfill_poll(void) {

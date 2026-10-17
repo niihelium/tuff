@@ -1403,6 +1403,241 @@ void gpu_expert_moe_down_dev_col_dst(const int *slots, const int *dst, int n,
 }
 
 // ---------------------------------------------------------------------------
+// Task Q1.2: Generalized Union Warprow Kernels across N columns (1 <= N <= 8)
+// ---------------------------------------------------------------------------
+template <int rows_per_block>
+__launch_bounds__(rows_per_block*32, 1)
+__global__ void mmvq_q4_K_gateup_swiglu_union_warprow_kernel(
+        const char * __restrict__ pool, unsigned long long slot_bytes,
+        unsigned long long off_gate, unsigned long long off_up,
+        const int * __restrict__ d_slots,
+        const int * __restrict__ d_m,
+        const int * __restrict__ d_cols,
+        const int * __restrict__ d_dst,
+        float * __restrict__ ex_dx,
+        size_t ex_stride_dx,
+        void * __restrict__ ex_gx_q8,
+        size_t ex_stride_gxq8,
+        int out_dim, int nblk) {
+    constexpr int vdr = VDR_Q4_K_Q8_1_MMVQ;
+    constexpr int tpsb = QI4_K / vdr;
+    constexpr int blocks_per_iter = vdr*32 / QI4_K;
+
+    const int warp_id = threadIdx.y;
+    const int lane_id = threadIdx.x;
+    const int row     = blockIdx.x * rows_per_block + warp_id;
+    const int e       = blockIdx.y;
+    if (row >= out_dim) return;
+
+    const char * __restrict__ base = pool + (unsigned long long)d_slots[e]*slot_bytes;
+    const block_q4_K * __restrict__ wg = (const block_q4_K *)(base + off_gate) + (size_t)row*nblk;
+    const block_q4_K * __restrict__ wu = (const block_q4_K *)(base + off_up)   + (size_t)row*nblk;
+
+    const int kqs = vdr * (lane_id % tpsb);
+    const int m = d_m[e];
+    float tg[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float tu[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int kbx = lane_id / tpsb; kbx < nblk; kbx += blocks_per_iter) {
+        const block_q4_K *wg_b = wg + kbx;
+        const block_q4_K *wu_b = wu + kbx;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            if (j < m) {
+                int col = d_cols[e * 8 + j];
+                const block_q8_1_c *vy = (const block_q8_1_c *)((const char *)ex_gx_q8 + (size_t)col * ex_stride_gxq8);
+                const block_q8_1_c *yb = vy + kbx * (QK_K / QK8_1);
+                tg[j] += vec_dot_q4_K_q8_1_c(wg_b, yb, kqs);
+                tu[j] += vec_dot_q4_K_q8_1_c(wu_b, yb, kqs);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        if (j < m) {
+            float g = warp_reduce_sum_f(tg[j]);
+            float u = warp_reduce_sum_f(tu[j]);
+            if (lane_id == 0) {
+                int col = d_cols[e * 8 + j];
+                int dst_k = d_dst[e * 8 + j];
+                float *act_col = ex_dx + (size_t)col * ex_stride_dx;
+                act_col[(size_t)dst_k * out_dim + row] = (g / (1.0f + expf(-g))) * u;
+            }
+        }
+    }
+}
+
+template <int rows_per_block>
+__launch_bounds__(rows_per_block*32, 1)
+__global__ void mmvq_q4_K_expert_union_warprow_kernel(
+        const char * __restrict__ pool, unsigned long long slot_bytes, unsigned long long off,
+        const int * __restrict__ d_slots,
+        const int * __restrict__ d_m,
+        const int * __restrict__ d_cols,
+        const int * __restrict__ d_dst,
+        float * __restrict__ ex_dbat,
+        size_t ex_stride_dbat,
+        const void * __restrict__ ex_dxq8,
+        size_t ex_stride_dxq8,
+        int y_stride_blocks,
+        int out_dim, int nblk) {
+    constexpr int vdr = VDR_Q4_K_Q8_1_MMVQ;
+    constexpr int tpsb = QI4_K / vdr;
+    constexpr int blocks_per_iter = vdr*32 / QI4_K;
+
+    const int row = blockIdx.x * rows_per_block + threadIdx.y;
+    if (row >= out_dim) return;
+    const int e = blockIdx.y;
+
+    const block_q4_K * __restrict__ rw =
+        (const block_q4_K *)(pool + (unsigned long long)d_slots[e]*slot_bytes + off) + (size_t)row*nblk;
+
+    const int kqs = vdr * (threadIdx.x % tpsb);
+    const int m = d_m[e];
+    float tmp[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int kbx = threadIdx.x / tpsb; kbx < nblk; kbx += blocks_per_iter) {
+        const block_q4_K *rw_b = rw + kbx;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            if (j < m) {
+                int col = d_cols[e * 8 + j];
+                int dst_k = d_dst[e * 8 + j];
+                const block_q8_1_c *vy = (const block_q8_1_c *)((const char *)ex_dxq8 + (size_t)col * ex_stride_dxq8);
+                const block_q8_1_c *y = vy + (size_t)dst_k * y_stride_blocks + kbx * (QK_K / QK8_1);
+                tmp[j] += vec_dot_q4_K_q8_1_c(rw_b, y, kqs);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        if (j < m) {
+            float t = warp_reduce_sum_f(tmp[j]);
+            if (threadIdx.x == 0) {
+                int col = d_cols[e * 8 + j];
+                int dst_k = d_dst[e * 8 + j];
+                float *dst_col = ex_dbat + (size_t)col * ex_stride_dbat;
+                dst_col[(size_t)dst_k * out_dim + row] = t;
+            }
+        }
+    }
+}
+
+template <int rows_per_block>
+__launch_bounds__(rows_per_block*32, 1)
+__global__ void mmvq_q6_K_expert_union_warprow_kernel(
+        const char * __restrict__ pool, unsigned long long slot_bytes, unsigned long long off,
+        const int * __restrict__ d_slots,
+        const int * __restrict__ d_m,
+        const int * __restrict__ d_cols,
+        const int * __restrict__ d_dst,
+        float * __restrict__ ex_dbat,
+        size_t ex_stride_dbat,
+        const void * __restrict__ ex_dxq8,
+        size_t ex_stride_dxq8,
+        int y_stride_blocks,
+        int out_dim, int nblk) {
+    constexpr int vdr = VDR_Q6_K_Q8_1_MMVQ;
+    constexpr int tpsb = QI6_K / vdr;
+    constexpr int blocks_per_iter = vdr*32 / QI6_K;
+
+    const int row = blockIdx.x * rows_per_block + threadIdx.y;
+    if (row >= out_dim) return;
+    const int e = blockIdx.y;
+
+    const block_q6_K * __restrict__ rw =
+        (const block_q6_K *)(pool + (unsigned long long)d_slots[e]*slot_bytes + off) + (size_t)row*nblk;
+
+    const int kqs = vdr * (threadIdx.x % tpsb);
+    const int m = d_m[e];
+    float tmp[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int kbx = threadIdx.x / tpsb; kbx < nblk; kbx += blocks_per_iter) {
+        const block_q6_K *rw_b = rw + kbx;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            if (j < m) {
+                int col = d_cols[e * 8 + j];
+                int dst_k = d_dst[e * 8 + j];
+                const block_q8_1_c *vy = (const block_q8_1_c *)((const char *)ex_dxq8 + (size_t)col * ex_stride_dxq8);
+                const block_q8_1_c *y = vy + (size_t)dst_k * y_stride_blocks + kbx * (QK_K / QK8_1);
+                tmp[j] += vec_dot_q6_K_q8_1_c(rw_b, y, kqs);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        if (j < m) {
+            float t = warp_reduce_sum_f(tmp[j]);
+            if (threadIdx.x == 0) {
+                int col = d_cols[e * 8 + j];
+                int dst_k = d_dst[e * 8 + j];
+                float *dst_col = ex_dbat + (size_t)col * ex_stride_dbat;
+                dst_col[(size_t)dst_k * out_dim + row] = t;
+            }
+        }
+    }
+}
+
+extern "C" void gpu_expert_moe_union_dev(const int *slots, const int *m_arr, const int *cols, const int *dst,
+                                         int n_unique, const float *d_norm_batch, ggml_type_t down_type,
+                                         int in_dim, int ffn_dim, int n_cols) {
+    if (n_unique <= 0) return;
+    CUDA_CHECK(cudaMemcpyAsync(g_d_union_slots, slots, (size_t)n_unique * sizeof(int), cudaMemcpyHostToDevice, g_expert_stream));
+    CUDA_CHECK(cudaMemcpyAsync(g_d_union_m, m_arr, (size_t)n_unique * sizeof(int), cudaMemcpyHostToDevice, g_expert_stream));
+    CUDA_CHECK(cudaMemcpyAsync(g_d_union_cols, cols, (size_t)n_unique * 8 * sizeof(int), cudaMemcpyHostToDevice, g_expert_stream));
+    CUDA_CHECK(cudaMemcpyAsync(g_d_union_dst, dst, (size_t)n_unique * 8 * sizeof(int), cudaMemcpyHostToDevice, g_expert_stream));
+
+    for (int c = 0; c < n_cols; ++c) {
+        gpu_expert_moe_normx_quant_col(d_norm_batch + (size_t)c * in_dim, in_dim, c);
+    }
+
+    const unsigned long long sb = (unsigned long long)g_slot_bytes;
+    const unsigned long long og = (unsigned long long)g_tensor_off[0];
+    const unsigned long long ou = (unsigned long long)g_tensor_off[1];
+    const unsigned long long od = (unsigned long long)g_tensor_off[2];
+
+    dim3 g_gu((unsigned)((ffn_dim + MMVQ_ROWS_PER_BLOCK - 1) / MMVQ_ROWS_PER_BLOCK), (unsigned)n_unique, 1u);
+    dim3 b_gu(32u, (unsigned)MMVQ_ROWS_PER_BLOCK, 1u);
+    mmvq_q4_K_gateup_swiglu_union_warprow_kernel<MMVQ_ROWS_PER_BLOCK><<<g_gu, b_gu, 0, g_expert_stream>>>(
+        g_pool, sb, og, ou, g_d_union_slots, g_d_union_m, g_d_union_cols, g_d_union_dst,
+        g_exdx, g_ex_stride_dx, g_exgx_q8, g_ex_stride_gxq8, ffn_dim, in_dim / QK_K);
+    CUDA_CHECK_LAST();
+
+    for (int c = 0; c < n_cols; ++c) {
+        launch_quantize_q8_1(ex_col_dx(c), ex_col_dxq8(c), 8 * ffn_dim, g_expert_stream);
+    }
+
+    dim3 g_dn((unsigned)((in_dim + MMVQ_ROWS_PER_BLOCK - 1) / MMVQ_ROWS_PER_BLOCK), (unsigned)n_unique, 1u);
+    dim3 b_dn(32u, (unsigned)MMVQ_ROWS_PER_BLOCK, 1u);
+    if (down_type == GGML_TYPE_Q6_K) {
+        mmvq_q6_K_expert_union_warprow_kernel<MMVQ_ROWS_PER_BLOCK><<<g_dn, b_dn, 0, g_expert_stream>>>(
+            g_pool, sb, od, g_d_union_slots, g_d_union_m, g_d_union_cols, g_d_union_dst,
+            g_exdbat, g_ex_stride_dbat, g_exdx_q8, g_ex_stride_dxq8, ffn_dim / QK8_1, in_dim, ffn_dim / QK_K);
+    } else {
+        mmvq_q4_K_expert_union_warprow_kernel<MMVQ_ROWS_PER_BLOCK><<<g_dn, b_dn, 0, g_expert_stream>>>(
+            g_pool, sb, od, g_d_union_slots, g_d_union_m, g_d_union_cols, g_d_union_dst,
+            g_exdbat, g_ex_stride_dbat, g_exdx_q8, g_ex_stride_dxq8, ffn_dim / QK8_1, in_dim, ffn_dim / QK_K);
+    }
+    CUDA_CHECK_LAST();
+}
+
+extern "C" void gpu_expert_moe_download_down_hits(float *host_dst, int n_cols, int dim) {
+    for (int c = 0; c < n_cols; ++c) {
+        float *gpu_dbat_c = ex_col_dbat(c);
+        CUDA_CHECK(cudaMemcpyAsync(host_dst + (size_t)c * 8 * dim,
+                                   gpu_dbat_c,
+                                   (size_t)8 * dim * sizeof(float),
+                                   cudaMemcpyDeviceToHost,
+                                   g_expert_stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(g_expert_stream));
+}
+
+// ---------------------------------------------------------------------------
 // Fused device top-k MoE routing (Ported from llama.cpp ggml-cuda/topk-moe.cu)
 // Warp-level softmax + iterative argmax top-k reduction.
 // ---------------------------------------------------------------------------
