@@ -34,6 +34,12 @@ void qwen_cpu_expert_eval(qwen_cpu_expert_t *ce, cudaStream_t stream,
                           unsigned miss_mask,
                           const void *const hg[8], const void *const hu[8], const void *const hd[8]);
 
+// Cache-invariant miss path: bit-identical to the GPU hit kernels (see qwen_cpu_expert.c).
+// xq8 / aq8: Q8_1 blocks (36 B per 32 values), as the GPU produced / qwen_exact_quant_q8_1 makes.
+void qwen_exact_gateup_rows(const void *gw, const void *uw, const void *xq8, int dim, float *act, int r0, int r1);
+void qwen_exact_quant_q8_1(const float *x, void *y, int n);
+void qwen_exact_down_rows(int type, const void *dw, const void *aq8, int ffn, float *y, int r0, int r1);
+
 #ifdef __cplusplus
 }
 #endif

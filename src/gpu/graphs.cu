@@ -433,6 +433,7 @@ static cudaGraphExec_t g_vcol_exec[2][64];
 static int g_vcol_ready = 0;
 static float *g_h_vrl[2] = {NULL, NULL};
 static float *g_h_vnx[2] = {NULL, NULL};
+static void  *g_h_vq8[2] = {NULL, NULL};
 
 static void vcol_layer_body(model_t *m, uint32_t l, uint32_t attn_idx, uint32_t delta_idx, int c,
                             float *res_c, float *shexp_c) {
@@ -485,6 +486,7 @@ static void vcol_layer_body(model_t *m, uint32_t l, uint32_t attn_idx, uint32_t 
     CUDA_CHECK(cudaMemcpyAsync(g_h_vnx[c], g_d_norm_x, (size_t)dim * sizeof(float), cudaMemcpyDeviceToHost, 0));
     gpu_shared_expert_dev(shexp_c, layer, g_d_norm_x, dim, sh_ffn_dim);
     gpu_expert_save_norm_q8_col(dim, c);
+    CUDA_CHECK(cudaMemcpyAsync(g_h_vq8[c], gpu_get_expert_xq8_dev_ptr(c), (size_t)(dim / QK8_1) * sizeof(block_q8_1_c), cudaMemcpyDeviceToHost, 0));
     CUDA_CHECK(cudaMemcpyAsync(res_c, g_d_res_x, (size_t)dim * sizeof(float), cudaMemcpyDeviceToDevice, 0));
 }
 
@@ -498,6 +500,7 @@ extern "C" void gpu_capture_verify_col_graphs(model_t *m) {
     for (int c = 0; c < 2; ++c) {
         if (!g_h_vrl[c]) CUDA_CHECK(cudaMallocHost(&g_h_vrl[c], 256 * sizeof(float)));
         if (!g_h_vnx[c]) CUDA_CHECK(cudaMallocHost(&g_h_vnx[c], (size_t)dim * sizeof(float)));
+        if (!g_h_vq8[c]) CUDA_CHECK(cudaMallocHost(&g_h_vq8[c], (size_t)(dim / QK8_1) * sizeof(block_q8_1_c)));
     }
     const int dual = !tuff_exact() && mmvq_dual_enabled();
     uint32_t ai = 0, di = 0;
@@ -531,4 +534,8 @@ extern "C" void gpu_launch_verify_col(int c, uint32_t l) {
 }
 extern "C" float *gpu_verify_host_rl(int c) { return g_h_vrl[c]; }
 extern "C" float *gpu_verify_host_nx(int c) { return g_h_vnx[c]; }
+extern "C" void *gpu_verify_host_q8(int c) { return g_h_vq8[c]; }
 extern "C" int *gpu_verify_d_vpos(void) { return g_d_vpos; }
+extern "C" void gpu_memcpy_d2h(void *dst, const void *src, size_t bytes) {
+    CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, 0));
+}

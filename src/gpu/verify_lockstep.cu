@@ -361,6 +361,7 @@ static block_q8_1_c *g_ls_rq8[4];
 static const int *g_ls_d_vpos = NULL;
 static float *g_h_lrl[4] = {NULL, NULL, NULL, NULL};
 static float *g_h_lnx[4] = {NULL, NULL, NULL, NULL};
+static void  *g_h_lq8[4] = {NULL, NULL, NULL, NULL};   // each column's routed-expert q8_1 input (exact CPU misses)
 
 static void ls_alloc(const model_t *m) {
     const int dim = (int)m->embedding_length;
@@ -399,6 +400,7 @@ static void ls_alloc(const model_t *m) {
         CUDA_CHECK(cudaMalloc(&B.shgi[c], sizeof(float)));
         CUDA_CHECK(cudaMallocHost(&g_h_lrl[c], 256 * sizeof(float)));
         CUDA_CHECK(cudaMallocHost(&g_h_lnx[c], (size_t)dim * sizeof(float)));
+        CUDA_CHECK(cudaMallocHost(&g_h_lq8[c], (size_t)(dim / QK8_1) * sizeof(block_q8_1_c)));
     }
 }
 
@@ -503,6 +505,7 @@ static void ls_layer_body(model_t *m, uint32_t l, uint32_t attn_idx, uint32_t de
     for (int c = 0; c < ncols; ++c) {
         CUDA_CHECK(cudaMemcpyAsync(g_h_lrl[c], B.rl[c], (size_t)n_expert * sizeof(float), cudaMemcpyDeviceToHost, 0));
         CUDA_CHECK(cudaMemcpyAsync(g_h_lnx[c], B.norm[c], (size_t)dim * sizeof(float), cudaMemcpyDeviceToHost, 0));
+        CUDA_CHECK(cudaMemcpyAsync(g_h_lq8[c], rq8[c], (size_t)(dim / QK8_1) * sizeof(block_q8_1_c), cudaMemcpyDeviceToHost, 0));
     }
 
     // Shared expert, all columns: gate/up+SwiGLU+quant and down in one weight read each.
@@ -582,6 +585,7 @@ extern "C" void gpu_launch_lockstep_n(int ncols, uint32_t l) {
 extern "C" void gpu_launch_lockstep(uint32_t l) { gpu_launch_lockstep_n(2, l); }
 extern "C" float *gpu_lockstep_host_rl(int c) { return g_h_lrl[c]; }
 extern "C" float *gpu_lockstep_host_nx(int c) { return g_h_lnx[c]; }
+extern "C" void *gpu_lockstep_host_q8(int c) { return g_h_lq8[c]; }
 extern "C" float *gpu_lockstep_shexp(int c) { return B.shexp_out[c]; }
 
 template <int rows_per_block, int ncols>

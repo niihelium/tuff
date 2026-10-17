@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "engine.h"
 #include "dflash.h"
+#include "qwen_cpu_expert.h"
 #include "gpu.h"
 #include "tuff_exact.h"
 #include "moe_policy.h"
@@ -120,6 +121,12 @@ typedef struct {
     int               n_xin;
     const float      *xin[8];
     block_q8_K       *q8in[8];
+    // Cache-invariant misses (default): each entry's input is the GPU's own q8_1 of its column's
+    // activation, and every step reproduces the GPU hit kernels bit for bit (qwen_exact_*), so the
+    // output does not depend on which experts the cache holds.
+    int               exact;
+    const void       *xq1[MOE_MAX_MISS];
+    void             *aq1[MOE_MAX_MISS];      // q8_1(act), ffn/32 blocks
 } moe_batch_t;
 
 // Background LFRU fills per layer per token (TUFF_FILL_BUDGET, default 2). 0 freezes the
@@ -182,6 +189,7 @@ static void moe_run_chunk_gateup(int t) {
     const int e = b->experts[j];
     const uint8_t *gw = (const uint8_t*)b->L->ffn_gate_exps.data + (size_t)e * b->gate_bytes;
     const uint8_t *uw = (const uint8_t*)b->L->ffn_up_exps.data   + (size_t)e * b->up_bytes;
+    if (b->exact) { qwen_exact_gateup_rows(gw, uw, b->xq1[j], b->dim, b->act[j], (int)r0, (int)r1); return; }
     if (b->xk2[j])
         cpu_expert_gateup_swiglu_dual_rows(b->act[j], b->act2[j], gw, uw, b->q8xk[j], b->q8xk2[j],
                                            b->dim, b->ffn, r0, r1);
@@ -195,6 +203,7 @@ static void moe_run_chunk_down(int t) {
     const int64_t r0 = (int64_t)b->dim * c / C, r1 = (int64_t)b->dim * (c + 1) / C;
     const int e = b->experts[j];
     const uint8_t *dw = (const uint8_t*)b->L->ffn_down_exps.data + (size_t)e * b->down_bytes;
+    if (b->exact) { qwen_exact_down_rows((int)b->dtype, dw, b->aq1[j], b->ffn, b->down_out[j], (int)r0, (int)r1); return; }
     if (b->xk2[j])
         expert_mat_vec_cpu_dual_rows(b->down_out[j], b->down_out2[j], dw, b->dtype, b->ffn, b->dim,
                                      b->q8act[j], b->q8act2[j], r0, r1);
@@ -213,7 +222,7 @@ static void moe_participate(moe_worker_t *w, unsigned long mygen) {
     // Phase 0: Parallel input activation quantization (8 blocks of QK_K = 256 elements)
     const int nb_in1 = g_moe_batch.dim / QK_K;
     const int nxin = g_moe_batch.n_xin;
-    const int nb_in = nxin > 0 ? nb_in1 * nxin : nb_in1;
+    const int nb_in = g_moe_batch.exact ? 0 : (nxin > 0 ? nb_in1 * nxin : nb_in1);
     for (;;) {
         if (__atomic_load_n(&g_moe_gen, __ATOMIC_ACQUIRE) != mygen) return;
         const int b = __atomic_fetch_add(&g_moe_next_in_q, 1, __ATOMIC_ACQ_REL);
@@ -261,7 +270,8 @@ static void moe_participate(moe_worker_t *w, unsigned long mygen) {
         if (__atomic_load_n(&g_moe_gen, __ATOMIC_ACQUIRE) != mygen) return;
         const int j = __atomic_fetch_add(&g_moe_next_q, 1, __ATOMIC_ACQ_REL);
         if (j >= n) break;
-        quantize_row_q8_K(g_moe_batch.act[j], g_moe_batch.q8act[j], g_moe_batch.ffn);
+        if (g_moe_batch.exact) qwen_exact_quant_q8_1(g_moe_batch.act[j], g_moe_batch.aq1[j], g_moe_batch.ffn);
+        else quantize_row_q8_K(g_moe_batch.act[j], g_moe_batch.q8act[j], g_moe_batch.ffn);
         if (g_moe_batch.xk2[j])
             quantize_row_q8_K(g_moe_batch.act2[j], g_moe_batch.q8act2[j], g_moe_batch.ffn);
         __atomic_fetch_add(&g_moe_done_q, 1, __ATOMIC_ACQ_REL);
@@ -357,6 +367,7 @@ static void moe_pool_init(const model_t *m) {
         g_moe_batch.act[j]   = (float*)malloc((size_t)ffn * sizeof(float));
         g_moe_batch.q8act[j] = (block_q8_K*)malloc(q8_K_row_bytes(ffn));
         g_moe_batch.act2[j]   = (float*)malloc((size_t)ffn * sizeof(float));
+        g_moe_batch.aq1[j]    = malloc((size_t)(ffn / 32) * 36);
         g_moe_batch.q8act2[j] = (block_q8_K*)malloc(q8_K_row_bytes(ffn));
         if (!g_moe_batch.act[j] || !g_moe_batch.q8act[j] ||
             !g_moe_batch.act2[j] || !g_moe_batch.q8act2[j]) {
@@ -418,6 +429,7 @@ static int moe_chunks_for(int n_miss) {
 // Publish g_moe_batch to the pool with zero mutex locks.
 static void moe_pool_submit(void) {
     g_moe_batch.chunks = moe_chunks_for(g_moe_batch.n);
+    if (g_moe_batch.exact && g_moe_batch.chunks == 0) g_moe_batch.chunks = 1;   // exact path is chunked-only
     __atomic_store_n(&g_moe_next_in_q, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&g_moe_done_in_q, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&g_moe_next,   0, __ATOMIC_RELAXED);
@@ -574,6 +586,7 @@ engine_t* engine_init(model_t *model, int max_seq_len) {
     eng->down_hit      = (float*)malloc(8 * (size_t)n_expert_used * dim * sizeof(float));
     eng->sh_up_exp     = (float*)malloc(sh_ffn_dim * sizeof(float));
     eng->q8_normx      = (block_q8_K*)malloc(4 * q8_K_row_bytes(dim));
+    eng->hxq8          = gpu_host_alloc((size_t)4 * (dim / 32) * 36);
     eng->norm_x2        = (float*)gpu_host_alloc(dim * sizeof(float));
     eng->moe_buf2       = (float*)gpu_host_alloc(dim * sizeof(float));
     eng->router_logits2 = (float*)gpu_host_alloc(n_expert * sizeof(float));
@@ -816,6 +829,36 @@ static void host_topk_softmax(const float *logits, int n_expert, int n_used, int
     softmax(tv, n_used);
 }
 
+// Cache-invariant MoE (default; TUFF_MISS_LEGACY=1 restores the old AVX2 q8_K misses and the
+// host pre-sum, whose output depends on cache residency). Needs the q8_1 norm the dual-MMVQ path
+// produces.
+static int miss_exact(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TUFF_MISS_LEGACY"); v = !(e && e[0] == '1') && !tuff_exact() && mmvq_dual_enabled(); }
+    return v;
+}
+
+static void host_miss_sum(float *moe_buf, const float *down_arr, const int *miss_k, int n_miss,
+                          const float *top_values, int dim);
+
+// The GPU's q8_1 of this layer's post-attention norm (the routed experts' input), copied to the
+// host before the router event so the exact CPU misses read the very bytes the hit kernels read.
+static void copy_xq8_host(engine_t *eng, int dim) {
+    if (miss_exact()) gpu_memcpy_d2h(eng->hxq8, gpu_get_d_norm_q8(), (size_t)(dim / 32) * 36);
+}
+
+// The MoE combine of one column: fixed rank order on the GPU (exact) or the legacy pre-sum.
+static void moe_combine(float *d_res, const int *hit_pos, int n_hits, const float *tv, const float *d_shexp,
+                        const int *miss_k, int n_miss, const float *down_arr, float *moe_buf, int n_used, int dim, int col) {
+    if (miss_exact()) {
+        gpu_moe_combine_fixed_col(d_res, hit_pos, n_hits, tv, d_shexp, miss_k, n_miss, down_arr, n_used, dim, col);
+        return;
+    }
+    float *host_miss_ptr = NULL;
+    if (n_miss > 0) { host_miss_sum(moe_buf, down_arr, miss_k, n_miss, tv, dim); host_miss_ptr = moe_buf; }
+    gpu_moe_combine_accum_col(d_res, hit_pos, n_hits, tv, d_shexp, host_miss_ptr, dim, col);
+}
+
 // Weighted sum of the CPU-computed miss experts' down outputs, in miss (k) order.
 static void host_miss_sum(float *moe_buf, const float *down_arr, const int *miss_k, int n_miss,
                           const float *top_values, int dim) {
@@ -941,8 +984,10 @@ int32_t engine_forward_token(engine_t *eng, int32_t token_id, int pos) {
                     gpu_expert_cache_bgfill_poll();
                 }
                 if (tuff_gpu_router()) {
+                    copy_xq8_host(eng, (int)dim);
                     gpu_router_topk_copy_out(top_indices, top_values, norm_x, d_norm_x, (int)dim);
                 } else {
+                    copy_xq8_host(eng, (int)dim);
                     gpu_router_logits_copy_out(router_logits, norm_x, d_norm_x, (int)dim, (int)n_expert);
                 }
                 gpu_shared_expert_dev((float*)d_shexp_out, layer, d_norm_x, (int)dim, (int)sh_ffn_dim);
@@ -987,9 +1032,11 @@ int32_t engine_forward_token(engine_t *eng, int32_t token_id, int pos) {
                     gpu_shared_expert_dev((float*)d_shexp_out, layer, d_norm_x, (int)dim, (int)sh_ffn_dim);
                 } else {
                     if (tuff_gpu_router()) {
+                        copy_xq8_host(eng, (int)dim);
                         gpu_router_topk_launch(top_indices, top_values, norm_x,
                                                &layer->ffn_gate_inp, d_norm_x, (int)dim, (int)n_expert);
                     } else {
+                        copy_xq8_host(eng, (int)dim);
                         gpu_router_logits_launch(router_logits, norm_x,
                                                  &layer->ffn_gate_inp, d_norm_x, (int)dim, (int)n_expert);
                     }
@@ -1039,9 +1086,11 @@ int32_t engine_forward_token(engine_t *eng, int32_t token_id, int pos) {
                     gpu_shared_expert_dev((float*)d_shexp_out, layer, d_norm_x, (int)dim, (int)sh_ffn_dim);
                 } else {
                     if (tuff_gpu_router()) {
+                        copy_xq8_host(eng, (int)dim);
                         gpu_router_topk_launch(top_indices, top_values, norm_x,
                                                &layer->ffn_gate_inp, d_norm_x, (int)dim, (int)n_expert);
                     } else {
+                        copy_xq8_host(eng, (int)dim);
                         gpu_router_logits_launch(router_logits, norm_x, &layer->ffn_gate_inp, d_norm_x, (int)dim, (int)n_expert);
                     }
                     gpu_shared_expert_dev((float*)d_shexp_out, layer, d_norm_x, (int)dim, (int)sh_ffn_dim);
@@ -1138,9 +1187,11 @@ int32_t engine_forward_token(engine_t *eng, int32_t token_id, int pos) {
                         g_moe_batch.xk2[j]      = NULL;   // H15: single-token path has no second column
                         g_moe_batch.q8xk2[j]    = NULL;
                         g_moe_batch.down_out2[j]= NULL;
+                        g_moe_batch.xq1[j]      = eng->hxq8;
                     }
                     g_moe_batch.n = n_miss;
                     g_moe_batch.n_xin = 0;
+                    g_moe_batch.exact = miss_exact();
                     moe_pool_submit();
                 }
             }
@@ -1163,13 +1214,14 @@ int32_t engine_forward_token(engine_t *eng, int32_t token_id, int pos) {
                     moe_pool_wait();
                     eng->t_cpumoe += omp_get_wtime() - tw0;
                 }
-                host_miss_sum(moe_buf, down_arr, miss_k, n_miss, top_values, (int)dim);
                 host_miss_ptr = moe_buf;
             }
+            (void)host_miss_ptr;
 
             // 10. Fused MoE Combine & Residual Add directly into d_res_x on GPU
             double tres0 = omp_get_wtime();
-            gpu_moe_combine_accum(d_res_x, hit_pos, n_batch, top_values, d_shexp_out, host_miss_ptr, (int)dim);
+            moe_combine(d_res_x, hit_pos, n_batch, top_values, d_shexp_out, miss_k, n_miss, down_arr, moe_buf,
+                        (int)n_expert_used, (int)dim, 0);
             eng->t_resid += omp_get_wtime() - tres0;
 
             // 11. Queue background fills
@@ -2810,6 +2862,7 @@ typedef struct {
     const float *d_norm_x;
     float *res[4], *shexp[4], *rl[4], *nx[4], *mb[4], *da[4];
     block_q8_K *q8[4];
+    const void *xq1[4];         // host q8_1 of each column's routed-expert input (exact misses)
     // per-column MoE state of the layer in flight
     int ti[4][8]; float tv[4][8];
     int hit_slots[4][8], hit_pos[4][8], n_hit[4];
@@ -2841,6 +2894,7 @@ static void v2_trunk(v2_ctx_t *x, int c, uint32_t l) {
                                       x->shexp[c], (int)x->dim, (int)x->ffn_dim, (int)x->n_expert);
     } else {
         gpu_expert_save_norm_q8_col((int)x->dim, c);
+        if (miss_exact()) gpu_memcpy_d2h((char*)x->eng->hxq8 + (size_t)c * (x->dim / 32) * 36, gpu_get_expert_xq8_dev_ptr(c), (size_t)(x->dim / 32) * 36);
         gpu_event_record(x->eng->vev[c]);
     }
     gpu_memcpy_d2d(x->res[c], x->d_res_x, (size_t)x->dim * sizeof(float));
@@ -2873,7 +2927,9 @@ static int v2_pool_fill(v2_ctx_t *x, model_layer_t *layer, int c, int j0) {
         g_moe_batch.xk2[j]      = NULL;
         g_moe_batch.q8xk2[j]    = NULL;
         g_moe_batch.down_out2[j]= NULL;
+        g_moe_batch.xq1[j]      = x->xq1[c];
     }
+    g_moe_batch.exact = miss_exact();
     return j;
 }
 
@@ -2953,6 +3009,7 @@ static void v2_ls_layer(v2_ctx_t *x, uint32_t l) {
         // compute each column with the single-column per-row dot product).
         static int dual_env = -1;
         if (dual_env < 0) { const char *e = getenv("TUFF_VERIFY_DUAL_MISS"); dual_env = (e && e[0] == '0') ? 0 : 1; }
+        if (miss_exact()) dual_env = 0;   // the exact kernels have no two-column form yet
         for (int c = 1; c < n; ++c) {
             for (int i = 0; i < x->n_miss[c]; ++i) {
                 const int ec = x->ti[c][x->miss_k[c][i]];
@@ -2978,6 +3035,7 @@ static void v2_ls_layer(v2_ctx_t *x, uint32_t l) {
                     g_moe_batch.xk2[j]       = NULL;
                     g_moe_batch.q8xk2[j]     = NULL;
                     g_moe_batch.down_out2[j] = NULL;
+                    g_moe_batch.xq1[j]       = x->xq1[c];
                     j++;
                 }
             }
@@ -3003,12 +3061,8 @@ static void v2_ls_layer(v2_ctx_t *x, uint32_t l) {
     }
     const double tr0 = omp_get_wtime();
     for (int c = 0; c < n; ++c) {
-        float *host_miss_ptr = NULL;
-        if (x->n_miss[c] > 0) {
-            host_miss_sum(x->mb[c], x->da[c], x->miss_k[c], x->n_miss[c], x->tv[c], (int)x->dim);
-            host_miss_ptr = x->mb[c];
-        }
-        gpu_moe_combine_accum_col(x->res[c], x->hit_pos[c], x->n_hit[c], x->tv[c], x->shexp[c], host_miss_ptr, (int)x->dim, c);
+        moe_combine(x->res[c], x->hit_pos[c], x->n_hit[c], x->tv[c], x->shexp[c], x->miss_k[c], x->n_miss[c],
+                    x->da[c], x->mb[c], (int)x->n_expert_used, (int)x->dim, c);
     }
     eng->tv_comb += omp_get_wtime() - tr0;
 }
@@ -3058,12 +3112,8 @@ static void v2_moe_finish(v2_ctx_t *x, int c) {
         eng->nv_cpu_miss += (unsigned long long)x->n_miss[c];
     }
     double tr0 = omp_get_wtime();
-    float *host_miss_ptr = NULL;
-    if (x->n_miss[c] > 0) {
-        host_miss_sum(x->mb[c], x->da[c], x->miss_k[c], x->n_miss[c], x->tv[c], (int)x->dim);
-        host_miss_ptr = x->mb[c];
-    }
-    gpu_moe_combine_accum_col(x->res[c], x->hit_pos[c], x->n_hit[c], x->tv[c], x->shexp[c], host_miss_ptr, (int)x->dim, c);
+    moe_combine(x->res[c], x->hit_pos[c], x->n_hit[c], x->tv[c], x->shexp[c], x->miss_k[c], x->n_miss[c],
+                x->da[c], x->mb[c], (int)x->n_expert_used, (int)x->dim, c);
     eng->t_resid += omp_get_wtime() - tr0;
     eng->tv_comb += omp_get_wtime() - tr0;
 }
@@ -3109,6 +3159,7 @@ static int engine_forward_verify_n(engine_t *eng, const int32_t *tokens, int n, 
             x->shexp[c] = gpu_lockstep_shexp(c);
             x->rl[c]    = gpu_lockstep_host_rl(c);
             x->nx[c]    = gpu_lockstep_host_nx(c);
+            x->xq1[c]   = gpu_lockstep_host_q8(c);
         }
     } else if (x->col_graphs) {
         // The column graphs bind the verify residuals and these pinned landing buffers (n == 2).
@@ -3116,11 +3167,13 @@ static int engine_forward_verify_n(engine_t *eng, const int32_t *tokens, int n, 
         x->shexp[0] = (float*)gpu_get_shexp_dev_ptr(); x->shexp[1] = (float*)gpu_get_shexp2_dev_ptr();
         x->rl[0] = gpu_verify_host_rl(0); x->rl[1] = gpu_verify_host_rl(1);
         x->nx[0] = gpu_verify_host_nx(0); x->nx[1] = gpu_verify_host_nx(1);
+        x->xq1[0] = gpu_verify_host_q8(0); x->xq1[1] = gpu_verify_host_q8(1);
     } else {
         x->res[0] = eng->d_res_v; x->res[1] = eng->d_res_v + dim;
         x->shexp[0] = (float*)gpu_get_shexp_dev_ptr(); x->shexp[1] = (float*)gpu_get_shexp2_dev_ptr();
         x->rl[0] = eng->router_logits; x->rl[1] = eng->router_logits2;
         x->nx[0] = eng->norm_x; x->nx[1] = eng->norm_x2;
+        x->xq1[0] = eng->hxq8; x->xq1[1] = (const char*)eng->hxq8 + (dim / 32) * 36;
     }
     const size_t q8_blocks = dim / QK_K;
     for (int c = 0; c < n; ++c) {

@@ -367,6 +367,24 @@ open-ledger. What they established, in one line each:
   64+256 on 1e14905 gives 73.14 tok/s, so 90.04 does not reproduce either. Old plain decode:
   ~55 tok/s geomean. **Withdrawn**: iteration 85 and all spec-mode numbers before entry 93.
 
+- **95**: Cache-invariant MoE (2026-10-18). A cache hit (GPU q8_1 MMVQ) and a miss (CPU q8_K AVX2)
+  computed the same expert with different arithmetic, so the output depended on which experts were
+  resident: plain `--no-spec` changed with `TUFF_EXPERT_SLOTS`, the KV size, or a loaded drafter.
+  Now every routed expert is bit-identical on either device: CPU misses read the GPU's own q8_1
+  input and emulate its lane math (dots `qwen_exact_*`, act requant with the warp-butterfly sum),
+  both sides use one SwiGLU (`include/tuff_silu.h`, explicit IEEE ops), and the combine sums the 8
+  experts in router-rank order on the GPU whatever computed them (`gpu_moe_combine_fixed_col`).
+  `TUFF_MISS_LEGACY=1` restores the old path.
+  - Gates: `qwen-cpu-expert-test` 600/600 byte-identical (CPU chain vs GPU, all 40 trunk layers);
+    teacher-forced logits byte-identical (128 steps) default vs all-CPU vs 800 slots vs 64k ctx;
+    tokens identical at 1924/1700/1000 slots, all-CPU, frozen cache; DFlash default and n-gram spec
+    token-identical to plain `--no-spec` on all 5 prompts. Golden re-recorded (tokens 128/128 and
+    top-1 unchanged; logits change by the new math).
+  - **Cost (corpus A/B vs c5a464c)**: `--no-spec` **63.80 vs 67.31 (-5.2%)**, DFlash default
+    **62.19 vs 69.31 (-10.3%)**: the GPU-exact CPU dot (32-value q8_1 blocks) is slower than the q8_K
+    one, and the verify lost its two-column shared misses. **Verdict**: correctness first, landed;
+    speed recovery is the next item.
+
 ## How to log a new iteration
 
 One entry per landed change: hypothesis → change → order-balanced measurement → gates → verdict.

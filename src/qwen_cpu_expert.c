@@ -397,3 +397,52 @@ void qwen_cpu_expert_eval(qwen_cpu_expert_t *ce, cudaStream_t stream,
     // 6. Upload pre_y to device
     CUDA_CHECK(cudaMemcpyAsync(ce->d_pre_y, ce->h_pre_y, (size_t)8 * dim * sizeof(float), cudaMemcpyHostToDevice, stream));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Cache-invariant CPU miss path (2026-10-18): the pieces of a routed expert, each bit-identical
+// to the GPU hit path, so the decode output never depends on which experts are resident.
+//   gate/up row dots   = vec_dot_q4_K_q8_1 lane math (row_dot_q4k_avx2, proven by qwen-cpu-expert-test)
+//   SwiGLU             = tuff_swiglu (include/tuff_silu.h, same IEEE op sequence as the device)
+//   act -> q8_1        = quantize_q8_1_kernel (warp-butterfly sum order emulated below)
+//   down row dots      = vec_dot_q4_K / q6_K_q8_1 lane math
+// This file is compiled with -ffp-contract=off, which the bit-identity relies on.
+// ---------------------------------------------------------------------------------------------
+#include "tuff_silu.h"
+
+void qwen_exact_gateup_rows(const void *gw, const void *uw, const void *xq8, int dim,
+                            float *act, int r0, int r1) {
+    const int nblk = dim / 256;
+    const size_t rb = (size_t)nblk * sizeof(block_q4_K);
+    for (int r = r0; r < r1; ++r) {
+        const float g = row_dot_q4k_avx2((const block_q4_K *)((const char *)gw + (size_t)r * rb), (const q8blk *)xq8, nblk);
+        const float u = row_dot_q4k_avx2((const block_q4_K *)((const char *)uw + (size_t)r * rb), (const q8blk *)xq8, nblk);
+        act[r] = tuff_swiglu(g, u);
+    }
+}
+
+// quantize_q8_1_kernel, block by block: amax over the 32 lanes (max is order-free), the sum in
+// the order lane 0 accumulates it through the xor butterfly, d = amax/127, q = round(x/d).
+void qwen_exact_quant_q8_1(const float *x, void *yv, int n) {
+    q8blk *y = (q8blk *)yv;
+    for (int b = 0; b < n / 32; ++b) {
+        const float *xb = x + (size_t)b * 32;
+        float v[32], amax = 0.0f;
+        for (int i = 0; i < 32; ++i) { v[i] = xb[i]; amax = fmaxf(amax, fabsf(xb[i])); }
+        for (int m = 16; m > 0; m >>= 1) {
+            float w[32];
+            for (int i = 0; i < 32; ++i) w[i] = v[i] + v[i ^ m];
+            memcpy(v, w, sizeof v);
+        }
+        const float d = amax / 127.0f;
+        for (int i = 0; i < 32; ++i) y[b].qs[i] = amax == 0.0f ? 0 : (int8_t)roundf(xb[i] / d);
+        y[b].d = (uint16_t)_cvtss_sh(d, 0);
+        y[b].s = (uint16_t)_cvtss_sh(v[0], 0);
+    }
+}
+
+void qwen_exact_down_rows(int type, const void *dw, const void *aq8, int ffn, float *y, int r0, int r1) {
+    const int nblk = ffn / 256;
+    const size_t rb = (size_t)nblk * (type == GGML_TYPE_Q6_K ? sizeof(block_q6_K) : sizeof(block_q4_K));
+    for (int r = r0; r < r1; ++r)
+        y[r] = qwen_cpu_row_dot_avx2(type, (const char *)dw + (size_t)r * rb, (const q8blk *)aq8, nblk);
+}

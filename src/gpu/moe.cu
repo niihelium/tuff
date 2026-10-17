@@ -1,4 +1,5 @@
 #include "state.h"
+#include "tuff_silu.h"
 
 void gpu_expert_mat_vec(float *dst, const void *dev_w, const float *src, int in_dim, int out_dim) {
     CUDA_CHECK(cudaMemcpyAsync(g_dx, src, (size_t)in_dim * sizeof(float), cudaMemcpyHostToDevice));
@@ -277,7 +278,7 @@ __global__ void mmvq_q4_K_gateup_swiglu_kernel(
 #pragma unroll
         for (int w = 0; w < nwarps; ++w) { g += sg[w]; u += su[w]; }
         // Identical formula to cpu_ops.c swiglu(): silu(gate) * up.
-        act[(size_t)e*out_dim + row] = (g / (1.0f + expf(-g))) * u;
+        act[(size_t)e*out_dim + row] = tuff_swiglu(g, u);
     }
 }
 
@@ -317,7 +318,7 @@ __global__ void mmvq_q4_K_gateup_swiglu_warprow_kernel(
     tmp_up   = warp_reduce_sum_f(tmp_up);
 
     if (lane_id == 0) {
-        act[(size_t)e*out_dim + row] = (tmp_gate / (1.0f + expf(-tmp_gate))) * tmp_up;
+        act[(size_t)e*out_dim + row] = tuff_swiglu(tmp_gate, tmp_up);
     }
 }
 
@@ -447,7 +448,7 @@ __global__ void mmvq_q4_K_gateup_swiglu_ncols_kernel(
 #pragma unroll
         for (int w = 0; w < nwarps; ++w) { g += sg[w]; u += su[w]; }
         const int d0 = d_dst0 ? d_dst0[e] : e;
-        act0[(size_t)d0*out_dim + row] = (g / (1.0f + expf(-g))) * u;
+        act0[(size_t)d0*out_dim + row] = tuff_swiglu(g, u);
     }
     if (ncols == 2) {
         tg1 = warp_reduce_sum_f(tg1);
@@ -459,7 +460,7 @@ __global__ void mmvq_q4_K_gateup_swiglu_ncols_kernel(
 #pragma unroll
             for (int w = 0; w < nwarps; ++w) { g += sg[w]; u += su[w]; }
             const int d1 = d_dst1 ? d_dst1[e] : e;
-            act1[(size_t)d1*out_dim + row] = (g / (1.0f + expf(-g))) * u;
+            act1[(size_t)d1*out_dim + row] = tuff_swiglu(g, u);
         }
     }
 }
@@ -505,14 +506,14 @@ __global__ void mmvq_q4_K_gateup_swiglu_warprow_ncols_kernel(
     tu0 = warp_reduce_sum_f(tu0);
     if (lane_id == 0) {
         const int d0 = d_dst0 ? d_dst0[e] : e;
-        act0[(size_t)d0*out_dim + row] = (tg0 / (1.0f + expf(-tg0))) * tu0;
+        act0[(size_t)d0*out_dim + row] = tuff_swiglu(tg0, tu0);
     }
     if (ncols == 2) {
         tg1 = warp_reduce_sum_f(tg1);
         tu1 = warp_reduce_sum_f(tu1);
         if (lane_id == 0) {
             const int d1 = d_dst1 ? d_dst1[e] : e;
-            act1[(size_t)d1*out_dim + row] = (tg1 / (1.0f + expf(-tg1))) * tu1;
+            act1[(size_t)d1*out_dim + row] = tuff_swiglu(tg1, tu1);
         }
     }
 }
@@ -1485,7 +1486,7 @@ __global__ void mmvq_q4_K_gateup_swiglu_union_warprow_kernel(
                 int col = d_cols[e * 8 + j];
                 int dst_k = d_dst[e * 8 + j];
                 float *act_col = ex_dx + (size_t)col * ex_stride_dx;
-                act_col[(size_t)dst_k * out_dim + row] = (g / (1.0f + expf(-g))) * u;
+                act_col[(size_t)dst_k * out_dim + row] = tuff_swiglu(g, u);
             }
         }
     }
@@ -1800,7 +1801,7 @@ __global__ void qwen_moe_swiglu_pre_gu_kernel(const float * __restrict__ pre_gu,
     if (!((miss_mask >> k) & 1u)) return;
     float g = pre_gu[(2 * k + 0) * ffn_dim + row];
     float u = pre_gu[(2 * k + 1) * ffn_dim + row];
-    act[(size_t)k * ffn_dim + row] = (g / (1.0f + expf(-g))) * u;
+    act[(size_t)k * ffn_dim + row] = tuff_swiglu(g, u);
 }
 
 void gpu_qwen_moe_swiglu_pre_gu(cudaStream_t stream, const float *d_pre_gu,
@@ -1880,5 +1881,59 @@ void launch_swiglu_ncols(float *act, const float *gate, const float *up, int cou
 
 void launch_scale_shexp(float *out, const float *down, const float *gate, int dim, cudaStream_t stream) {
     scale_shexp_kernel<<<(dim + 255) / 256, 256, 0, stream>>>(out, down, gate, dim);
+    CUDA_CHECK_LAST();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Cache-invariant combine (2026-10-18): res += sum_k w_k * y_k over the 8 routed experts in router
+// rank order, then + the shared expert, whichever device computed y_k (a hit's down output in the
+// column's expert scratch, a miss's row uploaded from the CPU). The old combine pre-summed the
+// misses on the host and added the hits on top, so the summation order - and the result - depended
+// on which experts were resident.
+// ---------------------------------------------------------------------------------------------
+typedef struct { const float *src[8]; float w[8]; int n; } moe_fixed_args_t;
+
+__global__ void moe_combine_fixed_kernel(float4 *res, moe_fixed_args_t a, const float4 *shexp, int dim4) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= dim4) return;
+    float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+    for (int k = 0; k < a.n; ++k) {
+        const float4 y = ((const float4 *)a.src[k])[i];
+        const float w = a.w[k];
+        acc.x += w * y.x; acc.y += w * y.y; acc.z += w * y.z; acc.w += w * y.w;
+    }
+    const float4 s = shexp[i];
+    float4 r = res[i];
+    r.x += acc.x + s.x; r.y += acc.y + s.y; r.z += acc.z + s.z; r.w += acc.w + s.w;
+    res[i] = r;
+}
+
+static float *g_d_missrows = NULL;    // [BATCH_COLS_MAX][8][dim]
+static float *g_h_missrows = NULL;    // pinned staging, same shape
+
+void gpu_moe_combine_fixed_col(float *d_res_x, const int *hit_pos, int n_hits, const float *top_values,
+                               const float *d_shexp_out, const int *miss_k, int n_miss,
+                               const float *h_rows, int n_used, int dim, int col) {
+    if (!g_d_missrows) {
+        CUDA_CHECK(cudaMalloc(&g_d_missrows, (size_t)BATCH_COLS_MAX * 8 * dim * sizeof(float)));
+        CUDA_CHECK(cudaMallocHost(&g_h_missrows, (size_t)BATCH_COLS_MAX * 8 * dim * sizeof(float)));
+    }
+    float *dm = g_d_missrows + (size_t)col * 8 * dim;
+    float *hm = g_h_missrows + (size_t)col * 8 * dim;
+    moe_fixed_args_t a;
+    a.n = n_used;
+    for (int k = 0; k < n_used; ++k) { a.w[k] = top_values[k]; a.src[k] = NULL; }
+    float *exdbat = g_exdbat + (size_t)col * g_ex_stride_dbat;
+    for (int j = 0; j < n_hits; ++j) a.src[hit_pos[j]] = exdbat + (size_t)j * dim;
+    for (int j = 0; j < n_miss; ++j) {
+        const int k = miss_k[j];
+        // The staging row is reused by this column's next layer only after that layer's router
+        // sync, which is stream-ordered after this copy.
+        memcpy(hm + (size_t)k * dim, h_rows + (size_t)k * dim, (size_t)dim * sizeof(float));
+        CUDA_CHECK(cudaMemcpyAsync(dm + (size_t)k * dim, hm + (size_t)k * dim, (size_t)dim * sizeof(float), cudaMemcpyHostToDevice, 0));
+        a.src[k] = dm + (size_t)k * dim;
+    }
+    const int dim4 = dim / 4;
+    moe_combine_fixed_kernel<<<(dim4 + 255) / 256, 256>>>((float4 *)d_res_x, a, (const float4 *)d_shexp_out, dim4);
     CUDA_CHECK_LAST();
 }

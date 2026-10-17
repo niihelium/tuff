@@ -448,6 +448,14 @@ float *gpu_lockstep_shexp(int c);
 void  gpu_lockstep_output_argmax_async_n(const tensor_t *output_weight, float * const res[4],
                                          const float *d_norm_w, int in_dim, int vocab_size,
                                          float eps, int ncols, int32_t *h_tok);
+void *gpu_lockstep_host_q8(int c);
+void *gpu_verify_host_q8(int c);
+void  gpu_memcpy_d2h(void *dst, const void *src, size_t bytes);
+// Cache-invariant MoE combine: sum of the n_used routed experts in rank order (hits from the
+// column's expert scratch, misses from h_rows[k] uploaded), then + the shared expert.
+void  gpu_moe_combine_fixed_col(float *d_res_x, const int *hit_pos, int n_hits, const float *top_values,
+                                const float *d_shexp_out, const int *miss_k, int n_miss,
+                                const float *h_rows, int n_used, int dim, int col);
 void *gpu_event_new(void);
 void  gpu_event_record(void *ev);
 void  gpu_event_sync(void *ev);

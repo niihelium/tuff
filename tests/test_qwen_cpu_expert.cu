@@ -66,8 +66,7 @@ int main(int argc, char **argv) {
     std::normal_distribution<float> nd(0.0f, 1.0f);
 
     int total_cases = 0, pass_cases = 0;
-    for (uint32_t l = 0; l < m->block_count; ++l) {
-        if (l >= m->block_count) continue;
+    for (uint32_t l = 0; l < m->block_count - m->nextn_predict_layers; ++l) {
         const model_layer_t *L = &m->layers[l];
         const int down_type = (int)L->ffn_down_exps.info.type;
         const char *down_type_str = (down_type == GGML_TYPE_Q6_K) ? "Q6_K" : "Q4_K";
@@ -138,6 +137,26 @@ int main(int argc, char **argv) {
 
             std::vector<float> ref_exdbat(8 * dim);
             CUDA_CHECK(cudaMemcpy(ref_exdbat.data(), gpu_get_expert_dbat_dev_ptr(0), 8 * dim * sizeof(float), cudaMemcpyDeviceToHost));
+
+            // Cache-invariant miss path: the CPU chain alone (no GPU step) must reproduce every
+            // expert's GPU output bit for bit.
+            {
+                std::vector<uint8_t> h_xq8((size_t)(dim / 32) * 36);
+                CUDA_CHECK(cudaMemcpy(h_xq8.data(), gpu_get_expert_xq8_dev_ptr(0), h_xq8.size(), cudaMemcpyDeviceToHost));
+                std::vector<float> act(ffn), y(dim);
+                std::vector<uint8_t> aq8((size_t)(ffn / 32) * 36);
+                for (int k = 0; k < 8; ++k) {
+                    total_cases++;
+                    qwen_exact_gateup_rows(hg[k], hu[k], h_xq8.data(), dim, act.data(), 0, ffn);
+                    qwen_exact_quant_q8_1(act.data(), aq8.data(), ffn);
+                    qwen_exact_down_rows(down_type, hd[k], aq8.data(), ffn, y.data(), 0, dim);
+                    if (memcmp(y.data(), &ref_exdbat[(size_t)k * dim], dim * sizeof(float)) == 0) pass_cases++;
+                    else {
+                        int nd = 0; for (int i = 0; i < dim; ++i) nd += memcmp(&y[i], &ref_exdbat[(size_t)k * dim + i], 4) != 0;
+                        printf("EXACT MISMATCH layer %u expert k=%d: %d/%d floats differ (y[0]=%a ref=%a)\n", l, k, nd, dim, y[0], ref_exdbat[(size_t)k * dim]);
+                    }
+                }
+            }
 
             // Test representative miss masks:
             // 0 (all hits), 1 (exp 0 miss), 2 (exp 1 miss), 5 (exp 0,2 miss), 0x55 (alternating), 0xAA, 0xFF (all misses)

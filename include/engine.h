@@ -47,6 +47,7 @@ typedef struct {
     // needs its own landing buffer rather than reusing the ones above.
     float      *norm_x2, *router_logits2, *down_arr2, *moe_buf2;
     block_q8_K *q8_normx2;
+    void       *hxq8;           // pinned [4][dim/32] q8_1: the GPU's routed-expert inputs, for exact CPU misses
 
     // Speculative MTP/N-gram draft tokens for the current step (up to 4 candidates)
     int32_t last_draft_tokens[4];
