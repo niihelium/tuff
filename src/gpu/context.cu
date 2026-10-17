@@ -1,4 +1,5 @@
 #include "state.h"
+#include "dflash.h"
 
 static void upload_dense(tensor_t *t) {
     if (!t->data) return;
@@ -163,6 +164,12 @@ void gpu_prepare_ex(model_t *m, int *p_max_seq, int fill_ram) {
 
     gpu_batch_prepare((int)m->embedding_length, (int)m->vocab_size, 8);
 
+    // DFlash2 drafter (TUFF_DFLASH=<gguf>): loaded before the expert pool sizes itself from free
+    // VRAM, so the pool - and therefore the cache trajectory - is the same with spec on or off.
+    {
+        const char *dp = getenv("TUFF_DFLASH");
+        if (dp && *dp) dflash_load(dp, m);
+    }
     gpu_expert_cache_init_ex(m, p_max_seq, fill_ram);
     gpu_expert_cache_prefill(m);
 }

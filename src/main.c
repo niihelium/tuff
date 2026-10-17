@@ -20,6 +20,7 @@
 #include <ctype.h>
 #include <limits.h>
 #include "lfm25_model.h"
+#include "dflash.h"
 
 #define TF_MAX_BATCH 8   // == LFM25_MAX_BATCH
 
@@ -571,7 +572,12 @@ static int spec_step(spec_t *s, int32_t t, int pos, int rem, int32_t *out) {
     int32_t d[SPEC_KMAX];
     int ml = 0, dl = 0, k = 0, b = 0;
     if (kcap > 0 && (g_spec_cost_measured || s->k_fixed || is_copying || s->n_single >= 8)) {   // static table: calibrate m1 on 8 single steps first
-        dl = spec_lookup(s, d, kcap, &ml);
+        if (dflash_active()) {   // DFlash2 block drafter (Qwen): always has a draft
+            dl = dflash_draft(t, pos, kcap, d);
+            ml = 6;
+        } else {
+            dl = spec_lookup(s, d, kcap, &ml);
+        }
         if (dl > 0) {
             b = spec_bucket(ml);
             k = (is_copying && !s->k_fixed) ? dl : spec_choose_k(s, dl, b);
@@ -766,6 +772,8 @@ static int parse_args(int argc, char **argv, job_cfg_t *cfg, int *rc) {
             cfg->n_warmup = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--runs") == 0 && i + 1 < argc) {
             cfg->n_runs = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--dflash") == 0 && i + 1 < argc) {
+            setenv("TUFF_DFLASH", argv[++i], 1);   // read by gpu_prepare (before the expert pool is sized)
         } else if (strcmp(argv[i], "--spec-draft-model") == 0 && i + 1 < argc) {
             cfg->spec_explicit = true;
             cfg->spec_draft_model = argv[++i];

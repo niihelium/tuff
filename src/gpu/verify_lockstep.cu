@@ -10,6 +10,7 @@
 // step (column 0 writes, column 1 the no-write variant), RoPE + attention over the KV cache
 // (column 1 after column 0, so it sees column 0's KV), the router copy-out.
 #include "state.h"
+#include "dflash.h"
 
 extern "C" void gpu_delta_gdn_core(int layer_idx, const model_layer_t *L, float eps, float scale_q,
                                    float *qkv, const float *z, const float *beta_raw, const float *alpha_raw,
@@ -308,6 +309,12 @@ static void ls_layer_body(model_t *m, uint32_t l, uint32_t attn_idx, uint32_t de
     const float eps = m->rms_norm_eps;
     const int nblk = dim / QK8_0;
     dim3 blk(32u, (unsigned)MMVQ_ROWS_PER_BLOCK, 1u);
+    {
+        const int tk = dflash_tap_index(l);   // drafter taps: the residual entering this layer
+        if (tk >= 0)
+            for (int c = 0; c < 2; ++c)
+                CUDA_CHECK(cudaMemcpyAsync(dflash_stage_dst(c, tk), res[c], (size_t)dim * sizeof(float), cudaMemcpyDeviceToDevice, 0));
+    }
     for (int c = 0; c < 2; ++c)
         gpu_fused_rms_norm_quant_dev(B.norm[c], res[c], (const float*)layer->attn_norm.dev, B.xq[c], dim, eps);
 

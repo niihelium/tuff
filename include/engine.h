@@ -80,6 +80,7 @@ typedef struct {
     // (engine_rollback), or until the next engine call (both kept).
     int      vpend;
     uint64_t vtok0;              // logical expert-cache token of column 0
+    int      vpos0, v_lockstep;   // the pass's first position; whether it ran the lockstep graphs
     struct expert_layer_snap *vsnap;
     float   *d_res_v;            // device [2][dim]: the pass's per-column residual streams
     void    *vev[2];             // per-column router-copy events

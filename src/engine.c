@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "engine.h"
+#include "dflash.h"
 #include "gpu.h"
 #include "tuff_exact.h"
 #include "moe_policy.h"
@@ -618,6 +619,7 @@ engine_t* engine_init(model_t *model, int max_seq_len) {
     eng->batch_x = (float*)malloc(8 * (size_t)dim * sizeof(float));
     eng->router_logits_batch = (float*)malloc(8 * 256 * sizeof(float));
     eng->batch_n = 0;
+    dflash_reset();
 
     return eng;
 }
@@ -920,8 +922,14 @@ int32_t engine_forward_token(engine_t *eng, int32_t token_id, int pos) {
 
         gpu_set_device_pos(pos);
 
+        const int df_on = dflash_active();
         for (uint32_t l = 0; l < m->block_count - m->nextn_predict_layers; ++l) {
             model_layer_t *layer = &m->layers[l];
+
+            if (df_on) {   // DFlash2 taps: the residual entering this layer
+                const int tk = dflash_tap_index(l);
+                if (tk >= 0) gpu_memcpy_d2d(dflash_tap_dst(dflash_pending(), tk), d_res_x, (size_t)dim * sizeof(float));
+            }
 
             if (gpu_has_delta_graphs()) {
                 gpu_launch_layer_graph(l);
@@ -1226,6 +1234,7 @@ int32_t engine_forward_token(engine_t *eng, int32_t token_id, int pos) {
 
         // Token boundary of the logical cache clock (also the LES policy's decay step).
         gpu_expert_cache_token_end();
+        if (df_on) dflash_commit(1, pos);
         if (cache_on && g_fill_budget > 0 && !exact) {
             gpu_expert_cache_les_prefetch(m);
         }
@@ -1943,6 +1952,10 @@ void engine_free(engine_t *eng) {
     if (eng && getenv("TUFF_PROFILE")) {
         unsigned long long n, gap, behind; gpu_expert_cache_streamwait_stats(&n, &gap, &behind);
         fprintf(stderr, "[PROFILE] LES admission rejects: %llu\n", gpu_expert_cache_les_rejects());
+        if (dflash_active()) {
+            double dms; unsigned long long dn; dflash_stats(&dms, &dn);
+            fprintf(stderr, "[PROFILE] dflash: %llu drafts, %.2f ms/draft\n", dn, dn ? dms / dn : 0.0);
+        }
         fprintf(stderr, "[PROFILE] GPU waits on unfinished fills: %llu (avg queue %.1f, avg behind %.1f)\n",
                 n, n ? (double)gap / n : 0.0, n ? (double)behind / n : 0.0);
     }
@@ -2753,6 +2766,7 @@ int engine_exact_verify_available(const engine_t *eng) { return eng && verify2_s
 static void verify2_finalize(engine_t *eng, int keep) {
     if (!eng->vpend) return;
     eng->vpend = 0;
+    if (eng->v_lockstep && dflash_active()) dflash_commit_stage(keep >= 2 ? 2 : 1, eng->vpos0);
     if (keep >= 2) {
         gpu_launch_verify_commit();
         gpu_expert_cache_fill_commit(1);
@@ -3048,6 +3062,7 @@ static int engine_forward_verify2(engine_t *eng, const int32_t *tokens, int pos0
     x->cache_on = gpu_expert_cache_active();
     x->T0 = gpu_expert_cache_get_token();
     eng->vtok0 = x->T0;
+    eng->vpos0 = pos0;
     x->d_res_x = gpu_get_d_res_x();
     x->d_norm_x = gpu_get_d_norm_x();
     x->res[0] = eng->d_res_v; x->res[1] = eng->d_res_v + dim;
@@ -3055,6 +3070,7 @@ static int engine_forward_verify2(engine_t *eng, const int32_t *tokens, int pos0
     static int ls_env = -1;
     if (ls_env < 0) { const char *e = getenv("TUFF_VERIFY_LOCKSTEP"); ls_env = (e && e[0] == '0') ? 0 : 1; }
     const int lockstep = ls_env && gpu_has_lockstep_graphs();
+    eng->v_lockstep = lockstep;
     x->col_graphs = gpu_has_verify_col_graphs();
     if (lockstep) {
         x->res[0] = gpu_get_d_res_verify((int)dim); x->res[1] = x->res[0] + dim;

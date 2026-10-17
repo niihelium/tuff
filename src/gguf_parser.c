@@ -117,10 +117,21 @@ gguf_context_t* tuff_gguf_parse_file(const char *filepath) {
                 uint64_t arr_len = *(const uint64_t*)curr; curr += 8;
                 kv->val.arr.item_type = arr_type;
                 kv->val.arr.len = arr_len;
-                if (arr_type == GGUF_TYPE_INT32 || arr_type == GGUF_TYPE_UINT32) {
-                    kv->val.arr.data = malloc(arr_len * 4);
-                    memcpy(kv->val.arr.data, curr, arr_len * 4);
-                    curr += arr_len * 4;
+                size_t esz = 0;
+                switch (arr_type) {
+                    case GGUF_TYPE_UINT8: case GGUF_TYPE_INT8: case GGUF_TYPE_BOOL: esz = 1; break;
+                    case GGUF_TYPE_UINT16: case GGUF_TYPE_INT16: esz = 2; break;
+                    case GGUF_TYPE_UINT32: case GGUF_TYPE_INT32: case GGUF_TYPE_FLOAT32: esz = 4; break;
+                    case GGUF_TYPE_UINT64: case GGUF_TYPE_INT64: case GGUF_TYPE_FLOAT64: esz = 8; break;
+                    default: break;
+                }
+                if (esz > 0) {
+                    // Every fixed-size element type (bool / float / 64-bit arrays included: a
+                    // DFlash2 drafter carries a bool sliding_window_pattern array; skipping it
+                    // without advancing desynchronized the whole parse).
+                    kv->val.arr.data = malloc(arr_len * esz > 0 ? arr_len * esz : 1);
+                    memcpy(kv->val.arr.data, curr, arr_len * esz);
+                    curr += arr_len * esz;
                 } else if (arr_type == GGUF_TYPE_STRING) {
                     // Store the full string array (needed for tokenizer.ggml.tokens / .merges) —
                     // previously these were parsed and discarded into a throwaway buffer, which
