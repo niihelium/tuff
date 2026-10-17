@@ -899,7 +899,7 @@ static const model_t *g_fill_model = NULL;
 static unsigned long long g_les_rejects = 0;
 static float les_admit_margin(void) {
     static float v = -2.0f;
-    if (v < -1.5f) { const char *e = getenv("TUFF_LES_ADMIT"); v = (e && *e) ? (float)atof(e) : -1.0f; }
+    if (v < -1.5f) { const char *e = getenv("TUFF_LES_ADMIT"); v = (e && *e) ? (float)atof(e) : 0.01f; }
     return v;
 }
 unsigned long long gpu_expert_cache_les_rejects(void) { return g_les_rejects; }
@@ -912,7 +912,8 @@ int gpu_expert_cache_fill_reserve(const model_t *m, uint32_t layer, int expert, 
     layer_begin(layer);
     layer_cache_t *lc = &g_lc[layer];
     if (lc->n_pend >= LAYER_PEND_MAX || g_n_unpushed >= UNPUSHED_MAX) return 0;
-    // LES admission (TUFF_LES_ADMIT=<margin>, off when unset): an eviction is a 1.95 MiB PCIe copy,
+    // LES admission (TUFF_LES_ADMIT=<margin>, default 0.01, negative disables; corpus A/B 2026-10-17:
+    // 67.06 vs 59.37 tok/s geomean, +13.0%, every prompt +11..15%): an eviction is a 1.95 MiB PCIe copy,
     // so only make it when the incoming expert's LES score beats the victim's by the margin. Both
     // scores are this layer's own (decayed routing frequency), so the decision stays a function of
     // the layer's token history and the speculative verify remains lossless.
