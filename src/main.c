@@ -36,6 +36,8 @@ static void print_usage(const char *prog) {
         "  --warmup <tokens>           warmup tokens (default: 32)\n"
         "  --runs <n>                  benchmark runs (default: 3)\n"
         "  --tf-batch <B>              with --teacher-force: feed the reference in chunks of B tokens (LFM2.5 batched forward)\n"
+        "  --prefill-batch <N>         LFM2.5: feed the prompt through the batched forward in chunks of N (1..8, default 8; 1 = token by token;\n"
+        "                              env LFM25_PREFILL_BATCH sets the default). Byte-identical. TUFF_TIMING=1 prints the prefill tok/s\n"
         "  --tf-rollback               with --tf-batch B>=2: roll back to 1+(chunk%%B) tokens after every chunk and re-feed\n"
         "\n"
         "Job runner (LFM2.5 engines): load the model once, run many jobs\n"
@@ -223,6 +225,51 @@ static double proc_age_sec(void) {
     fclose(u);
     if (ok != 1) return -1.0;
     return up - (double)start / (double)sysconf(_SC_CLK_TCK);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Prompt prefill (Task 7.1). Feeds toks[0..n) at positions pos0.. and returns what the LAST engine_forward_token of the
+// plain loop would have returned (the argmax after the last prompt token), or -1 on error. With a batched forward
+// (LFM2.5) the prompt goes through engine_forward_batch in chunks of up to `chunk` (<= 8) tokens; that path is
+// byte-identical per token to engine_forward_token (same per-(row, column) accumulation order, sequential conv
+// recurrence), and leaves the same KV/conv state. When the logit sink is armed, the logits of the last prompt position are
+// delivered to it exactly as the single-token path does (forward_batch itself does not capture). A one-token prompt and
+// engines without forward_batch use the plain single-token loop (which is also the CUDA-graphed path).
+// TUFF_TIMING=1 prints one line with the time and tok/s.
+// ---------------------------------------------------------------------------------------------------------------
+static int32_t prefill(const engine_vtable_t *vt, void *eng, const int32_t *toks, int n, int pos0, int chunk, uint32_t vocab) {
+    double t0 = tm_mono();
+    int32_t last = toks[0];
+    if (chunk > 8) chunk = 8;
+    if (chunk < 2 || n < 2 || !vt->engine_forward_batch) {
+        for (int i = 0; i < n; ++i) {
+            last = vt->engine_forward_token(eng, toks[i], pos0 + i);
+            if (last < 0) { fprintf(stderr, "[Tuff] FATAL: engine_forward_token failed at position %d\n", pos0 + i); return -1; }
+        }
+        chunk = 1;
+    } else {
+        const int cap = tuff_logit_capture_is_enabled() && vocab > 0;
+        float *rows = cap ? (float*)malloc((size_t)chunk * vocab * sizeof(float)) : NULL;
+        if (cap && !rows) { fprintf(stderr, "[Tuff] FATAL: out of memory for prefill logits\n"); return -1; }
+        int32_t am[8];
+        for (int p = 0; p < n; p += chunk) {
+            int c = n - p < chunk ? n - p : chunk;
+            int is_last = (p + c == n);
+            if (vt->engine_forward_batch(eng, toks + p, c, pos0 + p, am, (cap && is_last) ? rows : NULL) != 0) {
+                fprintf(stderr, "[Tuff] FATAL: engine_forward_batch failed at prefill position %d (n=%d)\n", pos0 + p, c);
+                free(rows);
+                return -1;
+            }
+            last = am[c - 1];
+            if (cap && is_last) tuff_logit_capture(rows + (size_t)(c - 1) * vocab, vocab);
+        }
+        free(rows);
+    }
+    if (g_tm_on) {
+        double dt = tm_mono() - t0;
+        fprintf(stderr, "[Tuff timing] prefill: %d tokens, batch %d, %.3f s (%.1f tok/s)\n", n, chunk, dt, dt > 0 ? n / dt : 0.0);
+    }
+    return last;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -520,7 +567,7 @@ typedef struct job_cfg {
     const char *model_path, *prompt, *system_prompt, *log_filepath, *spec_draft_model, *dump_logits_path, *teacher_force_path;
     bool prompt_specified, chat_mode, fill_ram, inspect_mode, bench_dense_batch, dump_tokens_mode;
     bool spec_mtp_mode, spec_measure_mode, spec_ngram_requested, tf_rollback;
-    int max_context_len, max_gen_tokens, spec_k_max, n_predict, n_warmup, n_runs, n_gpu_expert_layers, tf_batch;
+    int max_context_len, max_gen_tokens, spec_k_max, n_predict, n_warmup, n_runs, n_gpu_expert_layers, tf_batch, prefill_batch;
     sampler_params_t sampler_params;
     float default_temp;
     int kv_quant;
@@ -552,6 +599,11 @@ static void cfg_init(job_cfg_t *cfg) {
     cfg->n_warmup = 32;
     cfg->n_runs = 3;
     cfg->tf_batch = 1;
+    cfg->prefill_batch = 8;
+    {
+        const char *pb = getenv("LFM25_PREFILL_BATCH");
+        if (pb && pb[0]) { int v = atoi(pb); if (v >= 1 && v <= TF_MAX_BATCH) cfg->prefill_batch = v; }
+    }
     cfg->sampler_params = sampler_params_default();
     cfg->default_temp = cfg->sampler_params.temp;
     cfg->kv_quant = KV_QUANT_Q8_0;
@@ -627,7 +679,7 @@ static int parse_args(int argc, char **argv, job_cfg_t *cfg, int *rc) {
                 cfg->g_spec_mtp = 0;
             } else {
                 fprintf(stderr, "Error: --spec-draft must be ngram, mtp, ngram+mtp, external or none (got '%s')\n", s);
-                { *rc = 2; { *rc = 0; return 0; } }
+                { *rc = 2; return 0; }
             }
         } else if (strcmp(argv[i], "--no-spec") == 0) {
             cfg->spec_ngram_requested = false;
@@ -653,31 +705,31 @@ static int parse_args(int argc, char **argv, job_cfg_t *cfg, int *rc) {
                 cfg->g_spec_mtp = 0;
             } else {
                 fprintf(stderr, "Error: --spec-draft must be ngram, mtp, ngram+mtp, external or none (got '%s')\n", s);
-                { *rc = 2; { *rc = 0; return 0; } }
+                { *rc = 2; return 0; }
             }
         } else if ((strcmp(argv[i], "--spec-ngram") == 0 || strcmp(argv[i], "--spec-ngram-max") == 0) && i + 1 < argc) {
             cfg->g_spec_ngram_n = atoi(argv[++i]);
             if (cfg->g_spec_ngram_n < 1 || cfg->g_spec_ngram_n > 8) {
                 fprintf(stderr, "Error: --spec-ngram must be between 1 and 8 (got %d)\n", cfg->g_spec_ngram_n);
-                { *rc = 2; { *rc = 0; return 0; } }
+                { *rc = 2; return 0; }
             }
         } else if (strcmp(argv[i], "--spec-ngram-min") == 0 && i + 1 < argc) {
             cfg->g_spec_ngram_min = atoi(argv[++i]);
             if (cfg->g_spec_ngram_min < 1 || cfg->g_spec_ngram_min > 8) {
                 fprintf(stderr, "Error: --spec-ngram-min must be between 1 and 8 (got %d)\n", cfg->g_spec_ngram_min);
-                { *rc = 2; { *rc = 0; return 0; } }
+                { *rc = 2; return 0; }
             }
         } else if ((strcmp(argv[i], "--spec-draft-len") == 0 || strcmp(argv[i], "--draft-len") == 0) && i + 1 < argc) {
             cfg->g_spec_draft_len = atoi(argv[++i]);
             if (cfg->g_spec_draft_len < 1 || cfg->g_spec_draft_len > 3) {
                 fprintf(stderr, "Error: --spec-draft-len must be between 1 and 3 (got %d)\n", cfg->g_spec_draft_len);
-                { *rc = 2; { *rc = 0; return 0; } }
+                { *rc = 2; return 0; }
             }
         } else if (strcmp(argv[i], "--spec-k") == 0 && i + 1 < argc) {
             cfg->spec_k_max = atoi(argv[++i]);
             if (cfg->spec_k_max < 1 || cfg->spec_k_max > SPEC_KMAX) {
                 fprintf(stderr, "Error: --spec-k must be between 1 and %d (got %d)\n", SPEC_KMAX, cfg->spec_k_max);
-                { *rc = 2; { *rc = 0; return 0; } }
+                { *rc = 2; return 0; }
             }
         } else if (strcmp(argv[i], "--spec-measure") == 0) {
             cfg->spec_mtp_mode = true;
@@ -706,7 +758,7 @@ static int parse_args(int argc, char **argv, job_cfg_t *cfg, int *rc) {
                 cfg->kv_quant = KV_QUANT_Q4_0;
             } else {
                 fprintf(stderr, "Error: --kv-quant must be f32, q8_0, or q4_0 (got '%s')\n", s);
-                { *rc = 2; { *rc = 0; return 0; } }
+                { *rc = 2; return 0; }
             }
         } else if (strcmp(argv[i], "--kv-quant") == 0 && i + 1 < argc) {
             const char *s = argv[++i];
@@ -718,13 +770,19 @@ static int parse_args(int argc, char **argv, job_cfg_t *cfg, int *rc) {
                 cfg->kv_quant = KV_QUANT_Q4_0;
             } else {
                 fprintf(stderr, "Error: --kv-quant must be f32, q8_0, or q4_0 (got '%s')\n", s);
-                { *rc = 2; { *rc = 0; return 0; } }
+                { *rc = 2; return 0; }
             }
         } else if (strcmp(argv[i], "--tf-batch") == 0 && i + 1 < argc) {
             cfg->tf_batch = atoi(argv[++i]);
             if (cfg->tf_batch < 1 || cfg->tf_batch > TF_MAX_BATCH) {
                 fprintf(stderr, "Error: --tf-batch must be 1..%d\n", TF_MAX_BATCH);
-                { *rc = 2; { *rc = 0; return 0; } }
+                { *rc = 2; return 0; }
+            }
+        } else if (strcmp(argv[i], "--prefill-batch") == 0 && i + 1 < argc) {
+            cfg->prefill_batch = atoi(argv[++i]);
+            if (cfg->prefill_batch < 1 || cfg->prefill_batch > TF_MAX_BATCH) {
+                fprintf(stderr, "Error: --prefill-batch must be 1..%d\n", TF_MAX_BATCH);
+                { *rc = 2; return 0; }
             }
         } else if (strcmp(argv[i], "--tf-rollback") == 0) {
             cfg->tf_rollback = true;
@@ -733,7 +791,7 @@ static int parse_args(int argc, char **argv, job_cfg_t *cfg, int *rc) {
         } else if (strcmp(argv[i], "--teacher-force") == 0) {
             fprintf(stderr, "Error: --teacher-force requires a path argument\n");
             print_usage(argv[0]);
-            { *rc = 2; { *rc = 0; return 0; } }
+            { *rc = 2; return 0; }
         } else if ((strcmp(argv[i], "--temp") == 0 || strcmp(argv[i], "--temperature") == 0) && i + 1 < argc) {
             cfg->sampler_params.temp = (float)atof(argv[++i]);
         } else if ((strcmp(argv[i], "--top-p") == 0 || strcmp(argv[i], "--top_p") == 0) && i + 1 < argc) {
@@ -944,6 +1002,7 @@ static int run_job(const engine_vtable_t *vtable, void *model, job_cfg_t *cfg) {
     sampler_params_t sampler_params = cfg->sampler_params;
     const char *teacher_force_path = cfg->teacher_force_path;
     const int tf_batch = cfg->tf_batch;
+    const int prefill_batch = cfg->prefill_batch;
     const bool tf_rollback = cfg->tf_rollback;
     const tuff_arch_t arch = cfg->arch;
     const int is_lfm = cfg->is_lfm;
@@ -1234,10 +1293,9 @@ static int run_job(const engine_vtable_t *vtable, void *model, job_cfg_t *cfg) {
         tuff_logit_capture_enable(1);
         int pos = 0;
         int32_t pred_token = prompt_tokens[0];
-        for (int i = 0; i < n_prompt; ++i) {
-            pred_token = vtable->engine_forward_token(eng, prompt_tokens[i], pos++);
-            fwd_check(is_lfm, pred_token, pos - 1);
-        }
+        pred_token = prefill(vtable, eng, prompt_tokens, n_prompt, 0, prefill_batch, vtable->model_get_vocab_size(model));
+        if (pred_token < 0 && is_lfm) job_exit(3);
+        pos = n_prompt;
 
         tm_mark("prefill (prompt forward, incl. graph capture)");
         int matches = 0;
@@ -1327,10 +1385,9 @@ static int run_job(const engine_vtable_t *vtable, void *model, job_cfg_t *cfg) {
         vtable->engine_set_sampler(eng, &sampler_params);
         int pos = 0;
         int32_t curr_token = prompt_tokens[0];
-        for (int i = 0; i < n_prompt; ++i) {
-            curr_token = vtable->engine_forward_token(eng, prompt_tokens[i], pos++);
-            fwd_check(is_lfm, curr_token, pos - 1);
-        }
+        curr_token = prefill(vtable, eng, prompt_tokens, n_prompt, 0, prefill_batch, vtable->model_get_vocab_size(model));
+        if (curr_token < 0 && is_lfm) job_exit(3);
+        pos = n_prompt;
 
         // The vector left behind by the last prompt forward is the one that selected the
         // first generated token, so the i-th dumped vector lines up 1:1 with the i-th token
@@ -1438,10 +1495,9 @@ static int run_job(const engine_vtable_t *vtable, void *model, job_cfg_t *cfg) {
         vtable->engine_set_sampler(eng, &sampler_params);
         int pos = 0;
         int32_t curr_token = prompt_tokens[0];
-        for (int i = 0; i < n_prompt; ++i) {
-            curr_token = vtable->engine_forward_token(eng, prompt_tokens[i], pos++);
-            fwd_check(is_lfm, curr_token, pos - 1);
-        }
+        curr_token = prefill(vtable, eng, prompt_tokens, n_prompt, 0, prefill_batch, vtable->model_get_vocab_size(model));
+        if (curr_token < 0 && is_lfm) job_exit(3);
+        pos = n_prompt;
         tm_mark("prefill (prompt forward, incl. graph capture)");
         if (lfm_spec) {
             spec_t sp;
@@ -1520,10 +1576,9 @@ static int run_job(const engine_vtable_t *vtable, void *model, job_cfg_t *cfg) {
         int32_t *warmup_seq = (int32_t*)malloc((size_t)(n_prompt + n_warmup + 1) * sizeof(int32_t));
         memcpy(warmup_seq, prompt_tokens, (size_t)n_prompt * sizeof(int32_t));
 
-        for (int i = 0; i < n_prompt; ++i) {
-            curr_token = vtable->engine_forward_token(eng, prompt_tokens[i], pos++);
-            fwd_check(is_lfm, curr_token, pos - 1);
-        }
+        curr_token = prefill(vtable, eng, prompt_tokens, n_prompt, 0, prefill_batch, vtable->model_get_vocab_size(model));
+        if (curr_token < 0 && is_lfm) job_exit(3);
+        pos = n_prompt;
         tm_mark("prefill (prompt forward, incl. graph capture)");
         if (lfm_spec) {
             spec_begin_run(&lfm_sp, eng);

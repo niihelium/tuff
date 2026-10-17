@@ -5,6 +5,7 @@
 #include "cpu_ops.h"
 #include "tokenizer.h"
 #include "sampler.h"
+#include "qwen_cpu_expert.h"
 
 typedef struct {
     model_t *model;
@@ -65,7 +66,17 @@ typedef struct {
     // Stochastic sampler state (H60)
     sampler_t sampler;
     float    *host_logits; // Lazy-allocated only when temp > 0
+
+    // Qwen bit-identical CPU miss evaluator
+    qwen_cpu_expert_t *qwen_cpu_exp;
+
+    // Batched verify / speculative state (Task Q1.1)
+    int      batch_n;
+    float   *batch_x;
 } engine_t;
+
+int engine_forward_batch(engine_t *eng, const int32_t *tokens, int n, int pos0, int32_t *argmax_out, float *logits_out);
+int engine_rollback(engine_t *eng, int n_keep);
 
 void engine_set_sampler(engine_t *eng, const sampler_params_t *params);
 

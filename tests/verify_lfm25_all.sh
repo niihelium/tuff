@@ -5,6 +5,7 @@
 #
 #   golden dense|dense26|moe8|moe   byte-identity vs the frozen goldens (graph on/off, expert cache)
 #   oracle dense|dense26|moe8|moe   three-stage llama.cpp/FP64 gate with locked thresholds
+#   prefill                    batched prompt prefill == token-by-token prefill (tokens + logits, multi-chunk prompt)
 #   router8/24, moeffn8/24     kernel unit tests vs llama.cpp fixtures
 #   cpuexp8/24                 CPU-miss expert path byte-identical to the all-GPU path (every miss mask)
 #   --controls                 also run the full negative-control suite (tests/lfm25_negative_controls.sh)
@@ -48,6 +49,7 @@ step() {  # <name> <cmd...>
 
 for m in dense dense26 moe8 moe; do step "golden $m" ./tests/verify_lfm25_golden.sh "$m"; done
 for m in dense dense26 moe8 moe; do step "oracle $m" ./tests/verify_lfm25_oracle.sh "$m"; done
+step "prefill"   ./tests/verify_lfm25_prefill.sh
 step "router8"   "$BDIR/lfm25-router-test"  "$M8"  tests/fixtures/lfm25_8b_router_cases.bin
 step "router24"  "$BDIR/lfm25-router-test"  "$M24" tests/fixtures/lfm25_24b_router_cases.bin
 step "moeffn8"   "$BDIR/lfm25-moe-ffn-test" "$M8"  tests/fixtures/lfm25_8b_moe_ffn_cases.bin

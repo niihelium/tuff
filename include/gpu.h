@@ -2,6 +2,7 @@
 #define GPU_H
 
 #include "model.h"
+#include <cuda_runtime.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -122,6 +123,26 @@ void gpu_expert_batch_down_launch_fused(int n, ggml_type_t type, const float *ac
 void gpu_expert_moe_gateup_swiglu(const int *slots, int n, const float *norm_x, int in_dim, int ffn_dim);
 void gpu_expert_moe_down(int n, ggml_type_t type, int in_dim, int out_dim, float *down_out);
 
+void gpu_qwen_moe_swiglu_pre_gu(cudaStream_t stream, const float *d_pre_gu,
+                                float *d_act, void *d_act_q8,
+                                unsigned miss_mask, int ffn_dim);
+void gpu_qwen_moe_combine_unified(float *d_res_x, const float *exdbat,
+                                  const int *hit_pos, int n_hits,
+                                  const float *d_pre_y, unsigned miss_mask,
+                                  const float *top_values, const float *d_shexp_out,
+                                  int dim, cudaStream_t stream);
+
+const void* gpu_get_expert_xq8_dev_ptr(int col);
+float*      gpu_get_expert_dx_dev_ptr(int col);
+void*       gpu_get_expert_dxq8_dev_ptr(int col);
+float*      gpu_get_expert_dbat_dev_ptr(int col);
+void        gpu_expert_moe_normx_quant_col(const float *d_norm_x, int in_dim, int col);
+void        gpu_expert_moe_normx_quant_host(const float *h_norm_x, int in_dim, int col);
+cudaStream_t gpu_get_expert_stream(void);
+
+
+
+
 // Self-test of the Q4_K expert kernel vs the CPU reference (TUFF_EXPERT_SELFTEST=1).
 void gpu_selftest_q4k(const model_t *m);
 // H7 stage 1: cost of a dense Q8_0 projection over 1/2/4 activation columns.
@@ -154,6 +175,7 @@ void gpu_expert_cache_fill_down(int slot, const model_t *m, uint32_t layer, int 
 void gpu_expert_cache_stats(unsigned long long *hits, unsigned long long *misses);
 int  gpu_expert_cache_active(void);
 void gpu_expert_cache_sync(void);
+struct moe_policy* gpu_get_moe_policy(void);
 
 // --- P1 background cache fills (parity.md sec.4 P1) ---
 // The decode thread must never copy expert weights itself: the GGUF mapping is pageable, so
@@ -376,6 +398,31 @@ int   gpu_has_delta_graphs_n2(void);
 void  gpu_capture_delta_graphs_n2(model_t *m);
 void  gpu_launch_delta_layer_graph_n2(uint32_t delta_layer_idx);
 const float *gpu_get_shexp2_dev_ptr(void);
+
+// Generalised N-column batch verify operations (Task Q1.1, 1 <= N <= 8)
+void  gpu_batch_prepare(int dim, int vocab_size, int max_batch);
+float *gpu_get_d_res_batch(void);
+float *gpu_get_d_norm_batch(void);
+float *gpu_get_d_shexp_batch(void);
+float *gpu_get_d_moe_buf_batch(void);
+void  gpu_upload_moe_buf(int c, const float *h_buf, int dim);
+void  gpu_residual_reset_batch(const float *h_x_all, int dim, int n);
+void  gpu_residual_accum(float *d_dst, const float *d_src, int count);
+void  gpu_rms_norm_dev_batch(float *d_dst, const float *d_src, const float *d_weight, int dim, float eps, int n);
+void  gpu_batch_quantize_norm_x(const float *d_src, int in_dim, int n);
+void  gpu_delta_projections_batch(const tensor_t *attn_qkv, const tensor_t *attn_gate,
+                                  const tensor_t *ssm_beta, const tensor_t *ssm_alpha,
+                                  const float *d_norm_batch, int in_dim, int n);
+void  gpu_delta_fused_gdn_dev_col_batch(int c, int layer_idx, const model_layer_t *L, float *d_res_x,
+                                        float eps, float scale_q,
+                                        int n_k_heads, int n_v_heads, int head_k_dim, int head_v_dim,
+                                        int key_dim, int value_dim, int qkv_dim, int conv_kernel, int dim);
+void  gpu_delta_snapshot_layer_batch(int layer_idx, int col, int n_v_heads, int head_v_dim,
+                                     int head_k_dim, int conv_kernel, int qkv_dim);
+void  gpu_delta_rollback_batch(int n_keep);
+void  gpu_output_argmax_batch(const tensor_t *output_weight, const float *d_norm_batch,
+                              int in_dim, int vocab_size, int n, int32_t *out_tokens,
+                              float *host_logits_capture);
 
 // Page-locked host allocation for the per-layer decode round trips (norm_x, router logits, the
 // CPU-miss accumulator). A pageable cudaMemcpyAsync is not asynchronous: the driver stages it

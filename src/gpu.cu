@@ -3,10 +3,13 @@
 #include "ggml_types.h"
 #include "cuda_check.h"
 #include "tuff_exact.h"   // P0's shared TUFF_EXACT flag (cached, extern "C")
+#include "moe_policy.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cfloat>
+
+static moe_policy_t *g_moe_policy = NULL;
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -96,6 +99,22 @@ static float *g_d_logits2 = NULL;      // [2][vocab]
 static int    g_n2_dim    = 0;
 static float *g_dstate_snap = NULL;    // rollback copy of the GDN recurrent state
 static float *g_dconv_snap  = NULL;    // rollback copy of the conv1d state
+
+// Generalised N-column batch verify trunk (Task Q1.1, 1 <= N <= 8)
+static float   *g_d_res_batch = NULL;      // [8 * dim]
+static float   *g_d_norm_batch = NULL;     // [8 * dim]
+static void    *g_d_nx_batch_q8 = NULL;    // [8 * (dim/32) * 36 bytes]
+static float   *g_d_p_batch_qkv = NULL;    // [8 * out_qkv]
+static float   *g_d_p_batch_z = NULL;      // [8 * out_z]
+static float   *g_d_p_batch_b = NULL;      // [8 * out_beta]
+static float   *g_d_p_batch_a = NULL;      // [8 * out_alpha]
+static float   *g_d_logits_batch = NULL;   // [8 * vocab]
+static int32_t *g_d_best_token_batch = NULL; // [8]
+static int      g_batch_dim = 0;
+static float   *g_dstate_snap_batch[8] = {NULL}; // [8 snapshots of g_dstate_bytes]
+static float   *g_dconv_snap_batch[8]  = {NULL}; // [8 snapshots of g_dconv_bytes]
+static float   *g_d_shexp_batch = NULL;    // [8 * dim]
+static float   *g_d_moe_buf_batch = NULL;  // [8 * dim]
 static float *g_d_shexp_out2 = NULL;   // second column's shared-expert output
 static float *g_d_router_logits2 = NULL; // second column's router logits (graph-captured)
 static float *g_d_router_logits = NULL;// [256]
@@ -385,6 +404,8 @@ void gpu_expert_cache_init_ex(model_t *m, int *p_max_seq, int fill_ram) {
     CUDA_CHECK(cudaStreamCreateWithFlags(&g_upload_stream, cudaStreamNonBlocking));
 
     g_cache_ready = 1;
+    if (g_moe_policy) { moe_policy_free(g_moe_policy); g_moe_policy = NULL; }
+    g_moe_policy = moe_policy_create((int)m->block_count, (int)m->expert_count);
     bgfill_start();
     fprintf(stderr, "[EXPERT-CACHE] Context: %d tokens (KV: %.1f MiB, %.1f KiB/tok) | Expert Slots: %d (Pool: %.1f MiB, %.2f MiB/slot) | Margin: %d MiB | Free VRAM: %.1f MiB\n",
             ctx_len, (double)kv_bytes / (1024.0 * 1024.0), (double)kv_bytes_per_tok / 1024.0,
@@ -557,6 +578,7 @@ void gpu_expert_cache_free(void) {
     g_lru_head = g_lru_tail = -1; g_free_head = -1; g_valid_count = 0;
     g_n_slots = 0; g_slot_bytes = 0; g_cache_ready = 0;
     free(g_expert_hist); g_expert_hist = NULL; g_expert_hist_on = 0;
+    if (g_moe_policy) { moe_policy_free(g_moe_policy); g_moe_policy = NULL; }
 }
 
 // --- O(1) LRU + freelist bookkeeping (iteration-10) ---
@@ -681,13 +703,39 @@ void gpu_expert_cache_fill_down(int slot, const model_t *m, uint32_t layer, int 
     CUDA_CHECK(cudaMemcpyAsync(base + g_tensor_off[2], down, down_bytes, cudaMemcpyHostToDevice, g_upload_stream));
 }
 
-// Reserve a slot for a new expert (miss): free slot first, else LRU victim. Does NOT upload.
-// O(1) via freelist + doubly-linked LRU list (iteration-10). Pure LRU naturally evicts stale
-// domain working sets when the conversation shifts topic.
+static int select_tail_victim_slot(void) {
+    if (!g_moe_policy || getenv("TUFF_NO_LES")) {
+        return g_lru_tail;
+    }
+    int cands[16];
+    int n_cands = 0;
+    int cur = g_lru_tail;
+    while (cur >= 0 && n_cands < 16) {
+        if (g_slots[cur].valid) cands[n_cands++] = cur;
+        cur = g_lru_prev[cur];
+    }
+    if (n_cands == 0) return g_lru_tail;
+    int best_i = 0;
+    float min_score = 1e30f;
+    for (int i = 0; i < n_cands; ++i) {
+        int s = cands[i];
+        float sc = moe_policy_score(g_moe_policy, (int)g_slots[s].layer, g_slots[s].expert);
+        if (sc < min_score) {
+            min_score = sc;
+            best_i = i;
+            if (min_score <= 0.0f) break;
+        }
+    }
+    return cands[best_i];
+}
+
+// Reserve a slot for a new expert (miss): free slot first, else policy/LRU victim. Does NOT upload.
+// O(1) via freelist + tail candidate selection (Task 6.2 LES probability-driven cache).
 int gpu_expert_cache_alloc_slot(uint32_t layer, int expert) {
+    (void)layer; (void)expert;
     int victim = freelist_pop();
     if (victim < 0) {
-        victim = g_lru_tail;
+        victim = select_tail_victim_slot();
     }
     return victim;
 }
@@ -698,6 +746,8 @@ void gpu_expert_cache_stats(unsigned long long *hits, unsigned long long *misses
 }
 
 int gpu_expert_cache_active(void) { return g_cache_enabled(); }
+
+moe_policy_t* gpu_get_moe_policy(void) { return g_moe_policy; }
 
 // Ensure any in-flight async expert uploads are visible to the default stream before the
 // engine reads a resident slot (cheap when the upload stream is idle). No-op if not async.
@@ -844,7 +894,7 @@ static void bgfill_stop(void) {
 static int expert_slot_reserve(void) {
     int slot = freelist_pop();
     if (slot < 0) {
-        slot = g_lru_tail;
+        slot = select_tail_victim_slot();
         if (slot < 0) return -1;   // all slots reserved in flight
         lru_remove(slot);
     }
@@ -1727,6 +1777,8 @@ void gpu_prepare_ex(model_t *m, int *p_max_seq, int fill_ram) {
     kv_cache_ensure(n_attn, n_head_kv, max_seq_init, head_dim);
     attn_scores_ensure(n_head, max_seq_init);
 
+    gpu_batch_prepare((int)m->embedding_length, (int)m->vocab_size, 8);
+
     gpu_expert_cache_init_ex(m, p_max_seq, fill_ram);
     gpu_expert_cache_prefill(m);
 }
@@ -1869,6 +1921,23 @@ void gpu_shutdown(model_t *m) {
     if (g_d_dense_x_q8)   { CUDA_CHECK(cudaFree(g_d_dense_x_q8));   g_d_dense_x_q8 = NULL; }
     if (g_d_norm_q8)      { CUDA_CHECK(cudaFree(g_d_norm_q8));      g_d_norm_q8 = NULL; }
     if (g_d_shact_q8)     { CUDA_CHECK(cudaFree(g_d_shact_q8));     g_d_shact_q8 = NULL; }
+
+    if (g_d_res_batch)        { CUDA_CHECK(cudaFree(g_d_res_batch));        g_d_res_batch = NULL; }
+    if (g_d_norm_batch)       { CUDA_CHECK(cudaFree(g_d_norm_batch));       g_d_norm_batch = NULL; }
+    if (g_d_nx_batch_q8)      { CUDA_CHECK(cudaFree(g_d_nx_batch_q8));      g_d_nx_batch_q8 = NULL; }
+    if (g_d_p_batch_qkv)      { CUDA_CHECK(cudaFree(g_d_p_batch_qkv));      g_d_p_batch_qkv = NULL; }
+    if (g_d_p_batch_z)        { CUDA_CHECK(cudaFree(g_d_p_batch_z));        g_d_p_batch_z = NULL; }
+    if (g_d_p_batch_b)        { CUDA_CHECK(cudaFree(g_d_p_batch_b));        g_d_p_batch_b = NULL; }
+    if (g_d_p_batch_a)        { CUDA_CHECK(cudaFree(g_d_p_batch_a));        g_d_p_batch_a = NULL; }
+    if (g_d_logits_batch)     { CUDA_CHECK(cudaFree(g_d_logits_batch));     g_d_logits_batch = NULL; }
+    if (g_d_best_token_batch) { CUDA_CHECK(cudaFree(g_d_best_token_batch)); g_d_best_token_batch = NULL; }
+    if (g_d_shexp_batch)      { CUDA_CHECK(cudaFree(g_d_shexp_batch));      g_d_shexp_batch = NULL; }
+    if (g_d_moe_buf_batch)    { CUDA_CHECK(cudaFree(g_d_moe_buf_batch));    g_d_moe_buf_batch = NULL; }
+    for (int i = 0; i < 8; ++i) {
+        if (g_dstate_snap_batch[i]) { CUDA_CHECK(cudaFreeHost(g_dstate_snap_batch[i])); g_dstate_snap_batch[i] = NULL; }
+        if (g_dconv_snap_batch[i])  { CUDA_CHECK(cudaFreeHost(g_dconv_snap_batch[i]));  g_dconv_snap_batch[i]  = NULL; }
+    }
+    g_batch_dim = 0;
 
     gpu_expert_cache_free();
 }
@@ -3442,12 +3511,13 @@ static void launch_mmvq_q6_K_expert(unsigned long long off, const block_q8_1_c *
 // host round-trip between the gate/up and down projections. `in_dim` is the model's embedding
 // dim, `ffn_dim` the expert FFN dim; both come from the model struct via the engine.
 void gpu_expert_moe_gateup_swiglu(const int *slots, int n, const float *norm_x, int in_dim, int ffn_dim) {
-    CUDA_CHECK(cudaMemcpyAsync(g_exgx, norm_x, (size_t)in_dim * sizeof(float), cudaMemcpyHostToDevice, g_expert_stream));
-    CUDA_CHECK(cudaMemcpyAsync(g_exslots, slots, (size_t)n * sizeof(int), cudaMemcpyHostToDevice, g_expert_stream));
-
     block_q8_1_c *xq8 = (block_q8_1_c *)g_exgx_q8;
-    quantize_q8_1_kernel<<<(in_dim + 255)/256, 256, 0, g_expert_stream>>>(g_exgx, xq8, in_dim);
-    CUDA_CHECK_LAST();
+    if (norm_x) {
+        CUDA_CHECK(cudaMemcpyAsync(g_exgx, norm_x, (size_t)in_dim * sizeof(float), cudaMemcpyHostToDevice, g_expert_stream));
+        quantize_q8_1_kernel<<<(in_dim + 255)/256, 256, 0, g_expert_stream>>>(g_exgx, xq8, in_dim);
+        CUDA_CHECK_LAST();
+    }
+    CUDA_CHECK(cudaMemcpyAsync(g_exslots, slots, (size_t)n * sizeof(int), cudaMemcpyHostToDevice, g_expert_stream));
 
     const int nblk = in_dim / QK_K;
     const int nw = mmvq_nwarps(nblk, QI4_K / VDR_Q4_K_Q8_1_MMVQ);
@@ -5238,6 +5308,7 @@ void gpu_attention_layer_dev(int layer_idx, float *d_res_x, const model_layer_t 
                              int n_head, int n_head_kv, int head_dim,
                              int pos, int ctx_len, int max_seq, float scale, float eps, int dim,
                              int rope_dim_count, const uint32_t rope_sections[4], float rope_freq_base) {
+    gpu_set_device_pos(pos);
     kv_cache_ensure(n_attn_layers, n_head_kv, max_seq, head_dim);
     attn_scores_ensure(n_head, max_seq);
 
@@ -5246,6 +5317,7 @@ void gpu_attention_layer_dev(int layer_idx, float *d_res_x, const model_layer_t 
     uint32_t v_dim      = (uint32_t)layer->attn_v.info.dims[1]; // 512
 
     if (!tuff_exact() && mmvq_dual_enabled()) {
+        dense_quantize_x(d_norm_x, dim);
         const block_q8_1_c *xq = (const block_q8_1_c *)g_d_dense_x_q8;
         if (tuff_h50()) {
             const int nblk = dim / QK8_0;
@@ -5674,11 +5746,33 @@ static float *ex_col_dx(int col)  { return g_exdx   + (size_t)col * g_ex_stride_
 static float *ex_col_dbat(int col){ return g_exdbat + (size_t)col * g_ex_stride_dbat; }
 static int   *ex_col_slots(int col){ return g_exslots + (size_t)col * g_ex_stride_slots; }
 
-// One column's normalized input, quantized to q8_1 for the gate/up kernels.
 void gpu_expert_moe_normx_quant_col(const float *d_norm_x, int in_dim, int col) {
-    quantize_q8_1_kernel<<<(in_dim + 255)/256, 256>>>(d_norm_x, (block_q8_1_c*)ex_col_xq8(col), in_dim);
+    if (g_expert_stream) {
+        static cudaEvent_t ev = NULL;
+        if (!ev) CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventRecord(ev, 0));
+        CUDA_CHECK(cudaStreamWaitEvent(g_expert_stream, ev, 0));
+        quantize_q8_1_kernel<<<(in_dim + 255)/256, 256, 0, g_expert_stream>>>(d_norm_x, (block_q8_1_c*)ex_col_xq8(col), in_dim);
+    } else {
+        quantize_q8_1_kernel<<<(in_dim + 255)/256, 256>>>(d_norm_x, (block_q8_1_c*)ex_col_xq8(col), in_dim);
+    }
     CUDA_CHECK_LAST();
 }
+
+void gpu_expert_moe_normx_quant_host(const float *h_norm_x, int in_dim, int col) {
+    float *gx = g_exgx + (size_t)col * (size_t)in_dim;
+    CUDA_CHECK(cudaMemcpyAsync(gx, h_norm_x, (size_t)in_dim * sizeof(float), cudaMemcpyHostToDevice, g_expert_stream));
+    quantize_q8_1_kernel<<<(in_dim + 255)/256, 256, 0, g_expert_stream>>>(gx, (block_q8_1_c*)ex_col_xq8(col), in_dim);
+    CUDA_CHECK_LAST();
+}
+
+cudaStream_t gpu_get_expert_stream(void) { return g_expert_stream; }
+
+const void* gpu_get_expert_xq8_dev_ptr(int col) { return ex_col_xq8(col); }
+float*      gpu_get_expert_dx_dev_ptr(int col)  { return ex_col_dx(col); }
+void*       gpu_get_expert_dxq8_dev_ptr(int col){ return ex_col_dxq8(col); }
+float*      gpu_get_expert_dbat_dev_ptr(int col){ return ex_col_dbat(col); }
+
 
 template <int ncols>
 static void launch_mmvq_q4_K_gateup_swiglu_ncols(const int *slots, int n,
@@ -6196,6 +6290,90 @@ void gpu_moe_combine_accum(float *d_res_x, const int *hit_pos, int n_hits,
     gpu_moe_combine_accum_col(d_res_x, hit_pos, n_hits, top_values, d_shexp_out, host_miss_sum, dim, 0);
 }
 
+__global__ void qwen_moe_swiglu_pre_gu_kernel(const float * __restrict__ pre_gu,
+                                              float * __restrict__ act,
+                                              unsigned miss_mask,
+                                              int ffn_dim) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int k = blockIdx.y; // 0..7
+    if (row >= ffn_dim) return;
+    if (!((miss_mask >> k) & 1u)) return;
+    float g = pre_gu[(2 * k + 0) * ffn_dim + row];
+    float u = pre_gu[(2 * k + 1) * ffn_dim + row];
+    act[(size_t)k * ffn_dim + row] = (g / (1.0f + expf(-g))) * u;
+}
+
+void gpu_qwen_moe_swiglu_pre_gu(cudaStream_t stream, const float *d_pre_gu,
+                                float *d_act, void *d_act_q8,
+                                unsigned miss_mask, int ffn_dim) {
+    if (miss_mask == 0u) return;
+    dim3 grid((unsigned)((ffn_dim + 255) / 256), 8u, 1u);
+    dim3 block(256u, 1u, 1u);
+    qwen_moe_swiglu_pre_gu_kernel<<<grid, block, 0, stream>>>(d_pre_gu, d_act, miss_mask, ffn_dim);
+    CUDA_CHECK_LAST();
+    for (int k = 0; k < 8; ++k) {
+        if (!((miss_mask >> k) & 1u)) continue;
+        quantize_q8_1_kernel<<<(ffn_dim + 255)/256, 256, 0, stream>>>(
+            d_act + (size_t)k * ffn_dim,
+            (block_q8_1_c*)d_act_q8 + (size_t)k * (ffn_dim / 32),
+            ffn_dim);
+    }
+    CUDA_CHECK_LAST();
+}
+
+__global__ void qwen_moe_combine_unified_kernel(
+    float * __restrict__ res_x,
+    const float * __restrict__ exdbat,        // [n_hits * dim]
+    const int * __restrict__ hit_pos,         // [n_hits] maps hit h -> k in 0..7
+    int n_hits,
+    const float * __restrict__ pre_y,         // [8 * dim] (for missed k)
+    unsigned miss_mask,
+    const float * __restrict__ top_values,    // [8]
+    const float * __restrict__ shexp_out,     // [dim] or NULL
+    int dim) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= dim) return;
+
+    float y[8];
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) y[k] = 0.0f;
+
+    for (int h = 0; h < n_hits; ++h) {
+        int k = hit_pos[h];
+        y[k] = exdbat[(size_t)h * dim + i];
+    }
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        if ((miss_mask >> k) & 1u) {
+            y[k] = pre_y[(size_t)k * dim + i];
+        }
+    }
+
+    float sum = shexp_out ? shexp_out[i] : 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        sum += top_values[k] * y[k];
+    }
+    res_x[i] += sum;
+}
+
+void gpu_qwen_moe_combine_unified(float *d_res_x, const float *exdbat,
+                                  const int *hit_pos, int n_hits,
+                                  const float *d_pre_y, unsigned miss_mask,
+                                  const float *top_values, const float *d_shexp_out,
+                                  int dim, cudaStream_t stream) {
+    CUDA_CHECK(cudaMemcpyAsync(g_d_top_values, top_values, 8 * sizeof(float), cudaMemcpyHostToDevice, stream));
+    if (n_hits > 0) {
+        CUDA_CHECK(cudaMemcpyAsync(g_d_hit_pos, hit_pos, (size_t)n_hits * sizeof(int), cudaMemcpyHostToDevice, stream));
+    }
+    dim3 grid((unsigned)((dim + 255) / 256), 1u, 1u);
+    dim3 block(256u, 1u, 1u);
+    qwen_moe_combine_unified_kernel<<<grid, block, 0, stream>>>(
+        d_res_x, exdbat, g_d_hit_pos, n_hits, d_pre_y, miss_mask, g_d_top_values, d_shexp_out, dim);
+    CUDA_CHECK_LAST();
+}
+
+
 __global__ void argmax_block_kernel(const float * __restrict__ x, float * __restrict__ block_max,
                                     int * __restrict__ block_idx, int n) {
     __shared__ float s_max[256];
@@ -6697,6 +6875,215 @@ extern "C" void gpu_output_argmax_n2(const tensor_t *output_weight, const float 
 }
 
 // ===========================================================================
+// Generalised N-Column Batch Verify Trunk (Task Q1.1, 1 <= N <= 8)
+// ===========================================================================
+
+extern "C" float *gpu_get_d_res_batch(void)   { return g_d_res_batch; }
+extern "C" float *gpu_get_d_norm_batch(void)  { return g_d_norm_batch; }
+extern "C" float *gpu_get_d_shexp_batch(void) { return g_d_shexp_batch; }
+extern "C" float *gpu_get_d_moe_buf_batch(void) { return g_d_moe_buf_batch; }
+
+extern "C" void gpu_batch_prepare(int dim, int vocab_size, int max_batch) {
+    if (g_batch_dim == dim && g_d_res_batch) return;
+    g_batch_dim = dim;
+    if (!g_d_res_batch)        CUDA_CHECK(cudaMalloc(&g_d_res_batch,        (size_t)max_batch * dim * sizeof(float)));
+    if (!g_d_norm_batch)       CUDA_CHECK(cudaMalloc(&g_d_norm_batch,       (size_t)max_batch * dim * sizeof(float)));
+    if (!g_d_nx_batch_q8)      CUDA_CHECK(cudaMalloc(&g_d_nx_batch_q8,      (size_t)max_batch * (dim / QK8_1) * sizeof(block_q8_1_c)));
+    if (!g_d_logits_batch)     CUDA_CHECK(cudaMalloc(&g_d_logits_batch,     (size_t)max_batch * vocab_size * sizeof(float)));
+    if (!g_d_best_token_batch) CUDA_CHECK(cudaMalloc(&g_d_best_token_batch, (size_t)max_batch * sizeof(int32_t)));
+    if (!g_d_shexp_batch)      CUDA_CHECK(cudaMalloc(&g_d_shexp_batch,      (size_t)max_batch * dim * sizeof(float)));
+    if (!g_d_moe_buf_batch)    CUDA_CHECK(cudaMalloc(&g_d_moe_buf_batch,    (size_t)max_batch * dim * sizeof(float)));
+
+    const int out_qkv   = 8192;
+    const int out_z     = 4096;
+    const int out_beta  = 32;
+    const int out_alpha = 32;
+    if (!g_d_p_batch_qkv) CUDA_CHECK(cudaMalloc(&g_d_p_batch_qkv, (size_t)max_batch * out_qkv   * sizeof(float)));
+    if (!g_d_p_batch_z)   CUDA_CHECK(cudaMalloc(&g_d_p_batch_z,   (size_t)max_batch * out_z     * sizeof(float)));
+    if (!g_d_p_batch_b)   CUDA_CHECK(cudaMalloc(&g_d_p_batch_b,   (size_t)max_batch * out_beta  * sizeof(float)));
+    if (!g_d_p_batch_a)   CUDA_CHECK(cudaMalloc(&g_d_p_batch_a,   (size_t)max_batch * out_alpha * sizeof(float)));
+
+    for (int i = 0; i < max_batch - 1; ++i) {
+        if (!g_dstate_snap_batch[i] && g_dstate_bytes > 0)
+            CUDA_CHECK(cudaMallocHost(&g_dstate_snap_batch[i], g_dstate_bytes));
+        if (!g_dconv_snap_batch[i] && g_dconv_bytes > 0)
+            CUDA_CHECK(cudaMallocHost(&g_dconv_snap_batch[i], g_dconv_bytes));
+    }
+}
+
+__global__ void accum_inplace_kernel(float * __restrict__ dst, const float * __restrict__ src, int total) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        dst[i] += src[i];
+    }
+}
+
+extern "C" void gpu_upload_moe_buf(int c, const float *h_buf, int dim) {
+    CUDA_CHECK(cudaMemcpyAsync(g_d_moe_buf_batch + (size_t)c * dim, h_buf, (size_t)dim * sizeof(float), cudaMemcpyHostToDevice));
+}
+
+extern "C" void gpu_residual_reset_batch(const float *h_x_all, int dim, int n) {
+    CUDA_CHECK(cudaMemcpyAsync(g_d_res_batch, h_x_all, (size_t)n * dim * sizeof(float), cudaMemcpyHostToDevice));
+}
+
+extern "C" void gpu_residual_accum(float *d_dst, const float *d_src, int count) {
+    accum_inplace_kernel<<<(count + 255) / 256, 256>>>(d_dst, d_src, count);
+    CUDA_CHECK_LAST();
+}
+
+extern "C" void gpu_rms_norm_dev_batch(float *d_dst, const float *d_src, const float *d_weight, int dim, float eps, int n) {
+    for (int c = 0; c < n; ++c) {
+        rms_norm_dev_kernel<<<1, 256>>>(d_dst + (size_t)c * dim, d_src + (size_t)c * dim, d_weight, dim, eps);
+    }
+    CUDA_CHECK_LAST();
+}
+
+extern "C" void gpu_batch_quantize_norm_x(const float *d_src, int in_dim, int n) {
+    const int nblk = in_dim / QK8_1;
+    for (int c = 0; c < n; ++c) {
+        quantize_q8_1_kernel<<<(in_dim + 255) / 256, 256>>>(
+            d_src + (size_t)c * in_dim, (block_q8_1_c*)g_d_nx_batch_q8 + (size_t)c * nblk, in_dim);
+    }
+    CUDA_CHECK_LAST();
+}
+
+static void batch_dense_q8_0(const void *dev_w, float *d_dst, int in_dim, int out_dim, int n) {
+    const int nblk = in_dim / QK8_0;
+    dim3 grid((unsigned)((out_dim + MMVQ_ROWS_PER_BLOCK - 1) / MMVQ_ROWS_PER_BLOCK), 1u, 1u);
+    dim3 block(32u, (unsigned)MMVQ_ROWS_PER_BLOCK, 1u);
+    switch (n) {
+        case 1: mmvq_q8_0_dense_ncols_kernel<MMVQ_ROWS_PER_BLOCK, 1><<<grid, block>>>(
+                    (const block_q8_0*)dev_w, (const block_q8_1_c*)g_d_nx_batch_q8, d_dst, out_dim, nblk); break;
+        case 2: mmvq_q8_0_dense_ncols_kernel<MMVQ_ROWS_PER_BLOCK, 2><<<grid, block>>>(
+                    (const block_q8_0*)dev_w, (const block_q8_1_c*)g_d_nx_batch_q8, d_dst, out_dim, nblk); break;
+        case 3: mmvq_q8_0_dense_ncols_kernel<MMVQ_ROWS_PER_BLOCK, 3><<<grid, block>>>(
+                    (const block_q8_0*)dev_w, (const block_q8_1_c*)g_d_nx_batch_q8, d_dst, out_dim, nblk); break;
+        case 4: mmvq_q8_0_dense_ncols_kernel<MMVQ_ROWS_PER_BLOCK, 4><<<grid, block>>>(
+                    (const block_q8_0*)dev_w, (const block_q8_1_c*)g_d_nx_batch_q8, d_dst, out_dim, nblk); break;
+        case 5: mmvq_q8_0_dense_ncols_kernel<MMVQ_ROWS_PER_BLOCK, 5><<<grid, block>>>(
+                    (const block_q8_0*)dev_w, (const block_q8_1_c*)g_d_nx_batch_q8, d_dst, out_dim, nblk); break;
+        case 6: mmvq_q8_0_dense_ncols_kernel<MMVQ_ROWS_PER_BLOCK, 6><<<grid, block>>>(
+                    (const block_q8_0*)dev_w, (const block_q8_1_c*)g_d_nx_batch_q8, d_dst, out_dim, nblk); break;
+        case 7: mmvq_q8_0_dense_ncols_kernel<MMVQ_ROWS_PER_BLOCK, 7><<<grid, block>>>(
+                    (const block_q8_0*)dev_w, (const block_q8_1_c*)g_d_nx_batch_q8, d_dst, out_dim, nblk); break;
+        case 8: mmvq_q8_0_dense_ncols_kernel<MMVQ_ROWS_PER_BLOCK, 8><<<grid, block>>>(
+                    (const block_q8_0*)dev_w, (const block_q8_1_c*)g_d_nx_batch_q8, d_dst, out_dim, nblk); break;
+        default:
+            fprintf(stderr, "[FATAL CUDA ERROR] batch_dense_q8_0: unsupported batch size %d\n", n);
+            exit(EXIT_FAILURE);
+    }
+    CUDA_CHECK_LAST();
+}
+
+static void batch_dense_q6_K(const void *dev_w, float *d_dst, int in_dim, int out_dim, int n) {
+    const int nblk = in_dim / QK_K;
+    dim3 grid((unsigned)((out_dim + MMVQ_ROWS_PER_BLOCK - 1) / MMVQ_ROWS_PER_BLOCK), 1u, 1u);
+    dim3 block(32u, (unsigned)MMVQ_ROWS_PER_BLOCK, 1u);
+    switch (n) {
+        case 1: mmvq_q6_K_dense_ncols_kernel<MMVQ_ROWS_PER_BLOCK, 1><<<grid, block>>>(
+                    (const block_q6_K*)dev_w, (const block_q8_1_c*)g_d_nx_batch_q8, d_dst, out_dim, nblk); break;
+        case 2: mmvq_q6_K_dense_ncols_kernel<MMVQ_ROWS_PER_BLOCK, 2><<<grid, block>>>(
+                    (const block_q6_K*)dev_w, (const block_q8_1_c*)g_d_nx_batch_q8, d_dst, out_dim, nblk); break;
+        case 3: mmvq_q6_K_dense_ncols_kernel<MMVQ_ROWS_PER_BLOCK, 3><<<grid, block>>>(
+                    (const block_q6_K*)dev_w, (const block_q8_1_c*)g_d_nx_batch_q8, d_dst, out_dim, nblk); break;
+        case 4: mmvq_q6_K_dense_ncols_kernel<MMVQ_ROWS_PER_BLOCK, 4><<<grid, block>>>(
+                    (const block_q6_K*)dev_w, (const block_q8_1_c*)g_d_nx_batch_q8, d_dst, out_dim, nblk); break;
+        case 5: mmvq_q6_K_dense_ncols_kernel<MMVQ_ROWS_PER_BLOCK, 5><<<grid, block>>>(
+                    (const block_q6_K*)dev_w, (const block_q8_1_c*)g_d_nx_batch_q8, d_dst, out_dim, nblk); break;
+        case 6: mmvq_q6_K_dense_ncols_kernel<MMVQ_ROWS_PER_BLOCK, 6><<<grid, block>>>(
+                    (const block_q6_K*)dev_w, (const block_q8_1_c*)g_d_nx_batch_q8, d_dst, out_dim, nblk); break;
+        case 7: mmvq_q6_K_dense_ncols_kernel<MMVQ_ROWS_PER_BLOCK, 7><<<grid, block>>>(
+                    (const block_q6_K*)dev_w, (const block_q8_1_c*)g_d_nx_batch_q8, d_dst, out_dim, nblk); break;
+        case 8: mmvq_q6_K_dense_ncols_kernel<MMVQ_ROWS_PER_BLOCK, 8><<<grid, block>>>(
+                    (const block_q6_K*)dev_w, (const block_q8_1_c*)g_d_nx_batch_q8, d_dst, out_dim, nblk); break;
+        default:
+            fprintf(stderr, "[FATAL CUDA ERROR] batch_dense_q6_K: unsupported batch size %d\n", n);
+            exit(EXIT_FAILURE);
+    }
+    CUDA_CHECK_LAST();
+}
+
+extern "C" void gpu_delta_projections_batch(const tensor_t *attn_qkv, const tensor_t *attn_gate,
+                                            const tensor_t *ssm_beta, const tensor_t *ssm_alpha,
+                                            const float *d_norm_batch, int in_dim, int n) {
+    const int out_qkv   = (int)attn_qkv->info.dims[1];
+    const int out_z     = (int)attn_gate->info.dims[1];
+    const int out_beta  = (int)ssm_beta->info.dims[1];
+    const int out_alpha = (int)ssm_alpha->info.dims[1];
+
+    gpu_batch_quantize_norm_x(d_norm_batch, in_dim, n);
+    batch_dense_q8_0(attn_qkv->dev,  g_d_p_batch_qkv, in_dim, out_qkv, n);
+    batch_dense_q8_0(attn_gate->dev, g_d_p_batch_z,   in_dim, out_z,   n);
+
+    for (int c = 0; c < n; ++c) {
+        launch_mat_vec_f32_dual((const float*)ssm_beta->dev,  g_d_p_batch_b + (size_t)c * out_beta,  out_beta,
+                                (const float*)ssm_alpha->dev, g_d_p_batch_a + (size_t)c * out_alpha, out_alpha,
+                                d_norm_batch + (size_t)c * in_dim, in_dim);
+    }
+}
+
+extern "C" void gpu_delta_fused_gdn_dev_col_batch(int c, int layer_idx, const model_layer_t *L, float *d_res_x,
+                                                  float eps, float scale_q,
+                                                  int n_k_heads, int n_v_heads, int head_k_dim, int head_v_dim,
+                                                  int key_dim, int value_dim, int qkv_dim, int conv_kernel, int dim) {
+    gpu_delta_fused_gdn_dev_p(layer_idx, L, d_res_x, eps, scale_q,
+                              g_d_p_batch_qkv + (size_t)c * qkv_dim,
+                              g_d_p_batch_z   + (size_t)c * value_dim,
+                              g_d_p_batch_b   + (size_t)c * n_v_heads,
+                              g_d_p_batch_a   + (size_t)c * n_v_heads,
+                              n_k_heads, n_v_heads, head_k_dim, head_v_dim,
+                              key_dim, value_dim, qkv_dim, conv_kernel, dim);
+}
+
+extern "C" void gpu_delta_snapshot_layer_batch(int layer_idx, int col, int n_v_heads, int head_v_dim,
+                                               int head_k_dim, int conv_kernel, int qkv_dim) {
+    if (!g_dstate_all || g_dstate_bytes == 0 || col < 0 || col >= 7) return;
+    if (!g_dstate_snap_batch[col]) CUDA_CHECK(cudaMallocHost(&g_dstate_snap_batch[col], g_dstate_bytes));
+    if (!g_dconv_snap_batch[col] && g_dconv_bytes > 0) CUDA_CHECK(cudaMallocHost(&g_dconv_snap_batch[col], g_dconv_bytes));
+
+    const size_t state_floats = (size_t)n_v_heads * head_v_dim * head_k_dim;
+    CUDA_CHECK(cudaMemcpyAsync(g_dstate_snap_batch[col] + (size_t)layer_idx * state_floats,
+                               g_dstate_all              + (size_t)layer_idx * state_floats,
+                               state_floats * sizeof(float), cudaMemcpyDeviceToHost));
+
+    if (g_dconv_all && g_dconv_snap_batch[col]) {
+        const size_t conv_floats = (size_t)conv_kernel * qkv_dim;
+        CUDA_CHECK(cudaMemcpyAsync(g_dconv_snap_batch[col] + (size_t)layer_idx * conv_floats,
+                                   g_dconv_all              + (size_t)layer_idx * conv_floats,
+                                   conv_floats * sizeof(float), cudaMemcpyDeviceToHost));
+    }
+}
+
+extern "C" void gpu_delta_rollback_batch(int n_keep) {
+    int snap_idx = n_keep - 1;
+    if (snap_idx >= 0 && snap_idx < 7 && g_dstate_snap_batch[snap_idx]) {
+        CUDA_CHECK(cudaMemcpyAsync(g_dstate_all, g_dstate_snap_batch[snap_idx], g_dstate_bytes, cudaMemcpyHostToDevice));
+        if (g_dconv_all && g_dconv_snap_batch[snap_idx] && g_dconv_bytes > 0) {
+            CUDA_CHECK(cudaMemcpyAsync(g_dconv_all, g_dconv_snap_batch[snap_idx], g_dconv_bytes, cudaMemcpyHostToDevice));
+        }
+    }
+}
+
+extern "C" void gpu_output_argmax_batch(const tensor_t *output_weight, const float *d_norm_batch,
+                                        int in_dim, int vocab_size, int n, int32_t *out_tokens,
+                                        float *host_logits_capture) {
+    gpu_batch_quantize_norm_x(d_norm_batch, in_dim, n);
+    batch_dense_q6_K(output_weight->dev, g_d_logits_batch, in_dim, vocab_size, n);
+
+    for (int c = 0; c < n; ++c) {
+        argmax_block_kernel<<<256, 256>>>(g_d_logits_batch + (size_t)c * vocab_size,
+                                          g_d_block_max, g_d_block_idx, vocab_size);
+        CUDA_CHECK_LAST();
+        argmax_final_kernel<<<1, 256>>>(g_d_block_max, g_d_block_idx, g_d_best_token_batch + c, 256);
+        CUDA_CHECK_LAST();
+    }
+    CUDA_CHECK(cudaMemcpy(out_tokens, g_d_best_token_batch, (size_t)n * sizeof(int32_t), cudaMemcpyDeviceToHost));
+    if (host_logits_capture) {
+        CUDA_CHECK(cudaMemcpy(host_logits_capture, g_d_logits_batch, (size_t)n * vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
+    }
+}
+
+// ===========================================================================
 // CUDA Graph Capture for Delta-Net Dense Layers
 // ===========================================================================
 
@@ -7016,13 +7403,6 @@ __global__ void concat_norms_kernel(float * __restrict__ concat,
     if (i < dim) {
         concat[i] = enorm[i];
         concat[dim + i] = hnorm[i];
-    }
-}
-
-__global__ void accum_inplace_kernel(float * __restrict__ dst, const float * __restrict__ src, int total) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < total) {
-        dst[i] += src[i];
     }
 }
 

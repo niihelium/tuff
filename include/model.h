@@ -6,6 +6,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
 typedef enum {
     LAYER_TYPE_ATTENTION,
     LAYER_TYPE_DELTA_NET
@@ -117,4 +122,9 @@ model_t* model_load(const char *gguf_filepath);
 void model_print_inspection(const model_t *model);
 void model_free(model_t *model);
 
+#ifdef __cplusplus
+}
+#endif
+
 #endif // MODEL_H
+

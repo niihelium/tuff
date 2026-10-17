@@ -11,7 +11,7 @@
 #   file:    path relative to the repo root
 #   old/new: text to replace; "\n" is a newline, "\\" a backslash. Whitespace after "old: " is significant.
 #   targets: cmake targets to rebuild (space separated): tuff lfm25-router-test lfm25-moe-ffn-test
-#   checks:  golden:<mode> oracle:<mode> spec router8 router24 moeffn8 moeffn24 cpuexp8 cpuexp24   (all must FAIL on the mutant)
+#   checks:  golden:<mode> oracle:<mode> spec prefill router8 router24 moeffn8 moeffn24 cpuexp8 cpuexp24   (all must FAIL on the mutant)
 
 id: conv-taps-swap
 tags: quick
@@ -144,3 +144,11 @@ old: __m128 t0 = _mm_add_ps(r0, r2), t1 = _mm_add_ps(r1, r3);
 new: __m128 t0 = _mm_add_ps(r0, r1), t1 = _mm_add_ps(r2, r3);
 targets: tuff lfm25-cpu-expert-test
 checks: golden:moe8 cpuexp8
+
+id: prefill-chunk-pos-off-by-one
+desc: batched prefill feeds every chunk after the first at position pos0+p+1 (golden uses a 1-token prompt and cannot see it)
+file: src/main.c
+old: vt->engine_forward_batch(eng, toks + p, c, pos0 + p, am,
+new: vt->engine_forward_batch(eng, toks + p, c, pos0 + p + (p > 0), am,
+targets: tuff
+checks: prefill

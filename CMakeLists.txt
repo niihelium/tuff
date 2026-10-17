@@ -26,6 +26,28 @@ endif()
 include_directories(include /home/nii/workspace/llama.cpp/include /home/nii/workspace/llama.cpp/ggml/include)
 link_directories(/home/nii/workspace/llama.cpp/build/bin)
 
+option(TUFF_MODULAR_GPU "Use modular src/gpu/*.cu sources" ON)
+if(TUFF_MODULAR_GPU)
+    set(GPU_SOURCES
+        src/gpu/state.cu
+        src/gpu/context.cu
+        src/gpu/expert_cache.cu
+        src/gpu/dense_gemv.cu
+        src/gpu/delta.cu
+        src/gpu/attention.cu
+        src/gpu/router.cu
+        src/gpu/moe.cu
+        src/gpu/output.cu
+        src/gpu/graphs.cu
+        src/gpu/verify_n2.cu
+        src/gpu/batch.cu
+        src/gpu/mtp.cu
+    )
+    include_directories(src/gpu)
+else()
+    set(GPU_SOURCES src/gpu.cu)
+endif()
+
 find_package(OpenMP REQUIRED)
 
 set(SOURCES
@@ -33,7 +55,7 @@ set(SOURCES
     src/model.c
     src/cpu_ops.c
     src/tokenizer.c
-    src/gpu.cu
+    ${GPU_SOURCES}
     src/cupti_profiler.cu
     src/drafter.c
     src/sampler.c
@@ -44,6 +66,8 @@ set(SOURCES
     src/lfm25_engine.c
     src/lfm25_expert_cache.c
     src/lfm25_cpu_expert.c
+    src/qwen_cpu_expert.c
+    src/moe_policy.c
     src/chat.c
     src/main.c
 )
@@ -80,9 +104,11 @@ add_executable(tuff-server
     src/model.c
     src/cpu_ops.c
     src/tokenizer.c
-    src/gpu.cu
+    ${GPU_SOURCES}
     src/drafter.c
     src/sampler.c
+    src/qwen_cpu_expert.c
+    src/moe_policy.c
     src/engine.c
     src/server.c
 )
@@ -117,10 +143,12 @@ add_executable(microbench-gpu
     src/model.c
     src/cpu_ops.c
     src/tokenizer.c
-    src/gpu.cu
+    ${GPU_SOURCES}
     src/cupti_profiler.cu
     src/drafter.c
     src/sampler.c
+    src/qwen_cpu_expert.c
+    src/moe_policy.c
     src/engine.c
     src/chat.c
     src/microbench_gpu.cu
@@ -207,3 +235,69 @@ target_compile_options(lfm25-cpu-expert-test PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3 ${TUFF_CUDA_STREAM_FLAG}>
 )
 target_link_libraries(lfm25-cpu-expert-test PRIVATE CUDA::cudart OpenMP::OpenMP_C Threads::Threads m)
+
+# Qwen tokenizer regression test (Task 8.4)
+add_executable(qwen-tokenizer-test
+    src/gguf_parser.c
+    src/tokenizer.c
+    tests/test_qwen_tokenizer.c
+)
+target_compile_options(qwen-tokenizer-test PRIVATE
+    -g -O2 -Wall -Wextra -march=native
+)
+target_link_libraries(qwen-tokenizer-test PRIVATE Threads::Threads m)
+
+# Qwen CPU-miss MoE byte-identity test (Task Q0.2)
+set_source_files_properties(src/qwen_cpu_expert.c PROPERTIES COMPILE_OPTIONS "-O3;-ffp-contract=off")
+
+add_executable(qwen-cpu-expert-test
+    src/gguf_parser.c
+    src/model.c
+    src/cpu_ops.c
+    ${GPU_SOURCES}
+    src/cupti_profiler.cu
+    src/moe_policy.c
+    src/qwen_cpu_expert.c
+    tests/test_qwen_cpu_expert.cu
+)
+set_target_properties(qwen-cpu-expert-test PROPERTIES
+    COMPILE_FLAGS "${OpenMP_C_FLAGS}"
+    LINK_FLAGS "${OpenMP_C_FLAGS} -Wl,--disable-new-dtags"
+    INSTALL_RPATH "/home/nii/workspace/llama.cpp/build/bin"
+    BUILD_WITH_INSTALL_RPATH TRUE
+)
+target_compile_options(qwen-cpu-expert-test PRIVATE
+    $<$<COMPILE_LANGUAGE:C>:-g -O2 -Wall -Wextra -march=native -mfma -mavx2 -mf16c>
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3 ${TUFF_CUDA_STREAM_FLAG}>
+)
+target_link_libraries(qwen-cpu-expert-test PRIVATE CUDA::cudart CUDA::cuda_driver CUDA::cupti OpenMP::OpenMP_C Threads::Threads llama ggml ggml-cpu ggml-base m)
+
+# Qwen N-column batch verify test (Task Q1.1)
+add_executable(qwen-batch-test
+    src/gguf_parser.c
+    src/model.c
+    src/cpu_ops.c
+    src/tokenizer.c
+    ${GPU_SOURCES}
+    src/cupti_profiler.cu
+    src/drafter.c
+    src/sampler.c
+    src/qwen_cpu_expert.c
+    src/moe_policy.c
+    src/engine.c
+    src/chat.c
+    tests/test_qwen_batch.cu
+)
+set_target_properties(qwen-batch-test PROPERTIES
+    COMPILE_FLAGS "${OpenMP_C_FLAGS}"
+    LINK_FLAGS "${OpenMP_C_FLAGS} -Wl,--disable-new-dtags"
+    INSTALL_RPATH "/home/nii/workspace/llama.cpp/build/bin"
+    BUILD_WITH_INSTALL_RPATH TRUE
+)
+target_compile_options(qwen-batch-test PRIVATE
+    $<$<COMPILE_LANGUAGE:C>:-g -O2 -Wall -Wextra -march=native -mfma -mavx2 -mf16c>
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3 ${TUFF_CUDA_STREAM_FLAG}>
+)
+target_link_libraries(qwen-batch-test PRIVATE CUDA::cudart CUDA::cuda_driver CUDA::cupti OpenMP::OpenMP_C Threads::Threads llama ggml ggml-cpu ggml-base m)
+
+

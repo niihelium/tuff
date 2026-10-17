@@ -16,6 +16,8 @@ Reference Documentation:
 * [LFM2.5-8B-A1B Specification](file:///home/nii/workspace/tuf/wiki/lfm25/8b-a1b.md)
 * [LFM2.5-24B-A2B Specification](file:///home/nii/workspace/tuf/wiki/lfm25/24b-a2b.md)
 
+> **Ordering note:** the [Qwen3.5-MoE speculative-decoding roadmap](QWEN35_ROADMAP.md) (N-token verify, lookup-drafter upgrades, DFlash2 drafter, borrowed from HyperQwen) is to be implemented **after this LFM2.5 roadmap is complete**. It reuses work from here: Task 5.3 (MoE verify over the expert union), Task 6.1 (byte-identical CPU miss path) and Task 6.2 (`src/moe_policy.{c,h}`). Build and prove those on LFM2.5 first, then port them to the Qwen engine.
+
 ---
 
 ## 1. Core Engineering Principles

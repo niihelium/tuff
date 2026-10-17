@@ -9,7 +9,7 @@
 # Before any mutation, EVERY distinct check used by the selected controls is run once on the unmutated scratch
 # build and must PASS (cached per run); otherwise "FAIL" under a mutant could just be a broken setup.
 # Check outcomes: PASS; FAIL = a real gate failure recognized by the gate's own verdict line ("GOLDEN FAIL",
-# "ORACLE FAIL", "SPEC FAIL", "N/M cases pass" with N<M); ERROR = anything else (missing files, tracebacks,
+# "ORACLE FAIL", "SPEC FAIL", "PREFILL FAIL", "N/M cases pass" with N<M); ERROR = anything else (missing files, tracebacks,
 # unexpected exit codes). CAUGHT needs every listed check FAIL. ERROR (also in the baseline) -> "ERROR (setup)",
 # exit 1. A check that still passes = NOT CAUGHT (a blind spot). A control whose search string no longer
 # matches exactly once is STALE. Exit 1 on any NOT CAUGHT / STALE / build or setup error.
@@ -153,6 +153,12 @@ run_check() {
             if [ $rc -eq 0 ] && grep -q "^SPEC PASS" "$out"; then CHK_RES=PASS
             elif [ $rc -eq 1 ] && grep -q "^SPEC FAIL" "$out"; then CHK_RES=FAIL
             else CHK_RES="ERROR:spec exit $rc without a verdict"; fi ;;
+        prefill)
+            CHK_LABEL="prefill-dense"
+            TUFF_BIN="$DIR/build/tuff" "$DIR/tests/verify_lfm25_prefill.sh" dense > "$out" 2>&1; rc=$?
+            if [ $rc -eq 0 ] && grep -q "^PREFILL PASS" "$out"; then CHK_RES=PASS
+            elif [ $rc -eq 1 ] && grep -q "^PREFILL FAIL" "$out"; then CHK_RES=FAIL
+            else CHK_RES="ERROR:prefill exit $rc without a verdict"; fi ;;
         router8)   CHK_LABEL=router8;   env ${SCRUB[@]+"${SCRUB[@]}"} "$DIR/build/lfm25-router-test"  "$M8"  "$DIR/tests/fixtures/lfm25_8b_router_cases.bin"  > "$out" 2>&1; rc=$?; unit_verdict "$out" $rc ;;
         router24)  CHK_LABEL=router24;  env ${SCRUB[@]+"${SCRUB[@]}"} "$DIR/build/lfm25-router-test"  "$M24" "$DIR/tests/fixtures/lfm25_24b_router_cases.bin" > "$out" 2>&1; rc=$?; unit_verdict "$out" $rc ;;
         moeffn8)   CHK_LABEL=moeffn8;   env ${SCRUB[@]+"${SCRUB[@]}"} "$DIR/build/lfm25-moe-ffn-test" "$M8"  "$DIR/tests/fixtures/lfm25_8b_moe_ffn_cases.bin"  > "$out" 2>&1; rc=$?; unit_verdict "$out" $rc ;;

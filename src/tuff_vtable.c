@@ -64,6 +64,15 @@ static int32_t vtable_qwen_engine_forward_token(void *engine, int32_t token, int
     return engine_forward_token((engine_t*)engine, token, pos);
 }
 
+static int vtable_qwen_engine_forward_batch(void *engine, const int32_t *tokens, int n, int pos0,
+                                            int32_t *argmax_out, float *logits_out) {
+    return engine_forward_batch((engine_t*)engine, tokens, n, pos0, argmax_out, logits_out);
+}
+
+static int vtable_qwen_engine_rollback(void *engine, int n_keep) {
+    return engine_rollback((engine_t*)engine, n_keep);
+}
+
 static const engine_vtable_t qwen_engine_vtable = {
     .arch                   = TUFF_ARCH_QWEN35MOE,
     .name                   = "qwen35moe",
@@ -80,6 +89,8 @@ static const engine_vtable_t qwen_engine_vtable = {
     .engine_free            = vtable_qwen_engine_free,
     .engine_set_sampler     = vtable_qwen_engine_set_sampler,
     .engine_forward_token   = vtable_qwen_engine_forward_token,
+    .engine_forward_batch   = vtable_qwen_engine_forward_batch,
+    .engine_rollback        = vtable_qwen_engine_rollback,
 };
 
 const engine_vtable_t* tuff_get_vtable(tuff_arch_t arch) {
