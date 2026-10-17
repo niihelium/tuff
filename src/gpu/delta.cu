@@ -806,3 +806,42 @@ void launch_rms_norm_dev(float *dst, const float *src, const float *weight, int 
     rms_norm_dev_kernel<<<1, 256, 0, stream>>>(dst, src, weight, dim, eps);
     CUDA_CHECK_LAST();
 }
+
+// Lossless lockstep verify: conv + fused GDN for one column, without the ssm_out projection (the
+// lockstep trunk runs that for both columns in one ncols=2 launch). Same kernels and arguments as
+// delta_fused_gdn_impl (dual path); the gated q8 goes to xq_out instead of g_d_norm_q8.
+// nowrite: verify column 1 (no state write; inputs saved for gpu_delta_commit_nw).
+extern "C" void gpu_delta_gdn_core(int layer_idx, const model_layer_t *L, float eps, float scale_q,
+                        float *qkv, const float *z, const float *beta_raw, const float *alpha_raw,
+                        block_q8_1_c *xq_out, int nowrite,
+                        int n_k_heads, int n_v_heads, int head_k_dim, int head_v_dim,
+                        int key_dim, int value_dim, int qkv_dim, int conv_kernel) {
+    if (!g_dgated) CUDA_CHECK(cudaMalloc(&g_dgated, (size_t)value_dim * sizeof(float)));
+    if (!g_dout)   CUDA_CHECK(cudaMalloc(&g_dout,   (size_t)value_dim * sizeof(float)));
+    if (!g_dq)     CUDA_CHECK(cudaMalloc(&g_dq,     (size_t)key_dim * sizeof(float)));
+    if (!g_dk)     CUDA_CHECK(cudaMalloc(&g_dk,     (size_t)key_dim * sizeof(float)));
+    if (!g_dp)     CUDA_CHECK(cudaMalloc(&g_dp,     (size_t)64 * sizeof(float)));
+    if (!g_dpgate) CUDA_CHECK(cudaMalloc(&g_dpgate, (size_t)32 * sizeof(float)));
+    float *conv_state = g_dconv_all + (size_t)layer_idx * (size_t)conv_kernel * qkv_dim;
+    const float *conv_w = (const float*)L->ssm_conv1d.dev;
+    float *S = g_dstate_all + (size_t)layer_idx * n_v_heads * head_v_dim * head_k_dim;
+    if (nowrite) {
+        delta_nw_ensure(qkv_dim, n_v_heads);
+        float *cx = g_nw_x    + (size_t)layer_idx * qkv_dim;
+        float *cc = g_nw_conv + (size_t)layer_idx * qkv_dim;
+        delta_conv_kernel_t<false><<<(qkv_dim + 255) / 256, 256>>>(conv_state, qkv, conv_w, cc, cx, qkv_dim, conv_kernel);
+        CUDA_CHECK(cudaMemcpyAsync(g_nw_b + (size_t)layer_idx * n_v_heads, beta_raw,  (size_t)n_v_heads * sizeof(float), cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemcpyAsync(g_nw_a + (size_t)layer_idx * n_v_heads, alpha_raw, (size_t)n_v_heads * sizeof(float), cudaMemcpyDeviceToDevice));
+        fused_gated_delta_net_ar_kernel_t<false><<<n_v_heads, head_v_dim>>>(
+            S, cc, beta_raw, alpha_raw, (const float*)L->ssm_dt_bias.dev, (const float*)L->ssm_a.dev,
+            z, (const float*)L->ssm_norm.dev, NULL, xq_out, g_dout, g_dq, g_dk, g_dp, g_dpgate,
+            scale_q, eps, n_k_heads, n_v_heads, head_k_dim, head_v_dim, key_dim, value_dim);
+    } else {
+        delta_conv_kernel<<<(qkv_dim + 255) / 256, 256>>>(conv_state, qkv, conv_w, qkv, qkv_dim, conv_kernel);
+        fused_gated_delta_net_ar_kernel_t<true><<<n_v_heads, head_v_dim>>>(
+            S, qkv, beta_raw, alpha_raw, (const float*)L->ssm_dt_bias.dev, (const float*)L->ssm_a.dev,
+            z, (const float*)L->ssm_norm.dev, NULL, xq_out, g_dout, g_dq, g_dk, g_dp, g_dpgate,
+            scale_q, eps, n_k_heads, n_v_heads, head_k_dim, head_v_dim, key_dim, value_dim);
+    }
+    CUDA_CHECK_LAST();
+}

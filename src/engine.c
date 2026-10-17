@@ -605,6 +605,7 @@ engine_t* engine_init(model_t *model, int max_seq_len) {
             if (g_spec_mtp || g_spec_draft != SPEC_DRAFT_NONE) {
                 gpu_capture_verify_graphs(model);
                 gpu_capture_verify_col_graphs(model);
+                gpu_capture_lockstep_graphs(model);
             }
         }
     }
@@ -1953,6 +1954,7 @@ void engine_free(engine_t *eng) {
         fprintf(stderr, "[PROFILE] lossless verify: %llu passes (%llu kept both), %.2f ms/pass: trunk-issue %.2f sync %.2f host %.2f pub %.2f hits-issue %.2f pool-wait %.2f combine %.2f head %.2f\n",
                 eng->n_verify, eng->n_verify_kept2, k * eng->t_verify, k * eng->tv_trunk, k * eng->tv_sync, k * eng->tv_host,
                 k * eng->tv_pub, k * eng->tv_hits, k * eng->tv_pool, k * eng->tv_comb, k * eng->tv_head);
+        fprintf(stderr, "[PROFILE] verify CPU misses: %.2f ms/pass submit->done, %.1f misses/pass\n", k * eng->tv_cpu, (double)eng->nv_cpu_miss / eng->n_verify);
     }
     if (!eng) return;
     if (getenv("TUFF_PROFILE")) {
@@ -2785,6 +2787,7 @@ typedef struct {
     int ti[2][8]; float tv[2][8];
     int hit_slots[2][8], hit_pos[2][8], n_hit[2];
     int miss_k[2][8], n_miss[2];
+    double t_sub[2];
 } v2_ctx_t;
 
 // Trunk of layer l for column c: its single-token graph on its own residual, then everything the
@@ -2820,6 +2823,54 @@ static void v2_trunk(v2_ctx_t *x, int c, uint32_t l) {
 // Host half of column c's MoE at layer l: top-k, the cache operations at logical token T0+c (the
 // per-layer partition makes "column 0 then column 1 at each layer" the plain-decode order), the
 // CPU misses to the pool, the GPU hits to the stream.
+// Append column c's misses to the pool batch at entry `j0`; returns the next free entry.
+static int v2_pool_fill(v2_ctx_t *x, model_layer_t *layer, int c, int j0) {
+    const uint32_t dim = x->dim, ffn_dim = x->ffn_dim;
+    const ggml_type_t down_type = (ggml_type_t)layer->ffn_down_exps.info.type;
+    g_moe_batch.L      = layer;
+    g_moe_batch.x      = x->nx[c];
+    g_moe_batch.q8x    = x->q8[c];
+    g_moe_batch.dim    = (int)dim;
+    g_moe_batch.ffn    = (int)ffn_dim;
+    g_moe_batch.gtype  = (ggml_type_t)layer->ffn_gate_exps.info.type;
+    g_moe_batch.dtype  = down_type;
+    g_moe_batch.gate_bytes = ggml_row_size(g_moe_batch.gtype, dim) * ffn_dim;
+    g_moe_batch.up_bytes   = g_moe_batch.gate_bytes;
+    g_moe_batch.down_bytes = ggml_row_size(down_type, ffn_dim) * dim;
+    int j = j0;
+    for (int i = 0; i < x->n_miss[c]; ++i, ++j) {
+        g_moe_batch.experts[j]  = x->ti[c][x->miss_k[c][i]];
+        g_moe_batch.down_out[j] = x->da[c] + (size_t)x->miss_k[c][i] * dim;
+        g_moe_batch.xk[j]       = x->nx[c];
+        g_moe_batch.q8xk[j]     = x->q8[c];
+        g_moe_batch.xk2[j]      = NULL;
+        g_moe_batch.q8xk2[j]    = NULL;
+        g_moe_batch.down_out2[j]= NULL;
+    }
+    return j;
+}
+
+// Column c's GPU hits; after column 0's, its fills go to the copy engine (a victim may be one of
+// its hits, so the copy is ordered after them).
+static void v2_hits(v2_ctx_t *x, int c, uint32_t l) {
+    engine_t *eng = x->eng;
+    model_layer_t *layer = &x->m->layers[l];
+    const uint32_t dim = x->dim, ffn_dim = x->ffn_dim;
+    const ggml_type_t down_type = (ggml_type_t)layer->ffn_down_exps.info.type;
+    double tg0 = omp_get_wtime();
+    if (x->n_hit[c] > 0) {
+        gpu_expert_cache_wait_slots(x->hit_slots[c], x->n_hit[c]);
+        gpu_expert_moe_gateup_swiglu_dev_saved(x->hit_slots[c], x->n_hit[c], (int)dim, (int)ffn_dim, c);
+        gpu_expert_moe_down_dev_col(x->n_hit[c], down_type, (int)ffn_dim, (int)dim, c);
+    }
+    // Column 0's fills go to the copy engine after its kernels (a victim may be one of its hits).
+    if (c == 0) gpu_expert_cache_fill_push(0);
+    eng->t_gu += omp_get_wtime() - tg0;
+    eng->tv_hits += omp_get_wtime() - tg0;
+}
+
+
+static void v2_host_ops(v2_ctx_t *x, int c, uint32_t l);
 static void v2_moe_issue(v2_ctx_t *x, int c, uint32_t l) {
     engine_t *eng = x->eng;
     model_t *m = x->m;
@@ -2832,6 +2883,102 @@ static void v2_moe_issue(v2_ctx_t *x, int c, uint32_t l) {
     eng->t_expert_sync += omp_get_wtime() - tw0;
     eng->tv_sync += omp_get_wtime() - tw0;
 
+    v2_host_ops(x, c, l);
+
+    if (x->n_miss[c] > 0) {
+        double tp0 = omp_get_wtime();
+        v2_pool_fill(x, layer, c, 0);
+        g_moe_batch.n = x->n_miss[c];
+        g_moe_batch.n_xin = 0;
+        moe_pool_submit();
+        x->t_sub[c] = omp_get_wtime();
+        eng->t_cpumoe_pub += omp_get_wtime() - tp0;
+        eng->tv_pub += omp_get_wtime() - tp0;
+    }
+    v2_hits(x, c, l);
+    (void)dim; (void)ffn_dim; (void)down_type;
+}
+
+// Lockstep layer l: one graph runs both columns' trunk (shared weight reads); then both columns'
+// cache operations in plain-decode order, both columns' CPU misses as one pool batch, the hits
+// (column 0's fills pushed in between), the join, and both combines.
+static void v2_ls_layer(v2_ctx_t *x, uint32_t l) {
+    engine_t *eng = x->eng;
+    model_layer_t *layer = &x->m->layers[l];
+    const double tt0 = omp_get_wtime();
+    gpu_launch_lockstep(l);
+    gpu_event_record(eng->vev[0]);
+    eng->tv_trunk += omp_get_wtime() - tt0;
+    const double tw0 = omp_get_wtime();
+    gpu_event_sync(eng->vev[0]);
+    eng->t_expert_sync += omp_get_wtime() - tw0;
+    eng->tv_sync += omp_get_wtime() - tw0;
+    v2_host_ops(x, 0, l);
+    v2_host_ops(x, 1, l);
+    const int total = x->n_miss[0] + x->n_miss[1];
+    if (total > 0) {
+        const double tp0 = omp_get_wtime();
+        int j = v2_pool_fill(x, layer, 0, 0);
+        // An expert both columns miss is ONE entry: its weights are read once for both activations
+        // (the dual kernels compute each column with the single-column per-row dot product).
+        static int dual_env = -1;
+        if (dual_env < 0) { const char *e = getenv("TUFF_VERIFY_DUAL_MISS"); dual_env = (e && e[0] == '0') ? 0 : 1; }
+        for (int i = 0; i < x->n_miss[1]; ++i) {
+            const int e1 = x->ti[1][x->miss_k[1][i]];
+            int shared = -1;
+            if (dual_env)
+                for (int i0 = 0; i0 < x->n_miss[0]; ++i0)
+                    if (x->ti[0][x->miss_k[0][i0]] == e1) { shared = i0; break; }
+            float *dst = x->da[1] + (size_t)x->miss_k[1][i] * x->dim;
+            if (shared >= 0) {
+                g_moe_batch.xk2[shared] = x->nx[1];
+                g_moe_batch.q8xk2[shared] = x->q8[1];
+                g_moe_batch.down_out2[shared] = dst;
+            } else {
+                g_moe_batch.experts[j]  = e1;
+                g_moe_batch.down_out[j] = dst;
+                g_moe_batch.xk[j]       = x->nx[1];
+                g_moe_batch.q8xk[j]     = x->q8[1];
+                g_moe_batch.xk2[j]      = NULL;
+                g_moe_batch.q8xk2[j]    = NULL;
+                g_moe_batch.down_out2[j]= NULL;
+                j++;
+            }
+        }
+        g_moe_batch.n = j;
+        g_moe_batch.n_xin = 2;
+        g_moe_batch.xin[0] = x->nx[0]; g_moe_batch.q8in[0] = x->q8[0];
+        g_moe_batch.xin[1] = x->nx[1]; g_moe_batch.q8in[1] = x->q8[1];
+        moe_pool_submit();
+        x->t_sub[0] = omp_get_wtime();
+        eng->tv_pub += omp_get_wtime() - tp0;
+    }
+    v2_hits(x, 0, l);
+    v2_hits(x, 1, l);
+    if (total > 0) {
+        const double tj0 = omp_get_wtime();
+        moe_pool_wait();
+        eng->t_cpumoe += omp_get_wtime() - tj0;
+        eng->tv_pool += omp_get_wtime() - tj0;
+        eng->tv_cpu += omp_get_wtime() - x->t_sub[0];
+        eng->nv_cpu_miss += (unsigned long long)total;
+    }
+    const double tr0 = omp_get_wtime();
+    for (int c = 0; c < 2; ++c) {
+        float *host_miss_ptr = NULL;
+        if (x->n_miss[c] > 0) {
+            host_miss_sum(x->mb[c], x->da[c], x->miss_k[c], x->n_miss[c], x->tv[c], (int)x->dim);
+            host_miss_ptr = x->mb[c];
+        }
+        gpu_moe_combine_accum_col(x->res[c], x->hit_pos[c], x->n_hit[c], x->tv[c], x->shexp[c], host_miss_ptr, (int)x->dim, c);
+    }
+    eng->tv_comb += omp_get_wtime() - tr0;
+}
+
+// Top-k and the cache operations of column c at layer l (logical token T0+c).
+static void v2_host_ops(v2_ctx_t *x, int c, uint32_t l) {
+    engine_t *eng = x->eng;
+    model_t *m = x->m;
     double te0 = omp_get_wtime();
     host_topk_softmax(x->rl[c], (int)x->n_expert, (int)x->n_expert_used, x->ti[c], x->tv[c]);
     gpu_expert_cache_set_token(x->T0 + (uint64_t)c);
@@ -2854,44 +3001,6 @@ static void v2_moe_issue(v2_ctx_t *x, int c, uint32_t l) {
     eng->t_miss += omp_get_wtime() - te0;
     eng->tv_host += omp_get_wtime() - te0;
 
-    if (x->n_miss[c] > 0) {
-        double tp0 = omp_get_wtime();
-        g_moe_batch.L      = layer;
-        g_moe_batch.x      = x->nx[c];
-        g_moe_batch.q8x    = x->q8[c];
-        g_moe_batch.dim    = (int)dim;
-        g_moe_batch.ffn    = (int)ffn_dim;
-        g_moe_batch.gtype  = (ggml_type_t)layer->ffn_gate_exps.info.type;
-        g_moe_batch.dtype  = down_type;
-        g_moe_batch.gate_bytes = ggml_row_size(g_moe_batch.gtype, dim) * ffn_dim;
-        g_moe_batch.up_bytes   = g_moe_batch.gate_bytes;
-        g_moe_batch.down_bytes = ggml_row_size(down_type, ffn_dim) * dim;
-        for (int j = 0; j < x->n_miss[c]; ++j) {
-            g_moe_batch.experts[j]  = x->ti[c][x->miss_k[c][j]];
-            g_moe_batch.down_out[j] = x->da[c] + (size_t)x->miss_k[c][j] * dim;
-            g_moe_batch.xk[j]       = x->nx[c];
-            g_moe_batch.q8xk[j]     = x->q8[c];
-            g_moe_batch.xk2[j]      = NULL;
-            g_moe_batch.q8xk2[j]    = NULL;
-            g_moe_batch.down_out2[j]= NULL;
-        }
-        g_moe_batch.n = x->n_miss[c];
-        g_moe_batch.n_xin = 0;
-        moe_pool_submit();
-        eng->t_cpumoe_pub += omp_get_wtime() - tp0;
-        eng->tv_pub += omp_get_wtime() - tp0;
-    }
-
-    double tg0 = omp_get_wtime();
-    if (x->n_hit[c] > 0) {
-        gpu_expert_cache_wait_slots(x->hit_slots[c], x->n_hit[c]);
-        gpu_expert_moe_gateup_swiglu_dev_saved(x->hit_slots[c], x->n_hit[c], (int)dim, (int)ffn_dim, c);
-        gpu_expert_moe_down_dev_col(x->n_hit[c], down_type, (int)ffn_dim, (int)dim, c);
-    }
-    // Column 0's fills go to the copy engine after its kernels (a victim may be one of its hits).
-    if (c == 0) gpu_expert_cache_fill_push(0);
-    eng->t_gu += omp_get_wtime() - tg0;
-    eng->tv_hits += omp_get_wtime() - tg0;
 }
 
 static void v2_moe_finish(v2_ctx_t *x, int c) {
@@ -2901,6 +3010,8 @@ static void v2_moe_finish(v2_ctx_t *x, int c) {
         moe_pool_wait();
         eng->t_cpumoe += omp_get_wtime() - tj0;
         eng->tv_pool += omp_get_wtime() - tj0;
+        eng->tv_cpu += omp_get_wtime() - x->t_sub[c];
+        eng->nv_cpu_miss += (unsigned long long)x->n_miss[c];
     }
     double tr0 = omp_get_wtime();
     float *host_miss_ptr = NULL;
@@ -2941,8 +3052,15 @@ static int engine_forward_verify2(engine_t *eng, const int32_t *tokens, int pos0
     x->d_norm_x = gpu_get_d_norm_x();
     x->res[0] = eng->d_res_v; x->res[1] = eng->d_res_v + dim;
     x->shexp[0] = (float*)gpu_get_shexp_dev_ptr(); x->shexp[1] = (float*)gpu_get_shexp2_dev_ptr();
+    static int ls_env = -1;
+    if (ls_env < 0) { const char *e = getenv("TUFF_VERIFY_LOCKSTEP"); ls_env = (e && e[0] == '0') ? 0 : 1; }
+    const int lockstep = ls_env && gpu_has_lockstep_graphs();
     x->col_graphs = gpu_has_verify_col_graphs();
-    if (x->col_graphs) {
+    if (lockstep) {
+        x->res[0] = gpu_get_d_res_verify((int)dim); x->res[1] = x->res[0] + dim;
+        x->rl[0] = gpu_lockstep_host_rl(0); x->rl[1] = gpu_lockstep_host_rl(1);
+        x->nx[0] = gpu_lockstep_host_nx(0); x->nx[1] = gpu_lockstep_host_nx(1);
+    } else if (x->col_graphs) {
         // The column graphs bind the verify residuals and these pinned landing buffers.
         x->res[0] = gpu_get_d_res_verify((int)dim); x->res[1] = x->res[0] + dim;
         x->rl[0] = gpu_verify_host_rl(0); x->rl[1] = gpu_verify_host_rl(1);
@@ -2974,6 +3092,11 @@ static int engine_forward_verify2(engine_t *eng, const int32_t *tokens, int pos0
     // GPU runs column 1's trunk, and column 1's misses while it runs column 0's next layer. The
     // cache operations still run column 0 then column 1 at every layer.
     const uint32_t n_layers = m->block_count - m->nextn_predict_layers;
+    const int async_head = !tuff_exact() && mmvq_dual_enabled();
+    int32_t *htok = gpu_pinned_tokens();
+    if (lockstep) {
+        for (uint32_t l = 0; l < n_layers; ++l) v2_ls_layer(x, l);
+    } else {
     v2_trunk(x, 0, 0);
     for (uint32_t l = 0; l < n_layers; ++l) {
         const int resident = l < (uint32_t)g_n_gpu_expert_layers;
@@ -2981,16 +3104,36 @@ static int engine_forward_verify2(engine_t *eng, const int32_t *tokens, int pos0
         v2_trunk(x, 1, l);
         if (!resident) v2_moe_finish(x, 0);
         if (l + 1 < n_layers) v2_trunk(x, 0, l + 1);
+        else if (async_head) {
+            const double th = omp_get_wtime();
+            gpu_fused_output_argmax_async(&m->output_weight, x->res[0], (const float*)m->output_norm.dev,
+                                          (int)dim, (int)vocab_size, eps, htok + 0);
+            eng->tv_head += omp_get_wtime() - th;
+        }
         if (!resident) {
             v2_moe_issue(x, 1, l);
             v2_moe_finish(x, 1);
         }
     }
+    }
     gpu_expert_cache_set_token(x->T0 + 1);
+    if (lockstep && async_head) {
+        const double th = omp_get_wtime();
+        gpu_fused_output_argmax_async(&m->output_weight, x->res[0], (const float*)m->output_norm.dev,
+                                      (int)dim, (int)vocab_size, eps, htok + 0);
+        eng->tv_head += omp_get_wtime() - th;
+    }
 
-    // Output head per column (the single-token kernel on each column's residual).
+    // Output head per column (the single-token kernels on each column's residual).
     const double th0 = omp_get_wtime();
-    for (int c = 0; c < 2; ++c) {
+    if (async_head) {
+        gpu_fused_output_argmax_async(&m->output_weight, x->res[1], (const float*)m->output_norm.dev,
+                                      (int)dim, (int)vocab_size, eps, htok + 1);
+        gpu_stream_sync();
+        argmax_out[0] = htok[0];
+        argmax_out[1] = htok[1];
+    }
+    for (int c = 0; c < 2 && !async_head; ++c) {
         if (!tuff_exact() && mmvq_dual_enabled()) {
             argmax_out[c] = gpu_fused_output_norm_quant_argmax_dev(
                 &m->output_weight, x->res[c], (const float*)m->output_norm.dev, (int)dim, (int)vocab_size, eps, NULL);

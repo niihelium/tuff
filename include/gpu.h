@@ -432,6 +432,15 @@ int   gpu_has_verify_col_graphs(void);
 void  gpu_launch_verify_col(int c, uint32_t l);
 float *gpu_verify_host_rl(int c);
 float *gpu_verify_host_nx(int c);
+void  gpu_fused_output_argmax_async(const tensor_t *output_weight, const float *d_res_x, const float *d_norm_w,
+                                    int in_dim, int vocab_size, float eps, int32_t *h_tok);
+int32_t *gpu_pinned_tokens(void);
+void  gpu_stream_sync(void);
+void  gpu_capture_lockstep_graphs(model_t *m);
+int   gpu_has_lockstep_graphs(void);
+void  gpu_launch_lockstep(uint32_t l);
+float *gpu_lockstep_host_rl(int c);
+float *gpu_lockstep_host_nx(int c);
 void *gpu_event_new(void);
 void  gpu_event_record(void *ev);
 void  gpu_event_sync(void *ev);

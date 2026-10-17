@@ -40,6 +40,7 @@ if(TUFF_MODULAR_GPU)
         src/gpu/output.cu
         src/gpu/graphs.cu
         src/gpu/verify_n2.cu
+        src/gpu/verify_lockstep.cu
         src/gpu/batch.cu
         src/gpu/mtp.cu
     )

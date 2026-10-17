@@ -339,3 +339,31 @@ void launch_argmax(const float *x, float *block_max, int *block_idx, int *best_t
     argmax_final_kernel<<<1, 256, 0, stream>>>(block_max, block_idx, best_token, 256);
     CUDA_CHECK_LAST();
 }
+
+// Lossless verify: the fused output head for one column, asynchronously. Same kernels as
+// gpu_fused_output_norm_quant_argmax_dev; the token lands in pinned host memory (*h_tok) when the
+// stream reaches it, so column 0's head can run while the host finishes column 1's last layer.
+extern "C" void gpu_fused_output_argmax_async(const tensor_t *output_weight, const float *d_res_x, const float *d_norm_w,
+                                              int in_dim, int vocab_size, float eps, int32_t *h_tok) {
+    if (!g_d_out_normx_q8) {
+        CUDA_CHECK(cudaMalloc(&g_d_out_normx_q8, (size_t)(in_dim / QK8_1) * sizeof(block_q8_1_c)));
+    }
+    block_q8_1_c *xq8 = (block_q8_1_c *)g_d_out_normx_q8;
+    gpu_fused_rms_norm_quant_dev(g_d_norm_x, d_res_x, d_norm_w, xq8, in_dim, eps);
+    const int nblk = in_dim / QK_K;
+    const int grid_blocks = (vocab_size + HEAD_ROWS_PER_BLOCK - 1) / HEAD_ROWS_PER_BLOCK;
+    dim3 grid((unsigned)grid_blocks, 1u, 1u);
+    dim3 block(32u, (unsigned)HEAD_ROWS_PER_BLOCK, 1u);
+    mmvq_q6_K_dense_argmax_warprow_kernel<HEAD_ROWS_PER_BLOCK><<<grid, block>>>(
+        (const block_q6_K*)output_weight->dev, xq8, NULL, g_d_block_max, g_d_block_idx, vocab_size, nblk);
+    CUDA_CHECK_LAST();
+    argmax_final_kernel<<<1, 256>>>(g_d_block_max, g_d_block_idx, g_d_best_token, grid_blocks);
+    CUDA_CHECK_LAST();
+    CUDA_CHECK(cudaMemcpyAsync(h_tok, g_d_best_token, sizeof(int32_t), cudaMemcpyDeviceToHost, 0));
+}
+extern "C" int32_t *gpu_pinned_tokens(void) {
+    static int32_t *p = NULL;
+    if (!p) CUDA_CHECK(cudaMallocHost(&p, 8 * sizeof(int32_t)));
+    return p;
+}
+extern "C" void gpu_stream_sync(void) { CUDA_CHECK(cudaStreamSynchronize(0)); }

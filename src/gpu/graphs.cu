@@ -517,3 +517,4 @@ extern "C" void gpu_launch_verify_col(int c, uint32_t l) {
 }
 extern "C" float *gpu_verify_host_rl(int c) { return g_h_vrl[c]; }
 extern "C" float *gpu_verify_host_nx(int c) { return g_h_vnx[c]; }
+extern "C" int *gpu_verify_d_vpos(void) { return g_d_vpos; }
