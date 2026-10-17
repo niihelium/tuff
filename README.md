@@ -2,10 +2,11 @@
 
 Single-stream, single-machine greedy decoder for **Qwen3.6-35B-A3B** (`Q4_K_S` GGUF, 19.91 GiB,
 35.51 B params) on an **RTX 3070 Laptop 8 GB + Ryzen 9 5900HX + 64 GB DDR4**. Measured
-**60.15 tok/s base** (5-prompt corpus, 32 warmup + 128 timed, 3 runs) against **llama.cpp
-`885c5bb` 43.86 tok/s same-session → +38%**; from a 0.39 tok/s CPU-only floor (**154×**).
-Speculative: free n-gram draft `--spec-draft=ngram --spec-ngram 3` **+2.4%** (61.61), paid MTP
-head draft `--spec-mtp` **−12.4%** (52.67).
+**67.51 tok/s default** (lossless n-gram speculation) / **67.03 tok/s `--no-spec`** (5-prompt
+corpus geomean, 32 warmup + 128 timed, 3 runs, order-alternated, 2026-10-17; ITERATION_LOG 92-94)
+against **llama.cpp `885c5bb` 43.86 tok/s** measured in an earlier session; from a 0.39 tok/s
+CPU-only floor. Speculation is token-identical to `--no-spec`; it gains +0.7% on the corpus. Spec
+numbers published before 2026-10-17 (incl. 90 tok/s) came from a lossy verify and are withdrawn.
 
 The model is 41 blocks: **40 trunk** (10 full-attention every 4th layer + 30 gated delta-net /
 Qwen3-Next linear attention) and one **MTP draft head** (`blk.40`, excluded from the trunk pass);
@@ -28,8 +29,9 @@ router (206 GB/s) is the one kernel below bus speed. Cache policy: **hit → GPU
 resident slot; miss → CPU compute from the mmap** (AVX2 int8, split across 7 pinned spin-wait
 workers) with asynchronous background fill (budget 1). Hit rate 71.9%, flat 2500→2600 slots —
 the routing is a large rotating working set (top 25% cover 68% of accesses), so the cache is
-locality-bound, not capacity-bound. Speculative decode is lossless (two-column verify + recurrent
-state snapshot/rollback); the marginal-column break-even is α > 0.51. The three dominant kernels
+locality-bound, not capacity-bound. Speculative decode is lossless: a two-token verify with
+per-column arithmetic identical to plain decode, a per-layer expert cache so both columns see the
+plain-decode cache trajectory, and a no-write second column replayed only when accepted. The three dominant kernels
 run ~91% of the 384 GB/s bus, so the engine is at the practical batch-1 GEMV ceiling (~103 tok/s
 roofline), not bandwidth-starved.
 

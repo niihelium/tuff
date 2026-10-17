@@ -8,12 +8,12 @@ of open hypotheses lives in `PLAN.md`.
 
 | | value |
 |---|---|
-| Current | **90.04 tok/s** (5-prompt multi-domain corpus geomean), **+14.22% ± 5.25%** over Pre-H52 Baseline |
-| Plain Autoregressive | 40.34 tok/s base (512-token long-context decode without speculation) |
-| vs llama.cpp 43.86 | **+105% (2.05×)** |
-| VRAM / RSS | 7464.7 MiB / ~21.2 GiB |
-| Expert-cache hit rate | 87.7%–91.0% |
-| Correctness / Determinism | 100% bit-identical streams |
+| Current | **67.51 tok/s** default (lossless n-gram spec), **67.03 tok/s** `--no-spec` (5-prompt corpus geomean, 32 warmup + 128 timed × 3, order-alternated, power check OK, 2026-10-17) |
+| Spec vs no-spec | **+0.7%** geomean, reproduced in both run orders (67.44/66.98, 67.51/67.03); output token-identical to `--no-spec` on all 5 prompts |
+| Withdrawn | the 90.04 tok/s below (iteration 85) and every spec number before 2026-10-17: the old verify was lossy (see entry 94) |
+| VRAM / RSS | ~7.8 GiB / ~21.7 GiB |
+| Expert-cache hit rate | ~70–80% (per prompt), LES admission on |
+| Correctness / Determinism | spec == no-spec byte-for-byte; plain decode deterministic run to run; Qwen golden byte-identical |
 
 ## History (collapsed)
 
@@ -333,6 +333,39 @@ open-ledger. What they established, in one line each:
      - **Gate 3 (CUPTI Hardware Trace)**: Total GPU kernel execution time 71.936 ms (identical to pre-H60 baseline), 0 extra memory transfers, 0 register spills in greedy mode.
      - **Gate 4 (Multi-Domain A/B Benchmark)**: Ran 2-pass randomized 5-domain comparative benchmark (`scripts/run_corpus_benchmark.py`). Confirmed full throughput retention (68.25 tok/s Sampler vs 67.65 tok/s Greedy, +0.90% Geomean within statistical noise [-4.80%, +6.77%]).
   - **Verdict**: **ACCEPTED**. Ready to merge to `master`.
+
+- **92**: Per-layer expert cache + LES admission (2026-10-17).
+  The expert cache is partitioned per layer (own LRU, free list, pending fills; LES decay applied
+  lazily per layer, bit-identical), so a layer's residency depends only on that layer's history.
+  Fills are split into a logical reserve and a physical copy ordered after the compute that may
+  read the victim; readiness is a GPU-side event wait. New: LES admission, a fill evicts only if
+  the incoming expert's per-layer LES score beats the victim's by 0.01 (`TUFF_LES_ADMIT`, negative
+  disables). PCIe is Gen3 x8 here (~6.6 GB/s, 0.31 ms per 1.95 MiB fill); the old reactive fill
+  kept it ~77% busy. Admission cuts fills ~6x at equal hit rate.
+  - **Corpus A/B (no-spec, 32+128 × 3, alternated, power OK)**: **67.06 vs 59.37 tok/s (+13.0%)**,
+    every prompt +11..15%. Golden byte-identical (prefill layout unchanged).
+  - Also: Qwen prompt prefill is token-by-token by default; the n>2 batched prefill was lossy and
+    made plain decode non-deterministic run to run on the corpus prompts.
+- **93**: Lossless two-token verify, lockstep with shared-weight kernels (2026-10-17).
+  `engine_forward_batch(n=2)` evaluates both tokens with per-column arithmetic identical to two
+  `engine_forward_token` calls: ncols=2 copies of the quad/triple/out-proj/router/shared-expert
+  kernels (same per-lane accumulation order, one weight read for both columns), per-column GDN
+  (column 1 no-write, replayed by a commit graph if accepted), per-column attention, both
+  columns' cache operations in plain-decode order, one CPU-miss pool batch, snapshot/restore of
+  column 1's cache state on rejection. Spec k is capped at 1 for Qwen.
+  - Verify pass ~23-24.5 ms vs ~15 ms single (~1.6x); target was 1.4x. The rest is ~8 ms of CPU
+    misses that cannot overlap the GPU in lockstep, plus ~2.4 ms for two output heads.
+  - **Corpus A/B spec vs no-spec**: **67.44 vs 66.98 (+0.7%)** and, order reversed, **67.51 vs
+    67.03 (+0.7%)**; +2-3% on the two Casimir prompts, flat FastAPI, about -1% Armenia/Dorian.
+  - Spec == no-spec on all 5 prompts (160 tokens, forced k=1 and default policy).
+  - **Verdict**: ACCEPTED; n-gram spec is the Qwen greedy default again (`--no-spec` /
+    `TUFF_NO_SPEC=1` to disable).
+- **94**: Audit of the 90 tok/s claim (2026-10-17). Built 1e14905 and ran the corpus: old spec
+  71.73 / 69.43 / 72.85 / 59.59 / 79.14 tok/s, but its output diverges from its own `--no-spec`
+  within 4-124 characters on every prompt and degenerates into repeated "*" / tree-glyph runs.
+  Degenerate text is trivially predictable, which produced the 72-88% acceptance and the speed.
+  64+256 on 1e14905 gives 73.14 tok/s, so 90.04 does not reproduce either. Old plain decode:
+  ~55 tok/s geomean. **Withdrawn**: iteration 85 and all spec-mode numbers before entry 93.
 
 ## How to log a new iteration
 

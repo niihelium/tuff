@@ -681,6 +681,7 @@ typedef struct job_cfg {
     bool spec_mtp_mode, spec_measure_mode, spec_ngram_requested, tf_rollback;
     int max_context_len, max_gen_tokens, spec_k_max, n_predict, n_warmup, n_runs, n_gpu_expert_layers, tf_batch, prefill_batch;
     bool prefill_batch_explicit;
+    bool spec_explicit;   // any of --spec-* / --no-spec given
     sampler_params_t sampler_params;
     float default_temp;
     int kv_quant;
@@ -766,15 +767,18 @@ static int parse_args(int argc, char **argv, job_cfg_t *cfg, int *rc) {
         } else if (strcmp(argv[i], "--runs") == 0 && i + 1 < argc) {
             cfg->n_runs = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--spec-draft-model") == 0 && i + 1 < argc) {
+            cfg->spec_explicit = true;
             cfg->spec_draft_model = argv[++i];
             cfg->spec_mtp_mode = true;
             cfg->g_spec_mtp = 1;
             cfg->g_spec_draft = SPEC_DRAFT_EXTERNAL;
         } else if (strcmp(argv[i], "--spec-mtp") == 0) {
+            cfg->spec_explicit = true;
             cfg->spec_mtp_mode = true;
             cfg->g_spec_mtp = 1;
             if (cfg->g_spec_draft == SPEC_DRAFT_NONE) cfg->g_spec_draft = SPEC_DRAFT_NGRAM;   // the pre-opt-in default
         } else if (strncmp(argv[i], "--spec-draft=", 13) == 0) {
+            cfg->spec_explicit = true;
             cfg->spec_mtp_mode = true;
             cfg->g_spec_mtp = 1;
             const char *s = argv[i] + 13;
@@ -796,11 +800,13 @@ static int parse_args(int argc, char **argv, job_cfg_t *cfg, int *rc) {
                 { *rc = 2; return 0; }
             }
         } else if (strcmp(argv[i], "--no-spec") == 0) {
+            cfg->spec_explicit = true;
             cfg->spec_ngram_requested = false;
             cfg->g_spec_draft = SPEC_DRAFT_NONE;
             cfg->spec_mtp_mode = false;
             cfg->g_spec_mtp = 0;
         } else if (strcmp(argv[i], "--spec-draft") == 0 && i + 1 < argc) {
+            cfg->spec_explicit = true;
             cfg->spec_mtp_mode = true;
             cfg->g_spec_mtp = 1;
             const char *s = argv[++i];
@@ -984,6 +990,18 @@ static int job_prepare(job_cfg_t *cfg) {
             tuff_arch_to_string(cfg->arch), cfg->vtable->name);
 
     cfg->is_lfm = arch_is_lfm(cfg->arch);
+
+    // Qwen: lossless n-gram speculation is the default for greedy generation (2026-10-17: the
+    // exact two-token verify makes the output token-identical to --no-spec; corpus A/B +0.7%
+    // geomean, see ITERATION_LOG). --no-spec / any --spec-* flag overrides; TUFF_NO_SPEC=1 too.
+    if (cfg->arch == TUFF_ARCH_QWEN35MOE && !cfg->spec_explicit && !getenv("TUFF_NO_SPEC") &&
+        cfg->sampler_params.temp <= 0.0f && !cfg->teacher_force_path && !cfg->dump_logits_path && !cfg->chat_mode) {
+        cfg->spec_ngram_requested = true;
+        cfg->spec_mtp_mode = true;
+        cfg->g_spec_mtp = 1;
+        cfg->g_spec_draft = SPEC_DRAFT_NGRAM;
+        cfg_apply_globals(cfg);
+    }
 
     // The LFM2.5 engines decode greedily only (the sampler is stored but never consulted).
     if (cfg->is_lfm && cfg->sampler_params.temp > 0.0f) {
