@@ -6,11 +6,12 @@
 int g_n_gpu_expert_layers = 0;
 
 typedef struct {
-    uint32_t layer;
-    int      expert;
+    uint32_t layer;      // owning layer (fixed for the life of the pool)
+    int      expert;     // resident expert while valid; the incoming expert while a fill is reserved
     uint8_t  valid;
     uint64_t heat;
     uint64_t last_used;
+    uint64_t fill_token; // logical token that reserved the in-flight fill
 } expert_slot_meta_t;
 
 static int g_n_slots = 0;
@@ -30,18 +31,52 @@ static cudaStream_t g_upload_stream = 0;
 static uint64_t *g_expert_hist = NULL;
 static int g_expert_hist_on = 0;
 
-// Iteration-10: O(1) slot allocation. The LRU victim search used to be an O(n_slots=2200) scan on
-// every miss (the dominant miss-fill latency); replace it with a doubly-linked LRU list (MRU at
-// head, LRU at tail) plus a freelist for the initial fill, so alloc is O(1) in steady state.
-static int *g_lru_next = NULL;   // [n_slots]
-static int *g_lru_prev = NULL;   // [n_slots]
-static int g_lru_head = -1;      // MRU
-static int g_lru_tail = -1;      // LRU (eviction victim)
-static int g_free_head = -1;     // freelist of never-used (valid==0) slots
-static int g_valid_count = 0;
+// ---------------------------------------------------------------------------
+// Per-layer partitioned cache (lossless speculation, 2026-10).
+//
+// Every slot is owned by one layer for the life of the pool, and every layer has its own
+// LRU order, its own free list and its own queue of reserved-but-unclaimed fills. Victim
+// selection (LES score over the layer's LRU tail) only ever looks at the layer's own slots.
+// The point is order independence: the cache state a lookup at (token t, layer l) observes is
+// a function of the operations at layer l alone, in token order. A verify pass that evaluates
+// tokens t and t+1 layer by layer (both columns at layer l before either at l+1) therefore
+// sees, at every layer, exactly the hit/miss sets a token-by-token decode would have seen, and
+// the speculative output is bit-identical to plain decode. The old single global LRU coupled
+// the layers (token t's fill at layer 30 could evict a layer-5 expert that token t+1 needs).
+//
+// Fill lifecycle, per slot:
+//   reserve  (decode thread, logical): victim chosen, unmapped, removed from LRU; the slot is
+//            appended to the layer's pending list with fill_token = current logical token.
+//   push     (decode thread, physical): queued on the fill thread, which stages the weights
+//            and issues the H2D after `ev_dep` (recorded on the compute stream at push time,
+//            so the copy cannot overwrite a slot an in-flight expert kernel still reads).
+//   claim    (lazily, at the first access to the layer by a later logical token): the slot is
+//            mapped and pushed MRU, exactly where the old token-boundary commit put it.
+//   ready    the copy's event. A kernel that reads a claimed-but-not-yet-ready slot makes the
+//            compute stream wait on that event (GPU-side; the host never blocks on PCIe).
+// ---------------------------------------------------------------------------
+#define LAYER_PEND_MAX 64
 
-// Dedicated async-expert scratch + stream, so the pipelined gate/up launches overlap the CPU
-// down of the previous expert without colliding with the default-stream g_dx/g_dy scratch.
+typedef struct {
+    int  cap;             // slots owned
+    int *owned;           // [cap] slot ids owned by this layer
+    int *order;           // [cap] valid slots, MRU first
+    int  n_order;
+    int *freel;           // [cap] owned slots holding nothing
+    int  n_free;
+    int  pend[LAYER_PEND_MAX];   // reserved fills not yet claimed, in reservation order
+    int  n_pend;
+    uint64_t begun_tok;   // logical token whose claims have been applied (+1; 0 = never)
+} layer_cache_t;
+
+static layer_cache_t *g_lc = NULL;
+static int g_n_lc = 0;
+static uint64_t g_ctok = 0;            // logical token of the current cache operations
+
+// Physical fill state per slot, kept OUT of the logical snapshot (a pass may push column 0's
+// fills after column 1's snapshot was taken).
+static uint64_t *g_slot_ready = NULL;  // [n_slots] fill seq + 1 whose completion makes data valid; 0 = ready
+static int g_prefill_per_layer = 0;
 
 static int g_cache_enabled(void) {
     return !getenv("TUFF_CPU_EXPERT") && g_cache_ready;
@@ -188,15 +223,56 @@ void gpu_expert_cache_init_ex(model_t *m, int *p_max_seq, int fill_ram) {
         fprintf(stderr, "[EXPERT-HIST] per-(layer,expert) routing histogram ON (%d keys)\n", g_total_experts);
     }
 
-    // O(1) alloc: freelist of dynamic slots (valid==0); LRU list starts empty.
-    g_lru_next = (int*)malloc((size_t)g_n_slots * sizeof(int));
-    g_lru_prev = (int*)malloc((size_t)g_n_slots * sizeof(int));
-    g_lru_head = g_lru_tail = -1;
-    g_free_head = -1;
-    g_valid_count = 0;
-    const int n_res_slots = (g_n_gpu_expert_layers > 0) ? (g_n_gpu_expert_layers * (int)m->expert_count) : 0;
-    for (int i = 0; i < g_n_slots; ++i) { g_lru_next[i] = -1; g_lru_prev[i] = -1; }
-    for (int i = g_n_slots - 1; i >= n_res_slots; --i) { g_lru_next[i] = g_free_head; g_free_head = i; }
+    // Per-layer partition. The trunk layers (the MTP head's layer gets nothing: it is only
+    // looked up by --spec-mtp drafting, and a slot parked there was a slot lost to the trunk).
+    g_n_lc = (int)m->block_count;
+    g_lc = (layer_cache_t*)calloc((size_t)g_n_lc, sizeof(layer_cache_t));
+    g_slot_ready = (uint64_t*)calloc((size_t)g_n_slots, sizeof(uint64_t));
+    {
+        const int n_trunk = (int)m->block_count - (int)m->nextn_predict_layers;
+        const int n_res_layers = g_n_gpu_expert_layers < n_trunk ? g_n_gpu_expert_layers : n_trunk;
+        const int n_res_slots = (g_n_gpu_expert_layers > 0) ? (g_n_gpu_expert_layers * (int)m->expert_count) : 0;
+        int *owner = (int*)malloc((size_t)g_n_slots * sizeof(int));
+        for (int i = 0; i < g_n_slots; ++i) owner[i] = -1;
+        for (int i = 0; i < n_res_slots && i < g_n_slots; ++i) owner[i] = i / (int)m->expert_count;
+        const int n_dyn_layers = n_trunk - n_res_layers;
+        if (n_dyn_layers > 0) {
+            const int n_dyn = g_n_slots - n_res_slots;
+            // Prefill keeps the old even split over ALL block_count layers (so a frozen cache,
+            // TUFF_FILL_BUDGET=0, is resident-identical to the global-LRU build: the golden gate
+            // holds). The MTP layer's share and the remainder become free slots of the trunk
+            // layers, round-robin.
+            const int per = n_dyn / (int)m->block_count;
+            g_prefill_per_layer = per;
+            int s = n_res_slots;
+            for (int l = n_res_layers; l < n_trunk; ++l)
+                for (int e = 0; e < per && s < g_n_slots; ++e) owner[s++] = l;
+            for (int l = n_res_layers; s < g_n_slots; l = (l + 1 < n_trunk) ? l + 1 : n_res_layers) owner[s++] = l;
+        }
+        for (int i = 0; i < g_n_slots; ++i) if (owner[i] >= 0) g_lc[owner[i]].cap++;
+        for (int l = 0; l < g_n_lc; ++l) {
+            layer_cache_t *lc = &g_lc[l];
+            const int c = lc->cap > 0 ? lc->cap : 1;
+            lc->owned = (int*)malloc((size_t)c * sizeof(int));
+            lc->order = (int*)malloc((size_t)c * sizeof(int));
+            lc->freel = (int*)malloc((size_t)c * sizeof(int));
+            lc->cap = 0; lc->n_order = 0; lc->n_free = 0; lc->n_pend = 0; lc->begun_tok = 0;
+        }
+        for (int i = 0; i < g_n_slots; ++i) {
+            if (owner[i] < 0) continue;
+            layer_cache_t *lc = &g_lc[owner[i]];
+            lc->owned[lc->cap++] = i;
+            g_slots[i].layer = (uint32_t)owner[i];
+        }
+        // Free lists: dynamic slots only, lowest slot id popped first.
+        for (int l = 0; l < g_n_lc; ++l) {
+            layer_cache_t *lc = &g_lc[l];
+            for (int k = lc->cap - 1; k >= 0; --k)
+                if (lc->owned[k] >= n_res_slots) lc->freel[lc->n_free++] = lc->owned[k];
+        }
+        free(owner);
+    }
+    g_ctok = 0;
 
     g_cache_async = 1; // async fill uploads on a dedicated stream, synced before the batch launch
     CUDA_CHECK(cudaStreamCreateWithFlags(&g_upload_stream, cudaStreamNonBlocking));
@@ -248,7 +324,6 @@ static void gpu_expert_cache_fill_pinned(int slot, const model_t *m, uint32_t la
     sl->heat = 1;
     sl->last_used = 0;
     g_expert_map[layer * 256 + expert] = slot;
-    g_valid_count++;
 }
 
 void gpu_expert_cache_prefill(model_t *m) {
@@ -269,20 +344,25 @@ void gpu_expert_cache_prefill(model_t *m) {
                 n_layers, (int)m->expert_count, n_filled,
                 (double)n_filled * g_slot_bytes / 1048576.0);
     } else if (g_n_slots > 0) {
-        // Predictive startup prefill: distribute all available slots evenly across all layers
-        const int per_layer = g_n_slots / (int)m->block_count;
-        int slot = 0;
-        for (int l = 0; l < (int)m->block_count && slot < g_n_slots; ++l) {
-            for (int e = 0; e < per_layer && slot < g_n_slots; ++e) {
-                gpu_expert_cache_fill_pinned(slot, m, (uint32_t)l, e);
+        // Predictive startup prefill: every layer's owned slots get experts 0..cap-1 (the
+        // even split of the old global prefill, now over the trunk layers only).
+        int n_filled = 0, n_layers = 0, per_min = 1 << 30;
+        for (int l = 0; l < g_n_lc; ++l) {
+            layer_cache_t *lc = &g_lc[l];
+            if (lc->cap == 0) continue;
+            n_layers++;
+            if (lc->cap < per_min) per_min = lc->cap;
+            int e = 0;
+            while (lc->n_free > 0 && e < g_prefill_per_layer && e < (int)m->expert_count) {
+                const int slot = lc->freel[--lc->n_free];
+                gpu_expert_cache_fill_pinned(slot, m, (uint32_t)l, e++);
                 lru_push_front(slot);
-                slot++;
+                n_filled++;
             }
         }
-        g_free_head = (slot < g_n_slots) ? slot : -1;
         gpu_expert_cache_sync();
-        fprintf(stderr, "[EXPERT-CACHE] pre-filled %d dynamic slots across %d layers (%d per layer, %.2f MiB)\n",
-                slot, (int)m->block_count, per_layer, (double)slot * g_slot_bytes / 1048576.0);
+        fprintf(stderr, "[EXPERT-CACHE] pre-filled %d dynamic slots across %d layers (>=%d per layer, per-layer LRU, %.2f MiB)\n",
+                n_filled, n_layers, n_layers ? per_min : 0, (double)n_filled * g_slot_bytes / 1048576.0);
     }
 }
 
@@ -375,42 +455,43 @@ void gpu_expert_cache_free(void) {
     if (g_expert_stream) { CUDA_CHECK(cudaStreamDestroy(g_expert_stream)); g_expert_stream = 0; }
     free(g_slots); g_slots = NULL;
     free(g_expert_map); g_expert_map = NULL;
-    free(g_lru_next); g_lru_next = NULL;
-    free(g_lru_prev); g_lru_prev = NULL;
-    g_lru_head = g_lru_tail = -1; g_free_head = -1; g_valid_count = 0;
+    for (int l = 0; l < g_n_lc; ++l) { free(g_lc[l].owned); free(g_lc[l].order); free(g_lc[l].freel); }
+    free(g_lc); g_lc = NULL; g_n_lc = 0;
+    free(g_slot_ready); g_slot_ready = NULL;
+
     g_n_slots = 0; g_slot_bytes = 0; g_cache_ready = 0;
     free(g_expert_hist); g_expert_hist = NULL; g_expert_hist_on = 0;
     if (g_moe_policy) { moe_policy_free(g_moe_policy); g_moe_policy = NULL; }
 }
 
-// --- O(1) LRU + freelist bookkeeping (iteration-10) ---
-// The LRU list holds all valid slots, MRU at g_lru_head, LRU at g_lru_tail. A slot that is valid
-// is exactly one node in the LRU list. g_lru_next/prev[-1] are self-terminating sentinels.
+// --- Per-layer LRU + freelist bookkeeping ---
+// order[] is MRU first. A layer owns ~48 slots, so the O(cap) move-to-front is a few dozen ints.
 static void lru_remove(int slot) {
-    const int nxt = g_lru_next[slot], prv = g_lru_prev[slot];
-    if (prv < 0) g_lru_head = nxt; else g_lru_next[prv] = nxt;
-    if (nxt < 0) g_lru_tail = prv; else g_lru_prev[nxt] = prv;
-    g_lru_next[slot] = g_lru_prev[slot] = -1;
+    layer_cache_t *lc = &g_lc[g_slots[slot].layer];
+    for (int i = 0; i < lc->n_order; ++i) {
+        if (lc->order[i] == slot) {
+            memmove(lc->order + i, lc->order + i + 1, (size_t)(lc->n_order - i - 1) * sizeof(int));
+            lc->n_order--;
+            return;
+        }
+    }
 }
 
 static void lru_push_front(int slot) {
-    g_lru_prev[slot] = -1;
-    g_lru_next[slot] = g_lru_head;
-    if (g_lru_head >= 0) g_lru_prev[g_lru_head] = slot;
-    else g_lru_tail = slot;
-    g_lru_head = slot;
+    layer_cache_t *lc = &g_lc[g_slots[slot].layer];
+    memmove(lc->order + 1, lc->order, (size_t)lc->n_order * sizeof(int));
+    lc->order[0] = slot;
+    lc->n_order++;
 }
 
-static int freelist_pop(void) {
-    const int s = g_free_head;
-    if (s >= 0) g_free_head = g_lru_next[s]; // reuse next as free-list link
-    return s;
+static int freelist_pop(uint32_t layer) {
+    layer_cache_t *lc = &g_lc[layer];
+    return lc->n_free > 0 ? lc->freel[--lc->n_free] : -1;
 }
 
 static void expert_slot_claim(int slot, uint32_t layer, int expert) {
     expert_slot_meta_t *sl = &g_slots[slot];
     if (sl->valid) { g_expert_map[sl->layer * 256 + sl->expert] = -1; lru_remove(slot); }
-    else g_valid_count++;
     sl->valid = 1;
     sl->layer = layer;
     sl->expert = expert;
@@ -420,17 +501,54 @@ static void expert_slot_claim(int slot, uint32_t layer, int expert) {
     lru_push_front(slot);
 }
 
-// Look up (layer,expert). Returns slot index on HIT (resident, data on device), -1 on MISS.
-// A HIT moves the slot to the MRU end of the LRU list (O(1)).
+static unsigned long long g_bg_committed = 0;
+
+// Apply the claims every earlier logical token owes this layer. Lazy, but the observable state is
+// the old token-boundary commit's: claims land in reservation order, before the first access of a
+// later token, and nothing else touches the layer in between.
+static void layer_begin(uint32_t layer) {
+    layer_cache_t *lc = &g_lc[layer];
+    if (lc->begun_tok == g_ctok + 1) return;
+    int w = 0;
+    for (int i = 0; i < lc->n_pend; ++i) {
+        const int s = lc->pend[i];
+        if (g_slots[s].fill_token < g_ctok) {
+            expert_slot_claim(s, layer, g_slots[s].expert);
+            g_bg_committed++;
+        } else {
+            lc->pend[w++] = s;
+        }
+    }
+    lc->n_pend = w;
+    lc->begun_tok = g_ctok + 1;
+}
+
+void gpu_expert_cache_layer_begin(uint32_t layer) {
+    if (!g_cache_ready || (int)layer >= g_n_lc) return;
+    layer_begin(layer);
+}
+
+void gpu_expert_cache_set_token(uint64_t tok) {
+    g_ctok = tok;
+    if (g_moe_policy) moe_policy_set_step(g_moe_policy, (int)tok);
+}
+
+uint64_t gpu_expert_cache_get_token(void) { return g_ctok; }
+
+void gpu_expert_cache_token_end(void) { gpu_expert_cache_set_token(g_ctok + 1); }
+
+// Look up (layer,expert). Returns slot index on HIT (resident, data on device or arriving), -1 on
+// MISS. A HIT moves the slot to the MRU end of its layer's LRU order.
 int gpu_expert_lookup(uint32_t layer, int expert) {
     if (!g_cache_ready) return -1;
+    layer_begin(layer);
     if (g_expert_hist_on && layer < (uint32_t)g_total_experts / 256)
         g_expert_hist[layer * 256 + expert]++;
     int slot = g_expert_map[layer * 256 + expert];
     if (slot >= 0) {
         g_slots[slot].heat++;
         g_slots[slot].last_used = ++g_tick;
-        if (layer >= (uint32_t)g_n_gpu_expert_layers && g_lru_head != slot) {
+        if (layer >= (uint32_t)g_n_gpu_expert_layers && g_lc[layer].order[0] != slot) {
             lru_remove(slot);
             lru_push_front(slot);
         }
@@ -440,8 +558,6 @@ int gpu_expert_lookup(uint32_t layer, int expert) {
     }
     return slot;
 }
-
-// Device pointer for tensor `which` (0=gate,1=up,2=down) inside slot `slot`.
 const void *gpu_expert_dev_ptr(int slot, int which) {
     return g_pool + (size_t)slot * g_slot_bytes + g_tensor_off[which];
 }
@@ -505,36 +621,28 @@ void gpu_expert_cache_fill_down(int slot, const model_t *m, uint32_t layer, int 
     CUDA_CHECK(cudaMemcpyAsync(base + g_tensor_off[2], down, down_bytes, cudaMemcpyHostToDevice, g_upload_stream));
 }
 
-static int select_tail_victim_slot_score(float *out_score) {
+// LES victim over the layer's own LRU tail (up to 64 candidates, least recent first; the first
+// minimum wins, and a zero score ends the search).
+static int select_tail_victim_slot_score(uint32_t layer, float *out_score) {
     if (out_score) *out_score = 0.0f;
+    layer_cache_t *lc = &g_lc[layer];
+    if (lc->n_order == 0) return -1;
     if (!g_moe_policy || getenv("TUFF_NO_LES")) {
-        return g_lru_tail;
+        return lc->order[lc->n_order - 1];
     }
-    int cands[64];
-    int n_cands = 0;
-    int cur = g_lru_tail;
-    while (cur >= 0 && n_cands < 64) {
-        if (g_slots[cur].valid) cands[n_cands++] = cur;
-        cur = g_lru_prev[cur];
-    }
-    if (n_cands == 0) return g_lru_tail;
-    int best_i = 0;
+    int best = lc->order[lc->n_order - 1];
     float min_score = 1e30f;
-    for (int i = 0; i < n_cands; ++i) {
-        int s = cands[i];
-        float sc = moe_policy_score(g_moe_policy, (int)g_slots[s].layer, g_slots[s].expert);
+    for (int i = lc->n_order - 1, n = 0; i >= 0 && n < 64; --i, ++n) {
+        const int s = lc->order[i];
+        float sc = moe_policy_score(g_moe_policy, (int)layer, g_slots[s].expert);
         if (sc < min_score) {
             min_score = sc;
-            best_i = i;
+            best = s;
             if (min_score <= 0.0f) break;
         }
     }
     if (out_score) *out_score = min_score;
-    return cands[best_i];
-}
-
-static int select_tail_victim_slot(void) {
-    return select_tail_victim_slot_score(NULL);
+    return best;
 }
 
 // Pure query: check if an expert is currently resident without modifying LRU or counters
@@ -545,16 +653,14 @@ int gpu_expert_is_resident(uint32_t layer, int expert) {
 }
 
 // Reserve a slot for a new expert (miss): free slot first, else policy/LRU victim. Does NOT upload.
-// O(1) via freelist + tail candidate selection (Task 6.2 LES probability-driven cache).
 int gpu_expert_cache_alloc_slot(uint32_t layer, int expert) {
-    (void)layer; (void)expert;
-    int victim = freelist_pop();
-    if (victim < 0) {
-        victim = select_tail_victim_slot();
-    }
+    (void)expert;
+    if (!g_cache_ready || (int)layer >= g_n_lc) return -1;
+    layer_begin(layer);
+    int victim = freelist_pop(layer);
+    if (victim < 0) victim = select_tail_victim_slot_score(layer, NULL);
     return victim;
 }
-
 void gpu_expert_cache_stats(unsigned long long *hits, unsigned long long *misses) {
     if (hits) *hits = g_cache_hits;
     if (misses) *misses = g_cache_misses;
@@ -597,12 +703,9 @@ void gpu_expert_cache_sync(void) {
 //     (gpu_expert_moe_down / gpu_expert_batch_down_sync_download both sync g_expert_stream),
 //     so no in-flight kernel is reading the pool when a victim is chosen.
 // ---------------------------------------------------------------------------
-// P1 queue depth. Must fit a full token's fills with headroom (2 tokens' worth: up to
-// 40 layers x g_fill_budget 2 = 80, plus slack). A power of two since the code indexes with
-// `% BGFILL_QUEUE`. The old 8 gated issuance: g_bg_commit only advanced at the once-per-token
-// drain, so at most 8 fills could be issued per token (measured 8.00/token) while a token
-// routed up to 80 misses -> ~80% of routed experts took the CPU path every token. Deep enough
-// that the queue never gates issuance; the commit boundary is now the sole ordering control.
+// Ring depth. A request's stage buffer and events are reused only after the request at the same
+// index (seq - BGFILL_QUEUE) has completed; the producer waits for that, so the queue never drops
+// a fill (a drop would make residency depend on copy latency, not on token history).
 #define BGFILL_QUEUE 256
 
 typedef struct {
@@ -610,23 +713,30 @@ typedef struct {
     uint32_t layer;
     int      expert;
     int      slot;
-    unsigned long token;   // issuing token index, recorded by the decode thread at reserve time
-    cudaEvent_t ev;
+    cudaEvent_t ev;       // copy complete (recorded on g_upload_stream by the fill thread)
+    cudaEvent_t ev_dep;   // compute-stream point the copy must not overtake (recorded at push)
 } bgfill_req_t;
 
 static bgfill_req_t g_bg[BGFILL_QUEUE];
 static unsigned long g_bg_prod = 0;    // decode thread only (published with release)
 static unsigned long g_bg_sub  = 0;    // fill thread only  (published with release)
-static unsigned long g_bg_commit = 0;  // decode thread only
-static unsigned long g_bg_token = 0;   // decode thread only: token index of the fills being issued
+static unsigned long g_bg_done = 0;    // decode thread only: every seq < g_bg_done has completed
 static pthread_t g_bg_thread;
 static pthread_mutex_t g_bg_mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_bg_cv  = PTHREAD_COND_INITIALIZER;
 static int g_bg_running = 0;
 static int g_bg_stop = 0;
-static unsigned long long g_bg_issued = 0, g_bg_committed = 0;
+static unsigned long long g_bg_issued = 0;
 
 static uint8_t *g_pinned_stage = NULL;
+
+// Reserved fills not yet handed to the fill thread, tagged with a group (0 = the token being
+// decoded, 1.. = a speculative verify column whose fate is not yet known).
+#define UNPUSHED_MAX 512
+typedef struct { int slot; int group; int expert; } unpushed_t;   // expert: the reservation's, not the slot's
+                                                                   // (a later column may re-reserve the slot)
+static unpushed_t g_unpushed[UNPUSHED_MAX];
+static int g_n_unpushed = 0;
 
 static void bgfill_do(const bgfill_req_t *r) {
     const model_layer_t *L = &r->m->layers[r->layer];
@@ -648,8 +758,10 @@ static void bgfill_do(const bgfill_req_t *r) {
         memcpy(stage + g_tensor_off[0], gate, gate_bytes);
         memcpy(stage + g_tensor_off[1], up,   up_bytes);
         memcpy(stage + g_tensor_off[2], down, down_bytes);
+        CUDA_CHECK(cudaStreamWaitEvent(g_upload_stream, r->ev_dep, 0));
         CUDA_CHECK(cudaMemcpyAsync(base, stage, g_slot_bytes, cudaMemcpyHostToDevice, g_upload_stream));
     } else {
+        CUDA_CHECK(cudaStreamWaitEvent(g_upload_stream, r->ev_dep, 0));
         CUDA_CHECK(cudaMemcpyAsync(base + g_tensor_off[0], gate, gate_bytes, cudaMemcpyHostToDevice, g_upload_stream));
         CUDA_CHECK(cudaMemcpyAsync(base + g_tensor_off[1], up,   up_bytes,   cudaMemcpyHostToDevice, g_upload_stream));
         CUDA_CHECK(cudaMemcpyAsync(base + g_tensor_off[2], down, down_bytes, cudaMemcpyHostToDevice, g_upload_stream));
@@ -679,8 +791,10 @@ static void bgfill_start(void) {
     }
     for (int i = 0; i < BGFILL_QUEUE; ++i) {
         CUDA_CHECK(cudaEventCreateWithFlags(&g_bg[i].ev, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&g_bg[i].ev_dep, cudaEventDisableTiming));
     }
-    g_bg_prod = g_bg_sub = g_bg_commit = g_bg_token = 0;
+    g_bg_prod = g_bg_sub = g_bg_done = 0;
+    g_n_unpushed = 0;
     g_bg_stop = 0;
     if (pthread_create(&g_bg_thread, NULL, bgfill_thread_fn, NULL) != 0) {
         fprintf(stderr, "[FATAL ERROR] gpu: failed to create the background expert-fill thread\n");
@@ -700,42 +814,207 @@ static void bgfill_stop(void) {
     if (g_upload_stream) CUDA_CHECK(cudaStreamSynchronize(g_upload_stream));
     for (int i = 0; i < BGFILL_QUEUE; ++i) {
         if (g_bg[i].ev) { CUDA_CHECK(cudaEventDestroy(g_bg[i].ev)); g_bg[i].ev = 0; }
+        if (g_bg[i].ev_dep) { CUDA_CHECK(cudaEventDestroy(g_bg[i].ev_dep)); g_bg[i].ev_dep = 0; }
     }
     g_bg_running = 0;
 }
 
-// Reserve a victim slot and make it unreachable (see the race-freedom note above). Decode
-// thread only. Returns -1 when no slot can be spared (every slot is reserved in flight).
-static int expert_slot_reserve(void) {
-    int slot = freelist_pop();
+static void bg_wait_submitted(unsigned long seq) {
+    while (__atomic_load_n(&g_bg_sub, __ATOMIC_ACQUIRE) <= seq) sched_yield();
+}
+
+// Advance g_bg_done over completed requests (non-blocking).
+static void bg_advance_done(void) {
+    const unsigned long sub = __atomic_load_n(&g_bg_sub, __ATOMIC_ACQUIRE);
+    while (g_bg_done < sub) {
+        cudaError_t st = cudaEventQuery(g_bg[g_bg_done % BGFILL_QUEUE].ev);
+        if (st == cudaSuccess) { g_bg_done++; continue; }
+        if (st != cudaErrorNotReady) CUDA_CHECK(st);
+        break;
+    }
+}
+
+// Hand one reserved slot to the fill thread.
+static void bg_push(const model_t *m, int slot, int expert) {
+    const unsigned long seq = g_bg_prod;
+    if (seq >= BGFILL_QUEUE && g_bg_done <= seq - BGFILL_QUEUE) {
+        bg_advance_done();
+        if (g_bg_done <= seq - BGFILL_QUEUE) {
+            const unsigned long old = seq - BGFILL_QUEUE;
+            bg_wait_submitted(old);
+            CUDA_CHECK(cudaEventSynchronize(g_bg[old % BGFILL_QUEUE].ev));
+            g_bg_done = old + 1;
+            bg_advance_done();
+        }
+    }
+    bgfill_req_t *r = &g_bg[seq % BGFILL_QUEUE];
+    r->m = m; r->layer = g_slots[slot].layer; r->expert = expert; r->slot = slot;
+    CUDA_CHECK(cudaEventRecord(r->ev_dep, 0));
+    g_slot_ready[slot] = (uint64_t)seq + 1;
+    pthread_mutex_lock(&g_bg_mtx);
+    __atomic_store_n(&g_bg_prod, seq + 1, __ATOMIC_RELEASE);
+    pthread_cond_signal(&g_bg_cv);
+    pthread_mutex_unlock(&g_bg_mtx);
+    g_bg_issued++;
+}
+
+// Reserve a victim slot in `layer` and make it unreachable. Decode thread only.
+static int expert_slot_reserve(uint32_t layer) {
+    int slot = freelist_pop(layer);
     if (slot < 0) {
-        slot = select_tail_victim_slot();
-        if (slot < 0) return -1;   // all slots reserved in flight
+        slot = select_tail_victim_slot_score(layer, NULL);
+        if (slot < 0) return -1;
         lru_remove(slot);
     }
     expert_slot_meta_t *sl = &g_slots[slot];
     if (sl->valid) {
         g_expert_map[sl->layer * 256 + sl->expert] = -1;
         sl->valid = 0;
-        g_valid_count--;
     }
     return slot;
 }
 
-int gpu_expert_cache_bgfill(const model_t *m, uint32_t layer, int expert) {
-    if (!g_cache_ready || !g_bg_running) return 0;
-    if (g_bg_prod - g_bg_commit >= BGFILL_QUEUE) return 0;   // queue full -> skip this fill
-    const int slot = expert_slot_reserve();
+static const model_t *g_fill_model = NULL;
+
+// Logical half of a fill. group 0 is queued on the layer's pending list at once; group >= 1
+// (a speculative verify column) is not, until gpu_expert_cache_fill_commit(group) accepts it.
+// Returns 1 if a slot was reserved.
+int gpu_expert_cache_fill_reserve(const model_t *m, uint32_t layer, int expert, int group) {
+    if (!g_cache_ready || !g_bg_running || (int)layer >= g_n_lc) return 0;
+    layer_begin(layer);
+    layer_cache_t *lc = &g_lc[layer];
+    if (lc->n_pend >= LAYER_PEND_MAX || g_n_unpushed >= UNPUSHED_MAX) return 0;
+    const int slot = expert_slot_reserve(layer);
     if (slot < 0) return 0;
-    bgfill_req_t *r = &g_bg[g_bg_prod % BGFILL_QUEUE];
-    r->m = m; r->layer = layer; r->expert = expert; r->slot = slot;
-    r->token = g_bg_token;   // deterministic function of token history, not of copy latency
-    pthread_mutex_lock(&g_bg_mtx);
-    __atomic_store_n(&g_bg_prod, g_bg_prod + 1, __ATOMIC_RELEASE);
-    pthread_cond_signal(&g_bg_cv);
-    pthread_mutex_unlock(&g_bg_mtx);
-    g_bg_issued++;
+    g_fill_model = m;
+    g_slots[slot].expert = expert;
+    g_slots[slot].fill_token = g_ctok;
+    if (group == 0) lc->pend[lc->n_pend++] = slot;
+    g_unpushed[g_n_unpushed].slot = slot;
+    g_unpushed[g_n_unpushed].group = group;
+    g_unpushed[g_n_unpushed].expert = expert;
+    g_n_unpushed++;
     return 1;
+}
+
+// Physical half: hand every reserved slot of `group` to the fill thread, in reservation order.
+// The copies are ordered after everything already issued on the compute stream.
+void gpu_expert_cache_fill_push(int group) {
+    int w = 0;
+    for (int i = 0; i < g_n_unpushed; ++i) {
+        if (g_unpushed[i].group == group) bg_push(g_fill_model, g_unpushed[i].slot, g_unpushed[i].expert);
+        else g_unpushed[w++] = g_unpushed[i];
+    }
+    g_n_unpushed = w;
+}
+
+// A verify column was accepted: its reserved fills join their layers' pending lists (in order)
+// and are pushed.
+void gpu_expert_cache_fill_commit(int group) {
+    for (int i = 0; i < g_n_unpushed; ++i) {
+        if (g_unpushed[i].group != group) continue;
+        const int s = g_unpushed[i].slot;
+        layer_cache_t *lc = &g_lc[g_slots[s].layer];
+        if (lc->n_pend < LAYER_PEND_MAX) lc->pend[lc->n_pend++] = s;
+    }
+    gpu_expert_cache_fill_push(group);
+}
+
+// A verify column was rejected: forget its reserved fills (the caller restores the layers'
+// logical state, which puts the victims back; their device data was never touched).
+void gpu_expert_cache_fill_drop(int group) {
+    int w = 0;
+    for (int i = 0; i < g_n_unpushed; ++i) {
+        if (g_unpushed[i].group != group) g_unpushed[w++] = g_unpushed[i];
+    }
+    g_n_unpushed = w;
+}
+
+int gpu_expert_cache_bgfill(const model_t *m, uint32_t layer, int expert) {
+    if (!gpu_expert_cache_fill_reserve(m, layer, expert, 0)) return 0;
+    gpu_expert_cache_fill_push(0);
+    return 1;
+}
+
+// Make the compute stream wait for any of `slots` whose last ISSUED fill has not been observed
+// complete. Copies complete in issue order on the one upload stream, so waiting on the newest
+// suffices. A slot whose replacement is only reserved (not yet issued) still holds - and is being
+// read for - its previous contents; the replacement copy is ordered after the read by ev_dep.
+void gpu_expert_cache_wait_slots(const int *slots, int n) {
+    if (!g_cache_ready) return;
+    uint64_t need = 0;
+    for (int i = 0; i < n; ++i) {
+        const int s = slots[i];
+        if (s >= 0 && g_slot_ready[s] > need) need = g_slot_ready[s];
+    }
+    if (need == 0 || need <= g_bg_done) return;
+    bg_advance_done();
+    if (need <= g_bg_done) return;
+    const unsigned long seq = (unsigned long)(need - 1);
+    bg_wait_submitted(seq);
+    CUDA_CHECK(cudaStreamWaitEvent(0, g_bg[seq % BGFILL_QUEUE].ev, 0));
+}
+
+// --- Logical snapshot of one layer (a speculative column's cache operations are undone if the
+// column is rejected). Physical fill state (g_slot_ready / unpushed) is deliberately excluded.
+struct expert_layer_snap {
+    int n_order, n_free, n_pend;
+    uint64_t begun_tok;
+    int *order, *freel, *pend;
+    int map_row[256];
+    expert_slot_meta_t *meta;   // [cap], in owned[] order
+    unsigned char *pol;         // policy row
+    int cap;
+};
+
+expert_layer_snap_t *gpu_expert_cache_snap_alloc(void) {
+    if (!g_cache_ready) return NULL;
+    expert_layer_snap_t *sn = (expert_layer_snap_t*)calloc((size_t)g_n_lc, sizeof(expert_layer_snap_t));
+    const size_t pb = g_moe_policy ? moe_policy_row_bytes(g_moe_policy) : 0;
+    for (int l = 0; l < g_n_lc; ++l) {
+        const int c = g_lc[l].cap > 0 ? g_lc[l].cap : 1;
+        sn[l].cap = g_lc[l].cap;
+        sn[l].order = (int*)malloc((size_t)c * sizeof(int));
+        sn[l].freel = (int*)malloc((size_t)c * sizeof(int));
+        sn[l].pend  = (int*)malloc(LAYER_PEND_MAX * sizeof(int));
+        sn[l].meta  = (expert_slot_meta_t*)malloc((size_t)c * sizeof(expert_slot_meta_t));
+        sn[l].pol   = pb ? (unsigned char*)malloc(pb) : NULL;
+    }
+    return sn;
+}
+
+void gpu_expert_cache_snap_layer(expert_layer_snap_t *sn, uint32_t layer) {
+    if (!sn || (int)layer >= g_n_lc) return;
+    layer_cache_t *lc = &g_lc[layer];
+    expert_layer_snap_t *s = &sn[layer];
+    s->n_order = lc->n_order; s->n_free = lc->n_free; s->n_pend = lc->n_pend; s->begun_tok = lc->begun_tok;
+    memcpy(s->order, lc->order, (size_t)lc->n_order * sizeof(int));
+    memcpy(s->freel, lc->freel, (size_t)lc->n_free * sizeof(int));
+    memcpy(s->pend, lc->pend, (size_t)lc->n_pend * sizeof(int));
+    memcpy(s->map_row, g_expert_map + (size_t)layer * 256, sizeof(s->map_row));
+    for (int i = 0; i < lc->cap; ++i) s->meta[i] = g_slots[lc->owned[i]];
+    if (s->pol) moe_policy_row_save(g_moe_policy, (int)layer, s->pol);
+}
+
+void gpu_expert_cache_restore_layer(const expert_layer_snap_t *sn, uint32_t layer) {
+    if (!sn || (int)layer >= g_n_lc) return;
+    layer_cache_t *lc = &g_lc[layer];
+    const expert_layer_snap_t *s = &sn[layer];
+    lc->n_order = s->n_order; lc->n_free = s->n_free; lc->n_pend = s->n_pend; lc->begun_tok = s->begun_tok;
+    memcpy(lc->order, s->order, (size_t)s->n_order * sizeof(int));
+    memcpy(lc->freel, s->freel, (size_t)s->n_free * sizeof(int));
+    memcpy(lc->pend, s->pend, (size_t)s->n_pend * sizeof(int));
+    memcpy(g_expert_map + (size_t)layer * 256, s->map_row, sizeof(s->map_row));
+    for (int i = 0; i < lc->cap; ++i) g_slots[lc->owned[i]] = s->meta[i];
+    if (s->pol) moe_policy_row_restore(g_moe_policy, (int)layer, s->pol);
+}
+
+void gpu_expert_cache_snap_free(expert_layer_snap_t *sn) {
+    if (!sn) return;
+    for (int l = 0; l < g_n_lc; ++l) {
+        free(sn[l].order); free(sn[l].freel); free(sn[l].pend); free(sn[l].meta); free(sn[l].pol);
+    }
+    free(sn);
 }
 
 static int expert_is_resident_cb(void *ctx, int layer, int expert) {
@@ -744,11 +1023,9 @@ static int expert_is_resident_cb(void *ctx, int layer, int expert) {
 }
 
 static int bgfill_is_in_flight(uint32_t layer, int expert) {
-    const unsigned long prod = __atomic_load_n(&g_bg_prod, __ATOMIC_ACQUIRE);
-    for (unsigned long i = g_bg_commit; i < prod; ++i) {
-        const bgfill_req_t *r = &g_bg[i % BGFILL_QUEUE];
-        if (r->layer == layer && r->expert == expert) return 1;
-    }
+    const layer_cache_t *lc = &g_lc[layer];
+    for (int i = 0; i < lc->n_pend; ++i)
+        if (g_slots[lc->pend[i]].expert == expert) return 1;
     return 0;
 }
 
@@ -759,12 +1036,11 @@ int gpu_expert_cache_les_prefetch(const model_t *m) {
     if (!g_cache_ready || !g_bg_running || !g_moe_policy) return 0;
     // Opt-in: corpus A/B measured the inter-token prefetch at -2.3% (52.92 vs 54.12 tok/s), the
     // extra PCIe fills contend with the decode path's own traffic (same finding as iteration 37).
+    // Not part of the speculative-verify trajectory: with spec on it makes the output depend on
+    // where the verify steps fall.
     static int enabled = -1;
     if (enabled < 0) { const char *e = getenv("TUFF_LES_PREFETCH"); enabled = (e && *e) ? atoi(e) != 0 : 0; }
     if (!enabled || getenv("TUFF_NO_LES")) return 0;
-
-    // Do not queue prefetches if queue is half full
-    if (g_bg_prod - g_bg_commit >= BGFILL_QUEUE / 2) return 0;
 
     const char *e_budget = getenv("TUFF_LES_PREFETCH_BUDGET");
     int budget = (e_budget && *e_budget) ? atoi(e_budget) : 2;
@@ -785,13 +1061,15 @@ int gpu_expert_cache_les_prefetch(const model_t *m) {
     for (int p = 0; p < n_planned; ++p) {
         int l = plan_layers[p];
         int e = plan_experts[p];
+        if (l >= g_n_lc || g_lc[l].cap == 0) continue;
+        layer_begin((uint32_t)l);
         if (bgfill_is_in_flight((uint32_t)l, e)) continue;
 
         float score_new = moe_policy_score(g_moe_policy, l, e);
         float score_victim = 0.0f;
         int victim_slot = -1;
-        if (g_free_head < 0) {
-            victim_slot = select_tail_victim_slot_score(&score_victim);
+        if (g_lc[l].n_free == 0) {
+            victim_slot = select_tail_victim_slot_score((uint32_t)l, &score_victim);
         }
 
         // Only evict if incoming score beats victim score by threshold
@@ -806,41 +1084,15 @@ int gpu_expert_cache_les_prefetch(const model_t *m) {
     return issued;
 }
 
+// Completion bookkeeping only (claims are lazy, per layer; readiness is GPU-side).
 void gpu_expert_cache_bgfill_poll(void) {
     if (!g_bg_running) return;
-    const unsigned long t = g_bg_token;
-    const unsigned long prod = __atomic_load_n(&g_bg_prod, __ATOMIC_ACQUIRE);
-    while (g_bg_commit < prod) {
-        bgfill_req_t *r = &g_bg[g_bg_commit % BGFILL_QUEUE];
-        if (r->token > t) break;
-        while (g_bg_commit >= __atomic_load_n(&g_bg_sub, __ATOMIC_ACQUIRE))
-            sched_yield();
-        CUDA_CHECK(cudaEventSynchronize(r->ev));
-        expert_slot_claim(r->slot, r->layer, r->expert);
-        g_bg_commit++;
-        g_bg_committed++;
-    }
-    g_bg_token = t + 1;
+    bg_advance_done();
 }
 
 void gpu_expert_cache_bgfill_poll_ready(void) {
-    if (!g_bg_running) return;
-    const unsigned long sub = __atomic_load_n(&g_bg_sub, __ATOMIC_ACQUIRE);
-    while (g_bg_commit < sub) {
-        bgfill_req_t *r = &g_bg[g_bg_commit % BGFILL_QUEUE];
-        cudaError_t st = cudaEventQuery(r->ev);
-        if (st == cudaSuccess) {
-            expert_slot_claim(r->slot, r->layer, r->expert);
-            g_bg_commit++;
-            g_bg_committed++;
-        } else if (st == cudaErrorNotReady) {
-            break;
-        } else {
-            CUDA_CHECK(st);
-        }
-    }
+    gpu_expert_cache_bgfill_poll();
 }
-
 void gpu_expert_cache_bgfill_stats(unsigned long long *issued, unsigned long long *committed) {
     if (issued) *issued = g_bg_issued;
     if (committed) *committed = g_bg_committed;

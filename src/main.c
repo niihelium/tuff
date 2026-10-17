@@ -309,6 +309,7 @@ typedef struct {
     int copy_full_accept_streak;
     int copy_sticky_hold;
     int k_long;
+    int k_cap;   // hard cap on k from the engine (-1 none): Qwen's lossless verify is two tokens
 } spec_t;
 
 static int spec_cmp_double(const void *a, const void *b) {
@@ -420,6 +421,21 @@ static void spec_init(spec_t *s, const engine_vtable_t *vt, int ctx, int nmax, i
     const char *env_kl = getenv("TUFF_LONG_BLOCK");
     s->k_long = (env_kl && env_kl[0]) ? atoi(env_kl) : SPEC_KMAX;
     if (s->k_long < 1 || s->k_long > SPEC_KMAX) s->k_long = SPEC_KMAX;
+    s->k_cap = -1;
+}
+
+// Qwen: speculation is lossless only through the engine's exact two-token verify. Without it
+// (TUFF_GRAPHS=0, TUFF_EXACT=1, TUFF_GPU_ROUTER=1, TUFF_QWEN_BITID=1, ...) the batch path's
+// numerics differ from plain decode, so speculation is switched off rather than run lossy.
+static void spec_set_engine_cap(spec_t *s, tuff_arch_t arch, void *eng) {
+    if (arch != TUFF_ARCH_QWEN35MOE) return;
+    static int warned = 0;
+    if (engine_exact_verify_available((const engine_t*)eng)) { s->k_cap = 1; return; }
+    s->k_cap = 0;
+    if (!warned) {
+        fprintf(stderr, "[Tuff] spec: exact verify unavailable in this configuration; speculation disabled (output stays lossless)\n");
+        warned = 1;
+    }
 }
 
 // Reset per-run state for a fresh engine.
@@ -549,6 +565,7 @@ static int spec_step(spec_t *s, int32_t t, int pos, int rem, int32_t *out) {
         }
     }
 
+    if (s->k_cap >= 0 && eff_kmax > s->k_cap) eff_kmax = s->k_cap;
     int kcap = eff_kmax < rem - 1 ? eff_kmax : rem - 1;
     if (kcap > s->ctx - 1 - pos) kcap = s->ctx - 1 - pos;
     int32_t d[SPEC_KMAX];
@@ -663,6 +680,7 @@ typedef struct job_cfg {
     bool prompt_specified, chat_mode, fill_ram, inspect_mode, bench_dense_batch, dump_tokens_mode;
     bool spec_mtp_mode, spec_measure_mode, spec_ngram_requested, tf_rollback;
     int max_context_len, max_gen_tokens, spec_k_max, n_predict, n_warmup, n_runs, n_gpu_expert_layers, tf_batch, prefill_batch;
+    bool prefill_batch_explicit;
     sampler_params_t sampler_params;
     float default_temp;
     int kv_quant;
@@ -697,7 +715,7 @@ static void cfg_init(job_cfg_t *cfg) {
     cfg->prefill_batch = 8;
     {
         const char *pb = getenv("LFM25_PREFILL_BATCH");
-        if (pb && pb[0]) { int v = atoi(pb); if (v >= 1 && v <= TF_MAX_BATCH) cfg->prefill_batch = v; }
+        if (pb && pb[0]) { int v = atoi(pb); if (v >= 1 && v <= TF_MAX_BATCH) { cfg->prefill_batch = v; cfg->prefill_batch_explicit = true; } }
     }
     cfg->sampler_params = sampler_params_default();
     cfg->default_temp = cfg->sampler_params.temp;
@@ -876,6 +894,7 @@ static int parse_args(int argc, char **argv, job_cfg_t *cfg, int *rc) {
             }
         } else if (strcmp(argv[i], "--prefill-batch") == 0 && i + 1 < argc) {
             cfg->prefill_batch = atoi(argv[++i]);
+            cfg->prefill_batch_explicit = true;
             if (cfg->prefill_batch < 1 || cfg->prefill_batch > TF_MAX_BATCH) {
                 fprintf(stderr, "Error: --prefill-batch must be 1..%d\n", TF_MAX_BATCH);
                 { *rc = 2; return 0; }
@@ -1098,7 +1117,10 @@ static int run_job(const engine_vtable_t *vtable, void *model, job_cfg_t *cfg) {
     sampler_params_t sampler_params = cfg->sampler_params;
     const char *teacher_force_path = cfg->teacher_force_path;
     const int tf_batch = cfg->tf_batch;
-    const int prefill_batch = cfg->prefill_batch;
+    // Qwen: the n>2 batched forward is not bit-identical to engine_forward_token (and its CPU-miss
+    // path was measured non-deterministic run to run), so the prompt goes token by token unless
+    // --prefill-batch / LFM25_PREFILL_BATCH asks for the batch explicitly.
+    const int prefill_batch = (cfg->arch == TUFF_ARCH_QWEN35MOE && !cfg->prefill_batch_explicit) ? 1 : cfg->prefill_batch;
     const bool tf_rollback = cfg->tf_rollback;
     const tuff_arch_t arch = cfg->arch;
     const int is_lfm = cfg->is_lfm;
@@ -1599,6 +1621,7 @@ static int run_job(const engine_vtable_t *vtable, void *model, job_cfg_t *cfg) {
             spec_t sp;
             spec_init(&sp, vtable, max_context_len, spec_nmax, spec_nmin, spec_k_max, spec_kfix);
             spec_begin_run(&sp, eng);
+            spec_set_engine_cap(&sp, arch, eng);
             spec_print_policy(&sp);
             for (int i = 0; i < n_prompt; ++i) spec_push(&sp, prompt_tokens[i]);
             spec_push(&sp, curr_token);
@@ -1678,6 +1701,7 @@ static int run_job(const engine_vtable_t *vtable, void *model, job_cfg_t *cfg) {
         tm_mark("prefill (prompt forward, incl. graph capture)");
         if (lfm_spec) {
             spec_begin_run(&lfm_sp, eng);
+            spec_set_engine_cap(&lfm_sp, arch, eng);
             for (int i = 0; i < n_prompt; ++i) spec_push(&lfm_sp, prompt_tokens[i]);
             spec_push(&lfm_sp, curr_token);
         }

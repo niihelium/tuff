@@ -279,3 +279,122 @@ extern "C" void gpu_launch_delta_layer_graph_n2(uint32_t delta_layer_idx) {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Lossless verify (2026-10): column 1 of a two-token verify pass replays the single-token layer
+// graphs (bit-identical arithmetic by construction), except that its delta layers must not write
+// the recurrent/conv state - a rejected draft then needs no rollback at all. These are those
+// delta-layer graphs (no-write GDN), plus one graph that replays the state updates of an
+// accepted column 1 with the state-writing kernels.
+// ---------------------------------------------------------------------------
+static cudaGraph_t     g_layer_graphs_nw[64];
+static cudaGraphExec_t g_layer_execs_nw[64];
+static cudaGraph_t     g_commit_graph = NULL;
+static cudaGraphExec_t g_commit_exec = NULL;
+static int g_verify_graphs_ready = 0;
+
+static void nw_delta_layer_body(model_t *m, model_layer_t *layer, uint32_t delta_layer_idx) {
+    const int dim = (int)m->embedding_length;
+    const float eps = m->rms_norm_eps;
+    const float scale_q = 1.0f / sqrtf((float)m->ssm_head_k_dim);
+    if (!tuff_exact() && mmvq_dual_enabled()) {
+        gpu_fused_rms_norm_quant_dev(g_d_norm_x, g_d_res_x, (const float*)layer->attn_norm.dev, dense_quant_buf_ensure(dim), dim, eps);
+    } else {
+        gpu_rms_norm_dev(g_d_norm_x, g_d_res_x, (const float*)layer->attn_norm.dev, dim, eps);
+    }
+    gpu_delta_projections_dev(&layer->attn_qkv, &layer->attn_gate, &layer->ssm_beta, &layer->ssm_alpha, g_d_norm_x, dim);
+    gpu_delta_fused_gdn_dev_nw((int)delta_layer_idx, layer, g_d_res_x, eps, scale_q,
+                               (int)m->ssm_n_k_heads, (int)m->ssm_n_v_heads,
+                               (int)m->ssm_head_k_dim, (int)m->ssm_head_v_dim,
+                               (int)m->ssm_key_dim, (int)m->ssm_value_dim,
+                               (int)m->ssm_qkv_dim, (int)m->ssm_conv_kernel, dim);
+    if (!tuff_exact() && mmvq_dual_enabled()) {
+        gpu_fused_rms_norm_quant_dev(g_d_norm_x, g_d_res_x, (const float*)layer->post_attention_norm.dev, norm_x_q8_ensure(dim), dim, eps);
+    } else {
+        gpu_rms_norm_dev(g_d_norm_x, g_d_res_x, (const float*)layer->post_attention_norm.dev, dim, eps);
+    }
+    gpu_router_logits_dev_only(&layer->ffn_gate_inp, g_d_norm_x, dim, (int)m->expert_count);
+}
+
+static void commit_body(model_t *m) {
+    const float eps = m->rms_norm_eps;
+    const float scale_q = 1.0f / sqrtf((float)m->ssm_head_k_dim);
+    uint32_t di = 0;
+    for (uint32_t l = 0; l < m->block_count - m->nextn_predict_layers; ++l) {
+        model_layer_t *layer = &m->layers[l];
+        if (layer->type == LAYER_TYPE_ATTENTION) continue;
+        gpu_delta_commit_nw((int)di, layer, eps, scale_q,
+                            (int)m->ssm_n_k_heads, (int)m->ssm_n_v_heads,
+                            (int)m->ssm_head_k_dim, (int)m->ssm_head_v_dim,
+                            (int)m->ssm_key_dim, (int)m->ssm_value_dim,
+                            (int)m->ssm_qkv_dim, (int)m->ssm_conv_kernel);
+        di++;
+    }
+}
+
+extern "C" void gpu_capture_verify_graphs(model_t *m) {
+    if (!m || g_verify_graphs_ready || !g_layer_graphs_ready) return;
+    uint32_t di = 0;
+    for (uint32_t l = 0; l < m->block_count - m->nextn_predict_layers; ++l) {
+        model_layer_t *layer = &m->layers[l];
+        if (layer->type == LAYER_TYPE_ATTENTION) continue;
+        // Dry run (no state is written): every lazy cudaMalloc happens before capture.
+        nw_delta_layer_body(m, layer, di);
+        CUDA_CHECK(cudaStreamSynchronize(0));
+        CUDA_CHECK(cudaStreamBeginCapture(0, cudaStreamCaptureModeRelaxed));
+        nw_delta_layer_body(m, layer, di);
+        CUDA_CHECK(cudaStreamEndCapture(0, &g_layer_graphs_nw[l]));
+        CUDA_CHECK(cudaGraphInstantiate(&g_layer_execs_nw[l], g_layer_graphs_nw[l], NULL, NULL, 0));
+        di++;
+    }
+    CUDA_CHECK(cudaStreamBeginCapture(0, cudaStreamCaptureModeRelaxed));
+    commit_body(m);
+    CUDA_CHECK(cudaStreamEndCapture(0, &g_commit_graph));
+    CUDA_CHECK(cudaGraphInstantiate(&g_commit_exec, g_commit_graph, NULL, NULL, 0));
+    g_verify_graphs_ready = 1;
+    gpu_reset_delta_state();
+    gpu_reset_kv();
+}
+
+extern "C" int gpu_has_verify_graphs(void) { return g_verify_graphs_ready; }
+
+// Layer l for verify column 1: the no-write delta graph, or the ordinary graph for attention.
+extern "C" void gpu_launch_layer_graph_nw(uint32_t layer_idx) {
+    if (g_verify_graphs_ready && layer_idx < 64 && g_layer_execs_nw[layer_idx]) {
+        CUDA_CHECK(cudaGraphLaunch(g_layer_execs_nw[layer_idx], 0));
+        g_graph_launches++;
+    } else {
+        gpu_launch_layer_graph(layer_idx);
+    }
+}
+
+extern "C" void gpu_launch_verify_commit(void) {
+    if (g_commit_exec) CUDA_CHECK(cudaGraphLaunch(g_commit_exec, 0));
+}
+
+// Lossless verify: per-column positions live on the device, so selecting column c's position for
+// the attention graphs is a D2D copy (no pageable H2D per layer).
+static int *g_d_vpos = NULL;
+static int *g_h_vpos = NULL;
+extern "C" void gpu_verify_set_positions(int pos0, int n) {
+    if (!g_d_vpos) CUDA_CHECK(cudaMalloc(&g_d_vpos, 8 * sizeof(int)));
+    if (!g_h_vpos) CUDA_CHECK(cudaMallocHost(&g_h_vpos, 8 * sizeof(int)));
+    if (!g_d_pos) { CUDA_CHECK(cudaMalloc(&g_d_pos, sizeof(int))); }
+    // The previous pass's copies out of g_h_vpos are complete: its argmax synchronized.
+    for (int c = 0; c < n && c < 8; ++c) g_h_vpos[c] = pos0 + c;
+    CUDA_CHECK(cudaMemcpyAsync(g_d_vpos, g_h_vpos, (size_t)n * sizeof(int), cudaMemcpyHostToDevice, 0));
+}
+extern "C" void gpu_verify_select_pos(int c) {
+    CUDA_CHECK(cudaMemcpyAsync(g_d_pos, g_d_vpos + c, sizeof(int), cudaMemcpyDeviceToDevice, 0));
+}
+extern "C" void gpu_memcpy_d2d(void *dst, const void *src, size_t bytes) {
+    CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, 0));
+}
+static float *g_d_res_v = NULL;
+extern "C" float *gpu_get_d_res_verify(int dim) {
+    if (!g_d_res_v) CUDA_CHECK(cudaMalloc(&g_d_res_v, (size_t)8 * dim * sizeof(float)));
+    return g_d_res_v;
+}
+extern "C" void gpu_memcpy_h2d(void *dst, const void *src, size_t bytes) {
+    CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, 0));
+}

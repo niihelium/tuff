@@ -18,8 +18,28 @@ struct moe_policy {
     float *lh_probs;
     uint8_t *lh_valid; // [n_layers] 1 if lookahead populated for current step
 
+    // Logical token step. The decay is applied LAZILY per layer: layer_step[l] is the step the
+    // layer's counters have been decayed up to, and every access first multiplies the row by
+    // `decay` once per missed step. Per element that is exactly the sequence of multiplies the
+    // eager per-step loop performed, so the counters are bit-identical, but a layer's state now
+    // depends only on that layer's own observations and the step number. That independence is
+    // what lets a two-column verify pass process token t and t+1 layer by layer and still see,
+    // at every layer, the counters a token-by-token decode would have seen.
     int step_count;
+    int *layer_step;   // [n_layers]
 };
+
+static void policy_sync_layer(moe_policy_t *p, int l) {
+    if (p->decay > 0.0f && p->decay < 1.0f) {
+        float *row = p->ctx_counts + (size_t)l * p->n_experts;
+        while (p->layer_step[l] < p->step_count) {
+            for (int e = 0; e < p->n_experts; ++e) row[e] *= p->decay;
+            p->layer_totals[l] *= p->decay;
+            p->layer_step[l]++;
+        }
+    }
+    p->layer_step[l] = p->step_count;
+}
 
 moe_policy_t* moe_policy_create(int n_layers, int n_experts) {
     if (n_layers <= 0 || n_experts <= 0) return NULL;
@@ -41,8 +61,9 @@ moe_policy_t* moe_policy_create(int n_layers, int n_experts) {
     p->layer_totals = (float*)calloc((size_t)n_layers, sizeof(float));
     p->lh_probs = (float*)calloc(total_experts, sizeof(float));
     p->lh_valid = (uint8_t*)calloc((size_t)n_layers, sizeof(uint8_t));
+    p->layer_step = (int*)calloc((size_t)n_layers, sizeof(int));
 
-    if (!p->ctx_counts || !p->layer_totals || !p->lh_probs || !p->lh_valid) {
+    if (!p->ctx_counts || !p->layer_totals || !p->lh_probs || !p->lh_valid || !p->layer_step) {
         moe_policy_free(p);
         return NULL;
     }
@@ -56,6 +77,7 @@ void moe_policy_free(moe_policy_t *pol) {
     free(pol->layer_totals);
     free(pol->lh_probs);
     free(pol->lh_valid);
+    free(pol->layer_step);
     free(pol);
 }
 
@@ -66,31 +88,52 @@ void moe_policy_reset(moe_policy_t *pol) {
     memset(pol->layer_totals, 0, (size_t)pol->n_layers * sizeof(float));
     memset(pol->lh_probs, 0, total_experts * sizeof(float));
     memset(pol->lh_valid, 0, (size_t)pol->n_layers * sizeof(uint8_t));
+    memset(pol->layer_step, 0, (size_t)pol->n_layers * sizeof(int));
     pol->step_count = 0;
 }
 
 void moe_policy_step(moe_policy_t *pol) {
     if (!pol) return;
-    pol->step_count++;
+    moe_policy_set_step(pol, pol->step_count + 1);
+}
 
-    // Exponential decay of context statistics
-    if (pol->decay > 0.0f && pol->decay < 1.0f) {
-        size_t total = (size_t)pol->n_layers * pol->n_experts;
-        for (size_t i = 0; i < total; ++i) {
-            pol->ctx_counts[i] *= pol->decay;
-        }
-        for (int l = 0; l < pol->n_layers; ++l) {
-            pol->layer_totals[l] *= pol->decay;
-        }
+void moe_policy_set_step(moe_policy_t *pol, int step) {
+    if (!pol) return;
+    if (step != pol->step_count) {
+        // Clear step-local lookahead flags
+        memset(pol->lh_valid, 0, (size_t)pol->n_layers * sizeof(uint8_t));
     }
+    pol->step_count = step;
+}
 
-    // Clear step-local lookahead flags
-    memset(pol->lh_valid, 0, (size_t)pol->n_layers * sizeof(uint8_t));
+int moe_policy_get_step(const moe_policy_t *pol) { return pol ? pol->step_count : 0; }
+
+size_t moe_policy_row_bytes(const moe_policy_t *pol) {
+    return pol ? (size_t)pol->n_experts * sizeof(float) + sizeof(float) + sizeof(int) : 0;
+}
+
+void moe_policy_row_save(const moe_policy_t *pol, int layer, void *buf) {
+    if (!pol || layer < 0 || layer >= pol->n_layers) return;
+    char *b = (char*)buf;
+    memcpy(b, pol->ctx_counts + (size_t)layer * pol->n_experts, (size_t)pol->n_experts * sizeof(float));
+    b += (size_t)pol->n_experts * sizeof(float);
+    memcpy(b, &pol->layer_totals[layer], sizeof(float)); b += sizeof(float);
+    memcpy(b, &pol->layer_step[layer], sizeof(int));
+}
+
+void moe_policy_row_restore(moe_policy_t *pol, int layer, const void *buf) {
+    if (!pol || layer < 0 || layer >= pol->n_layers) return;
+    const char *b = (const char*)buf;
+    memcpy(pol->ctx_counts + (size_t)layer * pol->n_experts, b, (size_t)pol->n_experts * sizeof(float));
+    b += (size_t)pol->n_experts * sizeof(float);
+    memcpy(&pol->layer_totals[layer], b, sizeof(float)); b += sizeof(float);
+    memcpy(&pol->layer_step[layer], b, sizeof(int));
 }
 
 void moe_policy_observe(moe_policy_t *pol, int layer, const int *ids, int n) {
     if (!pol || layer < 0 || layer >= pol->n_layers || !ids || n <= 0) return;
 
+    policy_sync_layer(pol, layer);
     size_t base = (size_t)layer * pol->n_experts;
     for (int i = 0; i < n; ++i) {
         int e = ids[i];
@@ -120,6 +163,7 @@ float moe_policy_score(const moe_policy_t *pol, int layer, int expert) {
     if (!pol || layer < 0 || layer >= pol->n_layers || expert < 0 || expert >= pol->n_experts)
         return 0.0f;
 
+    policy_sync_layer((moe_policy_t*)pol, layer);
     size_t idx = (size_t)layer * pol->n_experts + expert;
     float tot = pol->layer_totals[layer];
     float p_ctx = (tot > 1e-4f) ? (pol->ctx_counts[idx] / tot) : 0.0f;

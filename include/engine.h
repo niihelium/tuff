@@ -74,10 +74,23 @@ typedef struct {
     int      batch_n;
     float   *batch_x;
     float   *router_logits_batch;
+
+    // Lossless two-token verify (engine.c, verify2_*): a pass leaves its expert-cache and
+    // recurrent-state effects open until the caller says how many columns it keeps
+    // (engine_rollback), or until the next engine call (both kept).
+    int      vpend;
+    uint64_t vtok0;              // logical expert-cache token of column 0
+    struct expert_layer_snap *vsnap;
+    float   *d_res_v;            // device [2][dim]: the pass's per-column residual streams
+    double   t_verify;
+    unsigned long long n_verify, n_verify_kept2;
 } engine_t;
 
 int engine_forward_batch(engine_t *eng, const int32_t *tokens, int n, int pos0, int32_t *argmax_out, float *logits_out);
 int engine_rollback(engine_t *eng, int n_keep);
+// 1 when engine_forward_batch(n=2) runs the lossless two-token verify (bit-identical to two
+// engine_forward_token calls, expert-cache trajectory included).
+int engine_exact_verify_available(const engine_t *eng);
 
 void engine_set_sampler(engine_t *eng, const sampler_params_t *params);
 

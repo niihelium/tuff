@@ -1144,23 +1144,12 @@ void gpu_shared_expert_dev(float *d_shexp_out, const model_layer_t *layer, const
     }
 }
 
-void gpu_expert_moe_gateup_swiglu_dev_col(const int *slots, int n, const float *d_norm_x,
-                                          int in_dim, int ffn_dim, int col) {
+static void gateup_swiglu_xq8(const int *slots, int n, const block_q8_1_c *xq8,
+                              int in_dim, int ffn_dim, int col) {
     int   *ex_slots = g_exslots + (size_t)col * g_ex_stride_slots;
     float *ex_dx    = g_exdx    + (size_t)col * g_ex_stride_dx;
     if (slots) {
         CUDA_CHECK(cudaMemcpyAsync(ex_slots, slots, (size_t)n * sizeof(int), cudaMemcpyHostToDevice));
-    }
-
-    block_q8_1_c *xq8;
-    if (col == 0 && g_norm_q8_valid) {
-        // H11: the shared expert already quantized this layer's norm_x into g_d_norm_q8
-        // (same quantize_q8_1_kernel, same layout). Reuse it instead of a second quantize.
-        xq8 = (block_q8_1_c *)g_d_norm_q8;
-    } else {
-        xq8 = (block_q8_1_c *)((char*)g_exgx_q8 + (size_t)col * g_ex_stride_gxq8);
-        launch_quantize_q8_1(d_norm_x, xq8, in_dim);
-        CUDA_CHECK_LAST();
     }
 
     const int nblk = in_dim / QK_K;
@@ -1189,6 +1178,40 @@ void gpu_expert_moe_gateup_swiglu_dev_col(const int *slots, int n, const float *
     const int nq = n * ffn_dim;
     launch_quantize_q8_1(ex_dx, (block_q8_1_c *)((char*)g_exdx_q8 + (size_t)col * g_ex_stride_dxq8), nq);
     CUDA_CHECK_LAST();
+}
+
+void gpu_expert_moe_gateup_swiglu_dev_col(const int *slots, int n, const float *d_norm_x,
+                                          int in_dim, int ffn_dim, int col) {
+    block_q8_1_c *xq8;
+    if (col == 0 && g_norm_q8_valid) {
+        // H11: the shared expert already quantized this layer's norm_x into g_d_norm_q8
+        // (same quantize_q8_1_kernel, same layout). Reuse it instead of a second quantize.
+        xq8 = (block_q8_1_c *)g_d_norm_q8;
+    } else {
+        xq8 = (block_q8_1_c *)((char*)g_exgx_q8 + (size_t)col * g_ex_stride_gxq8);
+        launch_quantize_q8_1(d_norm_x, xq8, in_dim);
+        CUDA_CHECK_LAST();
+    }
+    gateup_swiglu_xq8(slots, n, xq8, in_dim, ffn_dim, col);
+}
+
+// Lossless verify: column `col`'s routed-expert input, saved right after its layer graph while
+// g_d_norm_x / g_d_norm_q8 still hold it - the same bytes gpu_expert_moe_gateup_swiglu_dev_col
+// would have used for that token in plain decode (the shared expert's q8 when valid, else a
+// quantize of norm_x with the same kernel).
+void gpu_expert_save_norm_q8_col(int in_dim, int col) {
+    block_q8_1_c *dst = (block_q8_1_c *)((char*)g_exgx_q8 + (size_t)col * g_ex_stride_gxq8);
+    if (g_norm_q8_valid) {
+        CUDA_CHECK(cudaMemcpyAsync(dst, g_d_norm_q8, (size_t)(in_dim / QK8_1) * sizeof(block_q8_1_c), cudaMemcpyDeviceToDevice));
+    } else {
+        launch_quantize_q8_1(g_d_norm_x, dst, in_dim);
+        CUDA_CHECK_LAST();
+    }
+}
+
+void gpu_expert_moe_gateup_swiglu_dev_saved(const int *slots, int n, int in_dim, int ffn_dim, int col) {
+    gateup_swiglu_xq8(slots, n, (const block_q8_1_c *)((char*)g_exgx_q8 + (size_t)col * g_ex_stride_gxq8),
+                      in_dim, ffn_dim, col);
 }
 
 void gpu_expert_moe_gateup_swiglu_dev(const int *slots, int n, const float *d_norm_x, int in_dim, int ffn_dim) {

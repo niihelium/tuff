@@ -25,8 +25,16 @@ void moe_policy_free(moe_policy_t *pol);
 // Reset context counters for a new sequence / context
 void moe_policy_reset(moe_policy_t *pol);
 
-// Update decay: call at token boundaries
+// Update decay: call at token boundaries (step_count + 1). The decay itself is applied lazily
+// per layer on the next access, bit-identically to an eager per-step multiply.
 void moe_policy_step(moe_policy_t *pol);
+// Set the logical token step directly (the speculative verify pass evaluates token t+j at step t+j).
+void moe_policy_set_step(moe_policy_t *pol, int step);
+int  moe_policy_get_step(const moe_policy_t *pol);
+// Snapshot / restore one layer's counters (a rejected verify column's observations are undone).
+size_t moe_policy_row_bytes(const moe_policy_t *pol);
+void moe_policy_row_save(const moe_policy_t *pol, int layer, void *buf);
+void moe_policy_row_restore(moe_policy_t *pol, int layer, const void *buf);
 
 // Observe authoritative routing decision for a layer
 void moe_policy_observe(moe_policy_t *pol, int layer, const int *ids, int n);

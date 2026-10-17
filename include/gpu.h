@@ -189,6 +189,23 @@ int  gpu_expert_cache_les_prefetch(const model_t *m);
 // it cudaEventQuery()s finished fills and publishes their slots into the lookup map. Neither
 // call ever waits on PCIe. See the block comment in gpu.cu for the race-freedom argument.
 int  gpu_expert_cache_bgfill(const model_t *m, uint32_t layer, int expert);
+// Lossless speculation (per-layer cache partition, see expert_cache.cu): the logical token clock
+// every cache operation is stamped with, the split logical/physical fill, GPU-side readiness
+// waits, and per-layer snapshots for undoing a rejected verify column.
+void     gpu_expert_cache_set_token(uint64_t tok);
+uint64_t gpu_expert_cache_get_token(void);
+void     gpu_expert_cache_token_end(void);
+void     gpu_expert_cache_layer_begin(uint32_t layer);
+int      gpu_expert_cache_fill_reserve(const model_t *m, uint32_t layer, int expert, int group);
+void     gpu_expert_cache_fill_push(int group);
+void     gpu_expert_cache_fill_commit(int group);
+void     gpu_expert_cache_fill_drop(int group);
+void     gpu_expert_cache_wait_slots(const int *slots, int n);
+typedef struct expert_layer_snap expert_layer_snap_t;
+expert_layer_snap_t *gpu_expert_cache_snap_alloc(void);
+void     gpu_expert_cache_snap_layer(expert_layer_snap_t *sn, uint32_t layer);
+void     gpu_expert_cache_restore_layer(const expert_layer_snap_t *sn, uint32_t layer);
+void     gpu_expert_cache_snap_free(expert_layer_snap_t *sn);
 void gpu_expert_cache_bgfill_poll(void);
 void gpu_expert_cache_bgfill_poll_ready(void);
 void gpu_expert_cache_bgfill_stats(unsigned long long *issued, unsigned long long *committed);
@@ -397,6 +414,25 @@ void  gpu_router_logits_copy_out_n2(float *logits0, float *nx0, float *logits1, 
                                     const float *d_norm_x2, int in_dim, int n_expert);
 // Two-column delta-layer graphs: ~50 launches per layer collapse into one.
 int   gpu_has_delta_graphs_n2(void);
+// Lossless two-token verify (see graphs.cu): no-write delta graphs for column 1 and the commit
+// replay of an accepted column 1's recurrent-state updates.
+void  gpu_capture_verify_graphs(model_t *m);
+int   gpu_has_verify_graphs(void);
+void  gpu_launch_layer_graph_nw(uint32_t layer_idx);
+void  gpu_launch_verify_commit(void);
+void  gpu_verify_set_positions(int pos0, int n);
+void  gpu_verify_select_pos(int c);
+void  gpu_memcpy_d2d(void *dst, const void *src, size_t bytes);
+void  gpu_memcpy_h2d(void *dst, const void *src, size_t bytes);
+float *gpu_get_d_res_verify(int dim);
+void  gpu_expert_save_norm_q8_col(int in_dim, int col);
+void  gpu_expert_moe_gateup_swiglu_dev_saved(const int *slots, int n, int in_dim, int ffn_dim, int col);
+void  gpu_delta_fused_gdn_dev_nw(int layer_idx, const model_layer_t *L, float *d_res_x, float eps, float scale_q,
+                                 int n_k_heads, int n_v_heads, int head_k_dim, int head_v_dim,
+                                 int key_dim, int value_dim, int qkv_dim, int conv_kernel, int dim);
+void  gpu_delta_commit_nw(int layer_idx, const model_layer_t *L, float eps, float scale_q,
+                          int n_k_heads, int n_v_heads, int head_k_dim, int head_v_dim,
+                          int key_dim, int value_dim, int qkv_dim, int conv_kernel);
 void  gpu_capture_delta_graphs_n2(model_t *m);
 void  gpu_launch_delta_layer_graph_n2(uint32_t delta_layer_idx);
 const float *gpu_get_shexp2_dev_ptr(void);
