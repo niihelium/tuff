@@ -43,7 +43,7 @@ Decode speed (RTX 3070 Laptop, `-c 1024 -n 128 --runs 3`, `balanced` profile, in
 
 | Thing | Path / value |
 | :--- | :--- |
-| Repo | `/home/nii/workspace/tuf` (branch `lfm25-phase1`) |
+| Repo | `/home/nii/workspace/transcendence/runtime` (branch `lfm25-phase1`) |
 | llama.cpp (oracle + linked lib) | `/home/nii/workspace/llama.cpp`, commit `620d2225`, libs in `build/bin` |
 | gguf-py (FP64 ref, packers) | `/home/nii/workspace/llama.cpp/gguf-py` (imported by path) |
 | Python with numpy | `/home/nii/workspace/local-llm/.venv/bin/python` — run with `-I`. System `python3` has **no numpy**. |
@@ -196,7 +196,7 @@ Current results (stage 3 shift-invariant; plain-RMS values from before `a9155e3`
 ## 5. Reproduce everything
 
 ```bash
-cd /home/nii/workspace/tuf
+cd /home/nii/workspace/transcendence/runtime
 cmake -S . -B build && cmake --build build -j16 --target tuff lfm25-llama-ref lfm25-router-test lfm25-moe-ffn-test
 cmake -S . -B build-sanitize -DTUFF_PER_THREAD_STREAM=OFF && cmake --build build-sanitize -j16 --target tuff lfm25-router-test lfm25-moe-ffn-test
 ```
@@ -250,7 +250,7 @@ Speed:
 ./build/tuff --model $M --prompt Hello -c 1024 -n 128 --temp 0 --runs 3          # "Pipeline Generation Speed"
 /home/nii/workspace/llama.cpp/build/bin/llama-bench -m $M -ngl 99 -p 0 -n 128 -r 3   # 24B: add -ot "ffn_(up|down|gate)_exps=CPU"
 # formal A/B (needs performance power profile):
-MODEL=$M TUFF_ARGS="-c 1024" N=128 WARMUP=32 RUNS=3 ./scripts/ab_interleaved.sh /home/nii/workspace/tuf-base /home/nii/workspace/tuf 6
+MODEL=$M TUFF_ARGS="-c 1024" N=128 WARMUP=32 RUNS=3 ./scripts/ab_interleaved.sh /home/nii/workspace/tuf-base /home/nii/workspace/transcendence/runtime 6
 ```
 
 Regenerate references (byte-reproducible; recipe = command, llama.cpp commit, model sha256, prompt tokens, GPU):

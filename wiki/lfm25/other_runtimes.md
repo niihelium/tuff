@@ -1,6 +1,6 @@
 # Comparative Analysis of Inference Runtimes for LFM2.5 Architecture
 
-This document provides a comparative architectural study of how leading edge and local inference engines implement Liquid AI's hybrid Short-Convolution + Attention + Sparse MoE architecture, specifically evaluating [`llama.cpp`](file:///home/nii/workspace/llama.cpp), [`colibri`](file:///home/nii/workspace/colibri), and [`Strata`](file:///home/nii/workspace/Strata), and deriving the optimal implementation strategy for [`tuf`](file:///home/nii/workspace/tuf).
+This document provides a comparative architectural study of how leading edge and local inference engines implement Liquid AI's hybrid Short-Convolution + Attention + Sparse MoE architecture, specifically evaluating [`llama.cpp`](file:///home/nii/workspace/llama.cpp), [`colibri`](file:///home/nii/workspace/colibri), and [`Strata`](file:///home/nii/workspace/Strata), and deriving the optimal implementation strategy for [`tuf`](../../README.md).
 
 ---
 

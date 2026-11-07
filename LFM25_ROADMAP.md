@@ -1,6 +1,6 @@
 # LFM2.5 Implementation Roadmap & Engineering Architecture for Tuff
 
-This document specifies the updated architectural plan, phased implementation milestones, validation gates, and optimization roadmap for executing **Liquid AI LFM2.5 models** (both Dense backbones and the **LFM2.5-24B-A2B** Sparse MoE) within the [`tuf`](file:///home/nii/workspace/tuf) runtime.
+This document specifies the updated architectural plan, phased implementation milestones, validation gates, and optimization roadmap for executing **Liquid AI LFM2.5 models** (both Dense backbones and the **LFM2.5-24B-A2B** Sparse MoE) within the [`tuf`](README.md) runtime.
 
 Target Hardware Profile:
 * **GPU**: NVIDIA GeForce RTX 3070 Laptop (8 GB VRAM / ~7,880 MB usable, GA104, sm_86, ~330 GB/s sustained bandwidth).
@@ -9,12 +9,12 @@ Target Hardware Profile:
 * **Storage**: Dual NVMe PCIe SSDs.
 
 Reference Documentation:
-* [Architecture & Dispatch Manual](file:///home/nii/workspace/tuf/wiki/architecture.md)
-* [Comparative Analysis of Runtimes](file:///home/nii/workspace/tuf/wiki/lfm25/other_runtimes.md)
-* [LFM2.5-1.2B Specification](file:///home/nii/workspace/tuf/wiki/lfm25/1_2B.md)
-* [LFM2.5-2.6B Specification](file:///home/nii/workspace/tuf/wiki/lfm25/2_6b.md)
-* [LFM2.5-8B-A1B Specification](file:///home/nii/workspace/tuf/wiki/lfm25/8b-a1b.md)
-* [LFM2.5-24B-A2B Specification](file:///home/nii/workspace/tuf/wiki/lfm25/24b-a2b.md)
+* [Architecture & Dispatch Manual](wiki/architecture.md)
+* [Comparative Analysis of Runtimes](wiki/lfm25/other_runtimes.md)
+* [LFM2.5-1.2B Specification](wiki/lfm25/1_2B.md)
+* [LFM2.5-2.6B Specification](wiki/lfm25/2_6b.md)
+* [LFM2.5-8B-A1B Specification](wiki/lfm25/8b-a1b.md)
+* [LFM2.5-24B-A2B Specification](wiki/lfm25/24b-a2b.md)
 
 > **Ordering note:** the [Qwen3.5-MoE speculative-decoding roadmap](QWEN35_ROADMAP.md) (N-token verify, lookup-drafter upgrades, DFlash2 drafter, borrowed from HyperQwen) is to be implemented **after this LFM2.5 roadmap is complete**. It reuses work from here: Task 5.3 (MoE verify over the expert union), Task 6.1 (byte-identical CPU miss path) and Task 6.2 (`src/moe_policy.{c,h}`). Build and prove those on LFM2.5 first, then port them to the Qwen engine.
 
