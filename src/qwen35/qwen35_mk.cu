@@ -1189,23 +1189,16 @@ constexpr int TC_CHUNKT = 32;
 constexpr int TC_NS = 4;
 constexpr int TC_RING_BYTES = TC_NS * TC_CHUNKT * 544;
 
-__device__ __forceinline__ uint32_t cvt_pair(uint32_t v) {
-    __half2 h = __floats2half2_rn((float)(int8_t)(v & 0xff), (float)(int8_t)((v >> 8) & 0xff));
-    return *reinterpret_cast<uint32_t *>(&h);
-}
 // int8 x4 -> two f16x2 (bytes 0,1 -> lo; bytes 2,3 -> hi), exact: PRMT builds the f16 1024 + (q + 128)
-// and one HSUB2 removes 1152.  Same values as cvt_pair (I2F is quarter rate on sm_86).
+// and one HSUB2 removes 1152.  Equal to the I2F conversion for all 65,536 byte pairs (I2F is quarter
+// rate on sm_86).
 __device__ __forceinline__ void cvt4(uint32_t p, uint32_t &lo, uint32_t &hi) {
-#ifdef Q35_CVT_I2F
-    lo = cvt_pair(p); hi = cvt_pair(p >> 16);
-#else
     const uint32_t x = p ^ 0x80808080u;
     const uint32_t a = __byte_perm(x, 0x6464u, 0x5140), b = __byte_perm(x, 0x6464u, 0x5342);
     const __half2 bias = __halves2half2(__ushort_as_half(0x6480), __ushort_as_half(0x6480));
     __half2 ha = __hsub2(*reinterpret_cast<const __half2 *>(&a), bias);
     __half2 hb = __hsub2(*reinterpret_cast<const __half2 *>(&b), bias);
     lo = *reinterpret_cast<uint32_t *>(&ha); hi = *reinterpret_cast<uint32_t *>(&hb);
-#endif
 }
 __device__ __forceinline__ void mma_m16n8k16(float d[4], uint32_t a0, uint32_t a1,
                                              uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
@@ -1215,20 +1208,9 @@ __device__ __forceinline__ void mma_m16n8k16(float d[4], uint32_t a0, uint32_t a
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
-// vecf is written inside this kernel (by every CTA, identical values) and read by the GEMVs of
-// the same kernel, so ld.global.nc (__ldg) is not allowed.  A plain ld.global.ca read keeps the
-// L1 broadcast across the 16 warps of the CTA; it is coherent here because the reading CTA stores
-// the whole buffer itself before the __syncthreads that precedes its reads, and no CTA stores
-// again until every CTA has passed vdone_arrive() (see vdone_wait).
-__device__ __forceinline__ uint32_t ld_vecf(const uint32_t *p) {
-#ifdef Q35_VECF_LDG
-    return __ldg(p);   // experiment only: ld.global.nc on data written in-kernel is undefined
-#elif defined(Q35_VECF_CA)
-    return __ldca(p);   // ld.global.ca: an ordinary (non-.nc) load that stays L1-cached
-#else
-    return __ldcg(p);   // ld.global.cg: L2-coherent (slices of vecf are written by other CTAs)
-#endif
-}
+// vecf is written inside this kernel (each CTA writes a slice) and read by the GEMVs of the same
+// kernel, so ld.global.nc (__ldg) is not allowed; ld.global.cg is L2-coherent.
+__device__ __forceinline__ uint32_t ld_vecf(const uint32_t *p) { return __ldcg(p); }
 // fragment-major activation index (u32): [k/8][n-tile][lane], lane = (entry%8)*4 + (k%8)/2
 __device__ __forceinline__ int vf_idx(int k, int e) {
     return ((k >> 3) * Q35_NTMAX + (e >> 3)) * 32 + ((e & 7) << 2) + ((k & 7) >> 1);
@@ -1637,13 +1619,10 @@ __device__ void prologue_act_s(uint32_t *vecf, uint32_t e, int nt, unsigned vt, 
 
 // ------------------------------------------------------------------ core ops (per entry)
 // Task = (entry, head, 32 value columns); state is [head][v][k] so a column is one 512-B row.
-#ifndef Q35_GDN_CPW
-#define Q35_GDN_CPW 2   // value columns per warp per task (2 = 32-column slices; 8 = one task per head was not faster)
-#endif
 template <int BT>
 __device__ void gdn_op_b(const q35_layer_ptrs_t &L, int nt, uint32_t e, float *sm,
                          const int *positions, const int *slots) {
-    constexpr int CPW = Q35_GDN_CPW;
+    constexpr int CPW = 2;   // value columns per warp per task (32-column slices; 8 = one task per head was not faster)
     constexpr int COLS = N_CONSUMER_WARPS * CPW;   // value columns per task
     constexpr int SLICES = LIN_DV / COLS;
     static_assert(SLICES * COLS == LIN_DV && 256 + COLS < N_CONSUMERS, "gdn task shape");
@@ -1743,16 +1722,11 @@ __device__ void gdn_op_b(const q35_layer_ptrs_t &L, int nt, uint32_t e, float *s
 }
 
 // Batch path split rule: a function of the position only (never of BT), so batch invariance (G4)
-// holds.  Chunks of at least Q35_ATT_B_CHUNK positions: a batch has enough (entry, kv-head) tasks
+// holds.  Chunks of at least ATT_B_CHUNK positions: a batch has enough (entry, kv-head) tasks
 // to fill the grid, so many tiny splits only add per-task latency and merge passes.
-#ifndef Q35_ATT_KVB
-#define Q35_ATT_KVB 1   // 2 and 4 raise register pressure and slow every op (B=32: -3% / -14%)
-#endif
-#ifndef Q35_ATT_B_CHUNK
-#define Q35_ATT_B_CHUNK 128
-#endif
+constexpr int ATT_B_CHUNK = 128;
 __device__ __forceinline__ void attn_split_b(int n, int &splits, int &chunk) {
-    splits = min(MAX_SPLITS, (n + Q35_ATT_B_CHUNK - 1) / Q35_ATT_B_CHUNK);
+    splits = min(MAX_SPLITS, (n + ATT_B_CHUNK - 1) / ATT_B_CHUNK);
     chunk = (n + splits - 1) / splits;
     splits = (n + chunk - 1) / chunk;
 }
@@ -1778,7 +1752,7 @@ __device__ void attn_op_b(const q35_layer_ptrs_t &L, int nt, uint32_t e, float *
     const size_t ms = (size_t)P.max_seq;
     // positions per warp with loads in flight together; a warp still visits t0+warp+16k in increasing k,
     // so the online-softmax order (and the result) does not depend on KVB
-    constexpr int KVB = Q35_ATT_KVB;
+    constexpr int KVB = 1;   // 2 and 4 raise register pressure and slow every op (B=32: -3% / -14%)
     int en, g, sp, splits, chunk;
     for (int task = blockIdx.x; attn_task_b(task, nt, positions, en, g, sp, splits, chunk); task += gridDim.x) {
         const int pos = positions[en];
@@ -2131,15 +2105,10 @@ __device__ void gemv_cta_f(const void *Wv, const uint32_t *vecf, int n_groups, i
                 ntl++;
             }
         };
-#ifndef Q35_BB_AFTER_WAIT
         load_bb();
-#endif
         if (u + TC_NS <= total) cp_wait<TC_NS - 1>();
         else cp_wait<0>();
         __syncthreads();
-#ifdef Q35_BB_AFTER_WAIT
-        load_bb();
-#endif
         ntl = 0;
         for (int j = warp; j < nt; j += N_CONSUMER_WARPS) {
             const char *gt = slot + j * GROUP_BYTES;
@@ -2171,31 +2140,6 @@ __device__ void gemv_cta_f(const void *Wv, const uint32_t *vecf, int n_groups, i
             ntl++;
         }
         __syncthreads();
-#ifdef Q35_RED_SERIAL
-        if (u + TC_NS < total) issue(u + TC_NS, u % TC_NS);
-        if (c == nch - 1) {
-            const int g = chunk_g(u);
-#pragma unroll
-            for (int n = 0; n < NT; n++) {
-                float *rb = red + (warp * 32 + lane) * 4;
-                rb[0] = acc[n][0]; rb[1] = acc[n][1]; rb[2] = acc[n][2]; rb[3] = acc[n][3];
-                __syncthreads();
-                if (warp == 0) {
-                    float fin[4] = {0.f, 0.f, 0.f, 0.f};
-                    for (int q = 0; q < N_CONSUMER_WARPS; q++) {
-                        const float *rp = red + (q * 32 + lane) * 4;
-                        fin[0] += rp[0]; fin[1] += rp[1]; fin[2] += rp[2]; fin[3] += rp[3];
-                    }
-                    epi(g, n, fin);
-                }
-                __syncthreads();
-            }
-#pragma unroll
-            for (int n = 0; n < NT; n++)
-#pragma unroll
-                for (int j = 0; j < 4; j++) acc[n][j] = 0.f;
-        }
-#else
         // E2: reduce all NT n-tiles of a group at once (tiles 0..1 in `red`, tiles 2..3 in the ring slot
         // just consumed), warp n sums tile n.  Same order (warps 0..15) as the serial version, so the
         // result is bitwise identical; 2 barriers per group instead of 2*NT.
@@ -2225,27 +2169,16 @@ __device__ void gemv_cta_f(const void *Wv, const uint32_t *vecf, int n_groups, i
                 for (int j = 0; j < 4; j++) acc[n][j] = 0.f;
         }
         if (u + TC_NS < total) issue(u + TC_NS, u % TC_NS);
-#endif
     }
 }
 
-#ifndef Q35_LM32_GPW
-#define Q35_LM32_GPW 2
-#endif
-#ifndef Q35_LM32_DEPTH
-#define Q35_LM32_DEPTH 2   // 4 spills more: LM head 1002 -> 941 us at B=32 (0.8B)
-#endif
 // H-ks: k-split GEMV without a CTA ring.  Warp w owns k-tiles t = w + 16*i (i < KPW = n_kt/16) of every
 // row group of this CTA -- exactly the tiles and the order it had in gemv_cta_f -- and streams their A
 // fragments straight from global with a D-deep register pipeline that runs across group boundaries, so
 // there is no barrier per 32-tile chunk.  The cross-warp reduction (same 0..15 order, warp n sums n-tile n)
 // is double-buffered in the (now unused) ring smem: one barrier per group.  Bitwise identical to gemv_cta_f.
-#ifndef Q35_KS_MIN_BT
-#define Q35_KS_MIN_BT 16     // smallest BT that uses the k-split path (64 = never)
-#endif
-#ifndef Q35_KS_D
-#define Q35_KS_D 2           // register pipeline depth (3 and 8 were slower: spills)
-#endif
+constexpr int KS_MIN_BT = 16;   // smallest BT that uses the k-split path
+constexpr int KS_D = 2;         // register pipeline depth (3 and 8 were slower: spills)
 template <int BT, int D, bool HOIST, class Epi>
 __device__ void gemv_ks_f(const void *Wv, const uint32_t *vecf, int n_groups, int n_kt, char *rbuf, Epi epi) {
     constexpr int NT = (BT + 7) / 8;
@@ -2358,14 +2291,14 @@ __device__ void gemv_frag(const void *W, const uint32_t *vecf, int n_groups, int
                           char *ring, float *red, Epi epi) {
     if (n_groups >= 64 * GRID) {
         if constexpr (BT <= 16) gemv_direct_f<BT, 4, 2>(W, vecf, n_groups, n_kt, epi);
-        else gemv_direct_f<BT, Q35_LM32_GPW, Q35_LM32_DEPTH>(W, vecf, n_groups, n_kt, epi);
+        else gemv_direct_f<BT, 2, 2>(W, vecf, n_groups, n_kt, epi);   // depth 4 spills more (LM head +6%)
     } else {
         // Both paths compute bitwise-identical results, so the choice may depend on BT (G4 holds).
         // Ring: more weight bytes in flight (wins at BT <= 8, -4..5%); k-split: no per-chunk barrier
         // (wins at BT >= 16: B=32 2B +14%, 0.8B +6%).  Deeper k-split pipelines spill.
-        if constexpr (BT >= Q35_KS_MIN_BT) {
-            if (n_kt <= 2 * N_CONSUMER_WARPS) gemv_ks_f<BT, Q35_KS_D, true>(W, vecf, n_groups, n_kt, ring, epi);
-            else gemv_ks_f<BT, Q35_KS_D, false>(W, vecf, n_groups, n_kt, ring, epi);
+        if constexpr (BT >= KS_MIN_BT) {
+            if (n_kt <= 2 * N_CONSUMER_WARPS) gemv_ks_f<BT, KS_D, true>(W, vecf, n_groups, n_kt, ring, epi);
+            else gemv_ks_f<BT, KS_D, false>(W, vecf, n_groups, n_kt, ring, epi);
         } else {
             gemv_cta_f<BT>(W, vecf, n_groups, n_kt, ring, red, epi);
         }
