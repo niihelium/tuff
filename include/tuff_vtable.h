@@ -14,7 +14,8 @@ typedef enum {
     TUFF_ARCH_UNKNOWN = 0,
     TUFF_ARCH_QWEN35MOE,   // Qwen3.6 / Qwen3.5 hybrid DeltaNet + MoE
     TUFF_ARCH_LFM2,        // Liquid AI LFM2 / LFM2.5 Dense (ShortConv + GQA)
-    TUFF_ARCH_LFM2MOE      // Liquid AI LFM2.5 MoE (ShortConv + GQA + Sparse MoE)
+    TUFF_ARCH_LFM2MOE,     // Liquid AI LFM2.5 MoE (ShortConv + GQA + Sparse MoE)
+    TUFF_ARCH_QWEN35       // Qwen3.5 dense hybrid DeltaNet + gated attention
 } tuff_arch_t;
 
 // Architecture detection function (reads GGUF general.architecture once)

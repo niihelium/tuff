@@ -37,6 +37,63 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+# ---------------------------------------------------------------------------------------------
+# BENCH=batch : A/B two qwen35-batch-bench binaries (engine batch path), same alternating-order
+# protocol.  Each measurement is `qwen35-batch-bench --bench B --steps STEPS --rounds BROUNDS` and the
+# number parsed is the "P2 engine: B=N aggregate X tok/s" line (median of BROUNDS inside the tool).
+#   BENCH=batch BIN_A=/path/a BIN_B=/path/b MODEL=m.gguf BATCH_B=8 ./scripts/ab_interleaved.sh [rounds]
+# Env: BATCH_B (default 8)  STEPS (64)  BROUNDS (3)  GPU_LOCK (flock file wrapped around every run)
+# Verdict uses a t-based 95% CI of the mean paired ratio B/A (the +/-2sd band is printed as well).
+if [ "${BENCH:-}" = "batch" ]; then
+    BIN_A="${BIN_A:?BENCH=batch needs BIN_A}"; BIN_B="${BIN_B:?BENCH=batch needs BIN_B}"
+    MODEL="${MODEL:?BENCH=batch needs MODEL (gguf)}"
+    BB="${BATCH_B:-8}"; ST="${STEPS:-64}"; BR="${BROUNDS:-3}"; ROUNDS="${1:-5}"
+    for t in "$BIN_A" "$BIN_B"; do [ -x "$t" ] || { echo "missing $t" >&2; exit 2; }; done
+    if ! ./scripts/check_power_state.sh >/dev/null 2>&1; then
+        echo "ABORT: machine throttled -- see ./scripts/check_power_state.sh" >&2
+        [ "${FORCE:-0}" = "1" ] || exit 1
+    fi
+    gstate() { nvidia-smi --query-gpu=temperature.gpu,clocks.sm,power.draw --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' '; }
+    bmeasure() {   # echoes "tok/s<TAB>gpu_state_before"
+        local bin="$1" st log tok
+        st=$(gstate); log=$(mktemp)
+        ${GPU_LOCK:+flock "$GPU_LOCK"} "$bin" --model "$MODEL" --bench "$BB" --steps "$ST" --rounds "$BR" >"$log" 2>&1
+        tok=$(awk '/^P2 engine:/{for(i=1;i<=NF;i++) if($i=="aggregate"){print $(i+1); exit}}' "$log")
+        grep -q WATCHDOG "$log" && tok="ERR"
+        rm -f "$log"
+        printf '%s\t%s' "${tok:-ERR}" "$st"
+    }
+    echo "batch A/B  A=$BIN_A  B=$BIN_B"
+    echo "protocol: B=$BB --steps $ST --rounds $BR (median inside), $ROUNDS rounds, order alternates; gpu=temp_C,sm_MHz,power_W"
+    printf '%-6s %-6s %-10s %-18s %-10s %-18s %-8s\n' round order A_tok/s A_gpu B_tok/s B_gpu ratio
+    res=$(mktemp)
+    for r in $(seq 1 "$ROUNDS"); do
+        if [ $((r % 2)) -eq 1 ]; then
+            order="A,B"; IFS=$'\t' read -r a_tok a_st < <(bmeasure "$BIN_A"); IFS=$'\t' read -r b_tok b_st < <(bmeasure "$BIN_B")
+        else
+            order="B,A"; IFS=$'\t' read -r b_tok b_st < <(bmeasure "$BIN_B"); IFS=$'\t' read -r a_tok a_st < <(bmeasure "$BIN_A")
+        fi
+        ratio=$(awk -v a="$a_tok" -v b="$b_tok" 'BEGIN{ if(a+0>0 && b+0>0) printf "%.4f", b/a; else print "ERR" }')
+        printf '%-6s %-6s %-10s %-18s %-10s %-18s %-8s\n' "$r" "$order" "$a_tok" "$a_st" "$b_tok" "$b_st" "$ratio"
+        echo "$ratio" >> "$res"
+    done
+    echo
+    awk 'BEGIN{split("12.706 4.303 3.182 2.776 2.571 2.447 2.365 2.306 2.262 2.228 2.201 2.179 2.160 2.145 2.131 2.120 2.110 2.101 2.093 2.086 2.080 2.074 2.069 2.064 2.060 2.056 2.052 2.048 2.045",T," ")}
+    $1=="ERR"{e++; next} {n++; s+=$1; ss+=$1*$1} END {
+        if (e>0) printf "ERROR rounds: %d of %d excluded\n", e, n+e;
+        if (n<2) { print "VERDICT: INVALID -- not enough valid rounds."; exit }
+        m=s/n; sd=sqrt((ss-n*m*m)/(n-1)); tq=(n-1<=29)?T[n-1]:1.96; h=tq*sd/sqrt(n);
+        printf "paired ratio B/A over %d rounds: %.4f (%+.2f%%), sd %.4f\n", n, m, (m-1)*100, sd;
+        printf "95%% CI of the mean (t=%.3f): [%.4f, %.4f] = [%+.2f%%, %+.2f%%]   (+/-2sd band: [%.4f, %.4f])\n", tq, m-h, m+h, (m-h-1)*100, (m+h-1)*100, m-2*sd, m+2*sd;
+        if (e>0) print "VERDICT: INVALID -- " e " round(s) errored.";
+        else if (m-h > 1.0) print "VERDICT: B is faster than A.";
+        else if (m+h < 1.0) print "VERDICT: B is SLOWER than A.";
+        else print "VERDICT: interval includes 1.0 -- the difference is NOT established.";
+    }' "$res"
+    rm -f "$res"
+    exit 0
+fi
+
 A="${1:?usage: $0 <treeA> <treeB> [rounds]}"
 B="${2:?usage: $0 <treeA> <treeB> [rounds]}"
 ROUNDS="${3:-4}"

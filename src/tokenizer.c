@@ -585,8 +585,10 @@ tokenizer_t* tokenizer_init(const gguf_context_t *gguf) {
 
     tok->bos_id = (int)tuff_gguf_get_kv_u32(gguf, "tokenizer.ggml.bos_token_id", (uint32_t)-1);
     tok->eos_id = (int)tuff_gguf_get_kv_u32(gguf, "tokenizer.ggml.eos_token_id", (uint32_t)-1);
-    if (tok->bos_id < 0 || tok->eos_id < 0) {
-        fprintf(stderr, "[FATAL ERROR] tokenizer.ggml.bos_token_id / eos_token_id missing from GGUF\n");
+    // Qwen3.5 (GPT-2 BPE, no BOS) legitimately omits bos_token_id; it must not be
+    // prepended.  Only EOS is required.  Models that do carry a BOS keep it.
+    if (tok->eos_id < 0) {
+        fprintf(stderr, "[FATAL ERROR] tokenizer.ggml.eos_token_id missing from GGUF\n");
         exit(EXIT_FAILURE);
     }
 
@@ -604,22 +606,34 @@ tokenizer_t* tokenizer_init(const gguf_context_t *gguf) {
                 if (strcmp(pre_kv->val.str, llama3_group[i]) == 0) { tok->add_bos = true; break; }
         }
     }
+    if (tok->bos_id < 0) tok->add_bos = false;
     const gguf_kv_t *add_eos_kv = tuff_gguf_get_kv(gguf, "tokenizer.ggml.add_eos_token");
     tok->add_eos = add_eos_kv && add_eos_kv->type == GGUF_TYPE_BOOL && add_eos_kv->val.b;
 
     build_byte_maps(tok);
 
-    // Collect CONTROL-type tokens (e.g. <|im_start|>) for literal pre-split matching.
+    // Collect CONTROL and (for qwen35 dense) USER_DEFINED tokens for literal pre-split
+    // matching.  llama.cpp's tokenizer_st_partition treats both token types as special;
+    // Qwen3.5 needs USER_DEFINED for <think>/<tool_call>.  Other architectures keep the
+    // old CONTROL-only behaviour so their token streams are unchanged.
+    tok->user_defined_special = 0;
+    {
+        const gguf_kv_t *arch = tuff_gguf_get_kv(gguf, "general.architecture");
+        if (arch && arch->type == GGUF_TYPE_STRING && strcmp(arch->val.str, "qwen35") == 0)
+            tok->user_defined_special = 1;
+    }
     tok->n_special = 0;
     for (uint32_t i = 0; i < tok->vocab_size; ++i) {
-        if (tok->token_type[i] == 3 /* LLAMA_TOKEN_TYPE_CONTROL */) tok->n_special++;
+        if (tok->token_type[i] == 3 /* LLAMA_TOKEN_TYPE_CONTROL */ ||
+            (tok->user_defined_special && tok->token_type[i] == 4 /* USER_DEFINED */))
+            tok->n_special++;
     }
     tok->special_strs = (char**)malloc((tok->n_special ? tok->n_special : 1) * sizeof(char*));
     tok->special_lens = (size_t*)malloc((tok->n_special ? tok->n_special : 1) * sizeof(size_t));
     tok->special_ids  = (int32_t*)malloc((tok->n_special ? tok->n_special : 1) * sizeof(int32_t));
     uint32_t sp_i = 0;
     for (uint32_t i = 0; i < tok->vocab_size; ++i) {
-        if (tok->token_type[i] == 3) {
+        if (tok->token_type[i] == 3 || (tok->user_defined_special && tok->token_type[i] == 4)) {
             tok->special_strs[sp_i] = tok->tokens[i];
             tok->special_lens[sp_i] = strlen(tok->tokens[i]);
             tok->special_ids[sp_i] = (int32_t)i;
@@ -682,7 +696,7 @@ const char* tokenizer_decode(const tokenizer_t *tok, int32_t token_id) {
     if (!piece) { buf[0] = '\0'; return buf; }
 
     int32_t ttype = tok->token_type ? tok->token_type[token_id] : 1;
-    if (ttype == 3 /* CONTROL */) {
+    if (ttype == 3 /* CONTROL */ || (tok->user_defined_special && ttype == 4 /* USER_DEFINED */)) {
         snprintf(buf, sizeof(buf), "%s", piece);
         return buf;
     }

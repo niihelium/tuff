@@ -21,8 +21,26 @@
 #include <limits.h>
 #include "lfm25_model.h"
 #include "dflash.h"
+#include "qwen35.h"
 
 #define TF_MAX_BATCH 8   // == LFM25_MAX_BATCH
+
+// --prompt-file: read the whole prompt into a heap buffer (the process is a CLI; the buffer
+// lives for the rest of the run, exactly like argv).
+static char *read_prompt_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "[Tuff] ERROR: cannot open --prompt-file %s\n", path); return NULL; }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long n = ftell(f);
+    if (n < 0) { fclose(f); return NULL; }
+    rewind(f);
+    char *buf = (char*)malloc((size_t)n + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t got = fread(buf, 1, (size_t)n, f);
+    fclose(f);
+    buf[got] = 0;
+    return buf;
+}
 
 static void print_usage(const char *prog) {
     fprintf(stderr,
@@ -31,6 +49,7 @@ static void print_usage(const char *prog) {
         "Options:\n"
         "  --model <path>              model GGUF path\n"
         "  --prompt, -p <str>          prompt string for single generation\n"
+        "  --prompt-file <path>        read the prompt from a UTF-8 file (avoids the ARG_MAX limit)\n"
         "  -c, --ctx-size, --max-seq   maximum context sequence length (default: 4096)\n"
         "  --fill-ram, --fill-vram     inflate context to maximize VRAM utilization\n"
         "  -n <tokens>                 number of tokens to generate (default: 128)\n"
@@ -769,6 +788,11 @@ static int parse_args(int argc, char **argv, job_cfg_t *cfg, int *rc) {
         } else if ((strcmp(argv[i], "--prompt") == 0 || strcmp(argv[i], "-p") == 0) && i + 1 < argc) {
             cfg->prompt = argv[++i];
             cfg->prompt_specified = true;
+        } else if (strcmp(argv[i], "--prompt-file") == 0 && i + 1 < argc) {
+            char *buf = read_prompt_file(argv[++i]);
+            if (!buf) { *rc = 2; return 0; }
+            cfg->prompt = buf;
+            cfg->prompt_specified = true;
         } else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
             cfg->n_predict = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) {
@@ -992,6 +1016,12 @@ static int job_prepare(job_cfg_t *cfg) {
                     "(0 = none, hit/miss CPU overlap on)\n", g_n_gpu_expert_layers);
 
     cfg->arch = tuff_detect_arch(cfg->model_path);
+    // qwen35 (dense) shares the qwen35 hybrid family but is a distinct architecture.
+    // tuff_detect_arch() lives in lfm25_model.c (off-limits for this change), so the
+    // dense-architecture probe happens here through the new engine's GGUF reader.
+    if (cfg->arch == TUFF_ARCH_UNKNOWN && q35_model_is_arch(cfg->model_path)) {
+        cfg->arch = TUFF_ARCH_QWEN35;
+    }
     cfg->vtable = tuff_get_vtable(cfg->arch);
     if (!cfg->vtable) {
         fprintf(stderr, "[Tuff] ERROR: Unsupported or unrecognized architecture in %s\n", cfg->model_path);

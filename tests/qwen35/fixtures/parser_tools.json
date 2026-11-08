@@ -1,0 +1,7 @@
+[
+ {"type":"function","function":{"name":"special_function","description":"special","parameters":{"type":"object","properties":{"arg1":{"type":"integer"}},"required":["arg1"]}}},
+ {"type":"function","function":{"name":"special_function_with_opt","description":"opt","parameters":{"type":"object","properties":{"arg1":{"type":"integer"},"arg2":{"type":"integer"}},"required":["arg1"]}}},
+ {"type":"function","function":{"name":"python","description":"run python","parameters":{"type":"object","properties":{"code":{"type":"string"}},"required":["code"]}}},
+ {"type":"function","function":{"name":"edit","description":"edit","parameters":{"type":"object","properties":{"filename":{"type":"string"},"oldString":{"type":"string"},"newString":{"type":"string"}},"required":["filename","oldString","newString"]}}},
+ {"type":"function","function":{"name":"empty_args","description":"none","parameters":{"type":"object","properties":{}}}}
+]

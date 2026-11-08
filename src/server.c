@@ -22,6 +22,9 @@
 #include "engine.h"
 #include "gpu.h"
 #include "tokenizer.h"
+#include "qwen35.h"
+#include "q35_server.h"
+#include "tuff_vtable.h"
 #include "tuff_exact.h"
 
 #include <stdio.h>
@@ -35,6 +38,7 @@
 #include <errno.h>
 #include <time.h>
 #include <signal.h>
+#include <math.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -694,7 +698,15 @@ typedef struct {
     int             max_gen;
     char           *model_name;
     const char     *system_prompt;   // may be NULL
+    int             arch;
+    q35_model      *q35m;
+    q35_engine     *q35e;
+    q35_server     *q35srv;
+    int             nslots;
+    int             slot_ctx;
 } server_t;
+
+// Backend B handlers live in src/qwen35/q35_server.c.
 
 static int is_stop_token(const tokenizer_t *tok, int32_t token_id) {
     if (!tok || token_id < 0 || token_id >= (int32_t)tok->vocab_size) return 1;
@@ -1014,6 +1026,7 @@ static void handle_models(server_t *s, int fd) {
 }
 
 static void handle_completion(server_t *s, int fd, http_req_t *req) {
+    if (s->arch == TUFF_ARCH_QWEN35) { q35_http_completion(s->q35srv, fd, req->body ? req->body : "", req->body_len); return; }
     req_t r; req_init(&r);
     if (parse_request(req->body ? req->body : "", req->body_len, &r) != 0 || !r.prompt) {
         req_free(&r);
@@ -1061,6 +1074,7 @@ static void handle_completion(server_t *s, int fd, http_req_t *req) {
 }
 
 static void handle_chat(server_t *s, int fd, http_req_t *req) {
+    if (s->arch == TUFF_ARCH_QWEN35) { q35_http_chat(s->q35srv, fd, req->body ? req->body : "", req->body_len); return; }
     req_t r; req_init(&r);
     if (parse_request(req->body ? req->body : "", req->body_len, &r) != 0 || r.messages.n == 0) {
         req_free(&r);
@@ -1151,6 +1165,7 @@ typedef struct {
     server_t *srv;
 } conn_arg_t;
 
+
 static void *handle_connection(void *arg) {
     conn_arg_t *ca = (conn_arg_t *)arg;
     int fd = ca->fd;
@@ -1180,6 +1195,14 @@ static void *handle_connection(void *arg) {
         handle_completion(s, fd, &req);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/v1/chat/completions") == 0) {
         handle_chat(s, fd, &req);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/tokenize") == 0 && s->arch == TUFF_ARCH_QWEN35) {
+        q35_http_tokenize(s->q35srv, fd, req.body ? req.body : "", req.body_len);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/detokenize") == 0 && s->arch == TUFF_ARCH_QWEN35) {
+        q35_http_detokenize(s->q35srv, fd, req.body ? req.body : "", req.body_len);
+    } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/apply-template") == 0 && s->arch == TUFF_ARCH_QWEN35) {
+        q35_http_apply_template(s->q35srv, fd, req.body ? req.body : "", req.body_len);
+    } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/props") == 0 && s->arch == TUFF_ARCH_QWEN35) {
+        q35_http_props(s->q35srv, fd);
     } else {
         respond_json_error(fd, 404, "Not found");
     }
@@ -1245,6 +1268,11 @@ static void print_usage(const char *prog) {
         "  --fill-ram, --fill-vram    inflate context to maximize VRAM utilization\n"
         "  --max-gen <n>              max tokens per response, hard cap (default: 1024)\n"
         "  --system <prompt>          override the default chat system prompt\n"
+        "  -np, --parallel <n>        slots (qwen35 backend; >1 is an error for other models)\n"
+        "  --chat-template-kwargs J   default template kwargs, e.g. '{\"enable_thinking\":true}'\n"
+        "  --reasoning-format F       deepseek (default) | none\n"
+        "  --steps-per-launch <n>     max decode launches between admissions (default 16)\n"
+        "  --kv-unified, --jinja      accepted as no-ops (qwen35 backend)\n"
         "\n"
         "Endpoints:\n"
         "  GET  /health\n"
@@ -1252,7 +1280,7 @@ static void print_usage(const char *prog) {
         "  POST /v1/completions        {\"prompt\":\"...\",\"max_tokens\":N,\"stream\":bool}\n"
         "  POST /v1/chat/completions   {\"messages\":[{\"role\":\"user\",\"content\":\"...\"}],...}\n"
         "\n"
-        "Sampling is greedy-only; temperature / top_p are accepted and ignored.\n",
+        "Backend A is greedy-only. Backend B (qwen35) implements the llama.cpp sampling chain.\n",
         prog);
 }
 
@@ -1267,7 +1295,11 @@ int main(int argc, char **argv) {
     int max_seq = 131072;
     int max_gen = 2048;
     int fill_ram = 0;
+    int parallel = 1;
     const char *system_prompt = NULL;
+    const char *chat_template_kwargs = NULL;
+    int reasoning_format = 1;
+    int steps_per_launch = 16;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
@@ -1285,8 +1317,21 @@ int main(int argc, char **argv) {
             fill_ram = 1;
         } else if (strcmp(argv[i], "--max-gen") == 0 && i + 1 < argc) {
             max_gen = atoi(argv[++i]);
+        } else if ((strcmp(argv[i], "--parallel") == 0 || strcmp(argv[i], "-np") == 0) && i + 1 < argc) {
+            parallel = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--system") == 0 && i + 1 < argc) {
             system_prompt = argv[++i];
+        } else if (strcmp(argv[i], "--chat-template-kwargs") == 0 && i + 1 < argc) {
+            chat_template_kwargs = argv[++i];
+        } else if (strcmp(argv[i], "--reasoning-format") == 0 && i + 1 < argc) {
+            const char *f = argv[++i];
+            reasoning_format = (strcmp(f, "none") == 0) ? 0 : 1;
+        } else if (strcmp(argv[i], "--steps-per-launch") == 0 && i + 1 < argc) {
+            steps_per_launch = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--kv-unified") == 0 || strcmp(argv[i], "--jinja") == 0) {
+            // accepted as no-ops for the qwen35 backend, matching llama-server defaults
+        } else if (strcmp(argv[i], "--no-kv-unified") == 0 || strcmp(argv[i], "--no-jinja") == 0) {
+            // accepted as no-ops
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -1304,6 +1349,7 @@ int main(int argc, char **argv) {
     }
     if (max_seq < 16) { fprintf(stderr, "Error: --max-seq too small\n"); return 2; }
     if (max_gen < 1)  { fprintf(stderr, "Error: --max-gen must be >= 1\n"); return 2; }
+    if (parallel < 1 || parallel > 32) { fprintf(stderr, "Error: --parallel must be 1..32\n"); return 2; }
 
     signal(SIGPIPE, SIG_IGN);
 
@@ -1311,38 +1357,98 @@ int main(int argc, char **argv) {
             tuff_exact() ? "bit-exact reference kernels" : "fast paths permitted");
     fprintf(stderr, "[tuff-server] Loading GGUF model from: %s\n", model_path);
 
-    model_t *model = model_load(model_path);
-    if (!model) {
-        fprintf(stderr, "[tuff-server] Failed to load model from %s\n", model_path);
-        return 1;
+    // tuff-server only needs to distinguish the dense qwen35 backend from the existing
+    // qwen35moe engine; lfm25_model.c (which defines tuff_detect_arch) is not linked here.
+    tuff_arch_t arch = q35_model_is_arch(model_path) ? TUFF_ARCH_QWEN35 : TUFF_ARCH_QWEN35MOE;
+    if (arch != TUFF_ARCH_QWEN35 && parallel > 1) {
+        fprintf(stderr, "[tuff-server] Error: -np/--parallel > 1 requires the qwen35 dense backend "
+                        "(this model uses the serialized backend A)\n");
+        return 2;
     }
 
-    {
-        double rss_before = vmrss_mib();
-        double t0 = (double)clock() / CLOCKS_PER_SEC;
-        tuff_gguf_warmup_memory(model->gguf);
-        double t1 = (double)clock() / CLOCKS_PER_SEC;
-        double rss_after = vmrss_mib();
-        fprintf(stderr, "[tuff-server] Page-warmup: %.2f s; VmRSS %.0f MiB -> %.0f MiB\n",
-                t1 - t0, rss_before, rss_after);
+    model_t *model = NULL;
+    tokenizer_t *tok = NULL;
+    q35_model *q35m = NULL;
+    q35_engine *q35e = NULL;
+    int slot_ctx = max_seq;
+    if (arch == TUFF_ARCH_QWEN35) {
+        q35m = q35_model_load(model_path);
+        if (!q35m) { fprintf(stderr, "[tuff-server] qwen35 load failed\n"); return 1; }
+        int ctx = max_seq / parallel;
+        if (ctx < 64) { fprintf(stderr, "[tuff-server] -c %d / -np %d leaves < 64 positions per slot\n", max_seq, parallel); return 1; }
+        if (q35_prepare(q35m, &ctx) != 0) { fprintf(stderr, "[tuff-server] qwen35 prepare failed\n"); return 1; }
+        q35e = q35_engine_init(q35m, ctx, parallel);
+        if (!q35e) { fprintf(stderr, "[tuff-server] qwen35 engine_init failed\n"); return 1; }
+        tok = tokenizer_init(q35_model_gguf(q35m));
+        // a tiny model_t is kept only for /v1/models metadata (the MoE engine is not used)
+        model = (model_t *)calloc(1, sizeof(model_t));
+        model->vocab_size = (uint32_t)q35_model_vocab(q35m);
+        model->embedding_length = tuff_gguf_get_kv_u32(q35_model_gguf(q35m),
+                                                       "qwen35.embedding_length", 0);
+        model->context_length = (uint32_t)ctx;
+        slot_ctx = ctx;
+        fprintf(stderr, "[tuff-server] backend B: qwen35 dense, slots=%d ctx/slot=%d\n", parallel, ctx);
+    } else {
+        model = model_load(model_path);
+        if (!model) {
+            fprintf(stderr, "[tuff-server] Failed to load model from %s\n", model_path);
+            return 1;
+        }
+        {
+            double rss_before = vmrss_mib();
+            double t0 = (double)clock() / CLOCKS_PER_SEC;
+            tuff_gguf_warmup_memory(model->gguf);
+            double t1 = (double)clock() / CLOCKS_PER_SEC;
+            double rss_after = vmrss_mib();
+            fprintf(stderr, "[tuff-server] Page-warmup: %.2f s; VmRSS %.0f MiB -> %.0f MiB\n",
+                    t1 - t0, rss_before, rss_after);
+        }
+        gpu_prepare_ex(model, &max_seq, fill_ram);
+        slot_ctx = max_seq;
+        tok = tokenizer_init(model->gguf);
     }
-
-    gpu_prepare_ex(model, &max_seq, fill_ram);
-    tokenizer_t *tok = tokenizer_init(model->gguf);
 
     server_t s;
     s.model = model;
     s.tok = tok;
-    s.max_seq = max_seq;
+    s.max_seq = slot_ctx;
     s.max_gen = max_gen;
     s.system_prompt = system_prompt;
     s.model_name = model_name_from_path(model_path);
+    s.arch = arch;
+    s.q35m = q35m;
+    s.q35e = q35e;
+    s.nslots = parallel;
+    s.slot_ctx = slot_ctx;
+    s.q35srv = NULL;
     pthread_mutex_init(&s.lock, NULL);
 
-    s.eng = engine_init(model, max_seq);
-    if (!s.eng) {
-        fprintf(stderr, "[tuff-server] engine_init failed\n");
-        return 1;
+    if (arch != TUFF_ARCH_QWEN35) {
+        s.eng = engine_init(model, max_seq);
+        if (!s.eng) {
+            fprintf(stderr, "[tuff-server] engine_init failed\n");
+            return 1;
+        }
+    } else {
+        s.eng = NULL;
+        q35_server_cfg cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.model = q35m;
+        cfg.tok = tok;
+        cfg.engine = q35e;
+        cfg.model_name = s.model_name;
+        cfg.system_prompt = system_prompt;
+        cfg.chat_template_kwargs = chat_template_kwargs;
+        cfg.n_slots = parallel;
+        cfg.slot_ctx = slot_ctx;
+        cfg.max_gen = max_gen;
+        cfg.steps_per_launch = steps_per_launch;
+        cfg.reasoning_format = reasoning_format;
+        s.q35srv = q35_server_create(&cfg);
+        if (!s.q35srv) {
+            fprintf(stderr, "[tuff-server] qwen35 scheduler init failed\n");
+            return 1;
+        }
     }
 
     fprintf(stderr, "[tuff-server] model=%s vocab=%u dim=%u layers=%u (attn=%u delta=%u)\n",

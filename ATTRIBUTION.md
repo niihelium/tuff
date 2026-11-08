@@ -63,6 +63,25 @@ Tuff incorporates code, architecture specs, and mathematical formulations inspir
   - **CUDA Graph capture and executable update (H2)** (`src/gpu.cu`, `src/engine.c`):
     - Ported CUDA graph capture and executable update mechanism from `ggml/src/ggml-cuda/ggml-cuda.cu:2540–2647, 4180–4210` using `cudaStreamCaptureModeRelaxed`, `--default-stream per-thread`, and `cudaGraphExecUpdate` fallback logic (`cuda_graph_update_exec`, `gpu_capture_delta_graphs`, `gpu_launch_delta_layer_graph`).
 
+## 1b. Qwen3.5-0.8B decode megakernel (sm_120 reference implementation)
+- **License:** MIT License — Copyright (c) 2025 Samuel Reeder
+- **Upstream Repository:** [samuelreeder/qwen3.5-0.8b](https://github.com/samuelreeder/qwen3.5-0.8b)
+  (read from `/home/nii/src/megakernels/qwen3.5-0.8b`)
+- **Ported Components (Phase 1, `runtime/src/qwen35/`):**
+  - The persistent one-CTA-per-SM decode kernel structure, the flag-in-data activation handoff
+    (`(epoch << 32) | fp32` + `ld/st.relaxed.gpu`), the fused GEMV prologue/epilogue layout, the
+    Gated DeltaNet recurrence task decomposition (`[head][v][k]`, 32 value columns per task), the
+    split-K gated attention with deterministic partial merge, and the LM-head argmax reduction
+    (`csrc/megakernel.cu`, `csrc/megakernel.h`).
+  - The sm_120 TMA producer was rewritten for sm_86 as a 32-lane `cp.async` 16-byte ring with
+    `mbarrier` full / shared-counter empty handshakes and `prefetch.global.L2`; weight scales are
+    the GGUF's fp16 values (the reference rounds them to bf16), and norm weights are used as stored
+    in the GGUF.
+  - `tools/bw_sm86.cu` is the sm_86 port of `common/bw.cu` (plain loads, `cp.async` ring,
+    `evict_first`, prefetch cursor).
+- **Not ported:** the MTP/speculative path (the 0.8B/2B GGUFs carry no MTP head), PyTorch hosting,
+  and the sm_120-only TMA / bulk-copy code.
+
 ## 2. Colibrì
 - **License:** Apache License 2.0
 - **Upstream Repository:** `/home/nii/workspace/colibri`

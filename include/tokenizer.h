@@ -39,6 +39,7 @@ typedef struct {
     // substring matching — sufficient since these strings never legitimately occur as
     // substrings of ordinary text).
     uint32_t n_special;
+    int      user_defined_special; // qwen35 dense: USER_DEFINED tokens are special like CONTROL
     char **special_strs;
     size_t *special_lens;
     int32_t *special_ids;

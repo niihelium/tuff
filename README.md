@@ -1,4 +1,93 @@
-# Tuff
+# runtime — tuf
+
+**Goal:** our own inference runtime that replaces llama.cpp for **specific models on specific hardware**,
+with optimizations and tricks llama.cpp cannot afford to specialise for: per-expert VRAM caching of MoE
+weights, CPU/GPU split by locality, lossless speculation, fused kernels captured in CUDA graphs — and next, the
+hooks our research needs (mid-layer reads, in-process decision heads, state snapshots for context management).
+
+Target machine: RTX 3070 Laptop 8 GB (sm_86) + Ryzen 9 5900HX + 64 GB DDR4. Correctness reference: llama.cpp
+(token-identical greedy continuation).
+
+## Role in the workspace
+
+- Serves models over an **OpenAI-compatible API** (`tuff-server`), so `../agent`, `../webui`, `../alasin` and
+  `../sandbox` use it exactly like llama.cpp — swapping runtimes changes no agent code.
+- Until it serves the small models with tool calls, the workspace runs on llama.cpp; the sandbox is where tuf
+  must match llama.cpp's outputs (temp-0 identical) and beat its tok/s before it takes over.
+
+## Status
+
+| Model | Engine | State |
+|---|---|---|
+| Qwen3.6-35B-A3B (`qwen35moe`, Q4_K_S) | hand-tuned `engine.c` | **67.5 tok/s** vs llama.cpp 43.9 (details below) |
+| LFM2.5 dense / MoE (`lfm2`, `lfm2moe`) | `lfm25_engine.c` | phase 1, see `LFM25_ROADMAP.md`, `wiki/lfm25/` |
+| Qwen3.5 0.8B / 2B (dense, Q8_0) | `src/qwen35/` megakernel | **Phases 1, 2 and 4 (server)**. 0.8B 348 tok/s / 2B 159 tok/s at batch 1; the batched path is bitwise batch-invariant (G4) and scales to 2511 / 1506 tok/s aggregate at B=32 (see `QWEN35_MK_REPORT.md`). `tuff-server` backend B has continuous batching, exact-prefix prompt cache, the Qwen3.5 template, tools/tool-call + reasoning parsing, the llama.cpp sampling chain and logprobs. G8/G9/G10 pass; G7 and the P2 throughput table are documented misses. |
+
+Backend A (Qwen3.6-35B-A3B) is unchanged: greedy only, one request at a time, no `tools`, `logprobs` null.
+`-np/--parallel > 1` is a startup error on backend A. Backend B (dense Qwen3.5 0.8B/2B) is selected from the
+GGUF architecture (`general.architecture = qwen35`) and implements the server's parallel-slot path.
+
+## Server
+
+```bash
+cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=86 && cmake --build build --target tuff-server -j8
+MODEL_PATH=/path/to/model.gguf PORT=8080 ./run.sh        # builds if needed, then serves
+```
+
+Endpoints: `GET /health`, `GET /v1/models`, `POST /v1/completions`, `POST /v1/chat/completions` (ChatML,
+`"stream": true` for SSE), plus backend B's `POST /tokenize`, `POST /detokenize`, `POST /apply-template` and
+`GET /props`. Plain C11 + POSIX sockets.
+
+Backend B (Qwen3.5 dense) runs one GPU scheduler thread with `-np/--parallel N` slots and
+`-c/--ctx-size` split evenly per slot, like llama-server:
+
+```bash
+./build-srv/tuff-server --model Qwen3.5-0.8B-Q8_0.gguf --port 8097 -np 4 -c 65536 \
+  --chat-template-kwargs '{"enable_thinking":false}' --reasoning-format deepseek
+```
+
+`--kv-unified` and `--jinja` are accepted as no-ops. Sampling implements penalties, top-k/top-p/min-p,
+temperature and seed; `logprobs`/`top_logprobs` are supported; grammar / JSON schema return 400 and
+DRY/XTC/typical/mirostat fields return `X-Tuf-Ignored`. See `QWEN35_MK_REPORT.md` for the gates and the
+kernel-side limits that keep the server below llama.cpp at concurrency > 1.
+
+## Qwen3.5 dense megakernel (Phase 1)
+
+`src/qwen35/` is a C/CUDA-only port of the batch-1 persistent decode megakernel: one cooperative
+CTA per SM (sm_86, 40 SMs), a `cp.async` weight ring with fp16-exact Q8_0 scales, flag-in-data
+activation handoff, GDN recurrence and split-K gated attention. Both shapes (0.8B `1024/3584`,
+2B `2048/6144`) are template instantiations dispatched once at load.
+
+```bash
+./build/tuff --model Qwen3.5-0.8B-Q8_0.gguf --prompt "Hello" -c 512 -n 128 --warmup 32 --runs 3
+./build/tuff --model Qwen3.5-0.8B-Q8_0.gguf --prompt-file prompt.txt -c 16384 -n 128 --warmup 32 --runs 3
+./build/qwen35-batch-bench --model <gguf> --bench 8 --steps 128 --ctx 600
+./build/tuff --model Qwen3.5-0.8B-Q8_0.gguf --prompt "Hello" -n 32 --dump-tokens
+bash tests/qwen35/oracle.sh <gguf> 32      # G2: greedy == llama.cpp
+bash tests/qwen35/g1.sh <gguf> 256 out/    # G1: logits vs the fp32 GGUF reference
+```
+
+Design, measurements and the unmet P1 target are documented in `QWEN35_MK_REPORT.md`.
+
+## Roadmap (Notion page 12, "Runtime" decision of Nov 6)
+
+1. Dense Qwen3.5 0.8B / 2B (same gated-delta-net + gated-attention mixers, dense MLP) via the generic decoder
+   (`tuf_generic_plan.md`: new GGUF in hours, oracle gate in one command, ≥ llama.cpp tg128).
+2. Server parity for agents and evals: tool calls (Qwen template), `chat_template_kwargs` (thinking switch),
+   logprobs / top-k logprobs (KD data), sampling, parallel slots.
+3. GDN state + KV snapshots at segment boundaries, tail rebuild, fork → context management in `../agent`.
+4. Hook API: mid-layer hidden-state reads, in-process heads (fire / InfoNCE action / IDK), logit masks and
+   grammars, result injection as prefill.
+5. MTP speculation for small models with Soft-MTP heads; later Dory (looped block, SWA) and LFM short conv.
+6. KV quantization for long context; purpose-trained draft model (see `PLAN.md`).
+
+Documents: `PLAN.md` (open levers, hypothesis ledger), `ITERATION_LOG.md` (measured history),
+`PERFORMANCE_GUIDE.md`, `GPU_REFACTOR_PLAN.md`, `SAMPLER_PLAN.md`, `QWEN35_ROADMAP.md`, `LFM25_ROADMAP.md`,
+`wiki/`.
+
+---
+
+## Qwen3.6-35B-A3B engine (current fast path)
 
 Single-stream, single-machine greedy decoder for **Qwen3.6-35B-A3B** (`Q4_K_S` GGUF, 19.91 GiB,
 35.51 B params) on an **RTX 3070 Laptop 8 GB + Ryzen 9 5900HX + 64 GB DDR4**. Measured
