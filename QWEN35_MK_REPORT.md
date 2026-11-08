@@ -930,3 +930,90 @@ Unlike the racy baseline these numbers are bitwise deterministic and batch-invar
   0.8B) and passes all gates.
 * T=1 kernel / CLI path was not re-run here (no source change in it besides the shared `ll_wait_raw`
   fail-fast on a prior watchdog event).
+
+---
+
+## Batch throughput, round 2 (2026-11-08, branch `qwen35-megakernel`)
+
+Starting point: commit 46d27f7 (sections above). Method: `Q35_PROF=1` per-op profile (CTA-0 view, now with the
+mixer split into GDN / attention), one hypothesis at a time, single-run screening with alternating binaries,
+then one 5-round paired A/B of the kept set against the 46d27f7 binary. 0.8B and 2B are always measured
+separately. Measured read+write DRAM roofline for the in-place GDN state pattern: **353 GB/s**
+(read-only 365 GB/s, same kernel shape; `scratchpad rwbw.cu`).
+
+### Where the time went (0.8B, B=32, before)
+
+`in` 2580 us, mixer 5012 (GDN 4302 + attention ~700), `out` 777, gate/up 2567, `down` 777, LM head 964;
+total 12.68 ms/step. The `in` and gate/up GEMVs ran at ~80 us/layer against a ~30 us/layer tensor-core floor
+(f16 MMA with fp32 accumulate is half rate on GA10x: ~9.2 TFMA/s at 1800 MHz).
+
+### Hypotheses tested
+
+| # | hypothesis | result | kept |
+|---|---|---|---|
+| E1 | `gemv_cta_f` reloads the activation fragments from L2 for every 16-row group although, for K <= 1024 (one chunk per group), each warp uses the same k-tiles in every group: load once per op | with E2: 0.8B B=32 2466 -> 2994 tok/s | yes |
+| E2 | the per-group cross-warp reduction is serial: 2*NT `__syncthreads` per group and warp 0 sums all n-tiles; reduce all n-tiles at once (tiles 0-1 in `red`, 2-3 in the ring slot just consumed), warp n sums tile n, same 0..15 order | bitwise identical; together with E1 above (`in` GEMV part 77 -> 41 us/layer) | yes |
+| E3 | GDN: issue the state loads before waiting on the projections, prefetch the next task's 16 KB slice to L2 | GDN 4302 -> 4472-4600 us (slower, with and without the prefetch) | no |
+| E4 | GDN: one task per head (8 columns/warp) instead of 32-column slices to cut per-task latency | GDN 4383 us (no gain), B=1 GDN 144 -> 163 us | no (code generalized, CPW=2 default) |
+| E5 | attention: 32-position split chunks make ~5 rounds of ~14 us tasks per layer at B=32; batch-path rule `splits = ceil(n/128)` (a function of the position only, so G4 holds; T=1 kernel unchanged) | attention 672 -> 461 us, `out` prologue -160 us at B=32; B=1 attention +50 us (fewer splits for one sequence); identical above n ~ 1344 (42-split cap) | yes (chunk 64: in between) |
+| E6 | attention KV loads batched per warp (KVB 2/4) | raises register pressure for the whole kernel: every op slower (B=32: -3% / -14%) | no (KVB=1) |
+| E7 | LM head at BT=32 spills (all batch instantiations sit at the 128-register cap); `gemv_direct_f` DEPTH 4 -> 2 | LM head 1002 -> 941 us | yes |
+| E8 | int8 -> f16 dequant uses two I2F (quarter rate on sm_86) + a pack per pair; PRMT magic number (`0x64xx` = 1024 + u, one HSUB2) | exact (all 65,536 byte pairs checked equal); kernel -1.5% at B=32 | yes |
+| E9 | RMSNorm prologues: every CTA recomputes the 16 partials itself instead of the `g_ssl` round trip | `in` prologue 718 -> 905 us (the 256 KB/CTA L2 read costs more than the hop) | no |
+| E10 | host: 13 small synchronous transfers per batch step (3 input copies, 5 symbol resets, 3 watchdog reads, info, tokens) + a 4 KB `__constant__` params upload every step | inputs in one block (1 copy), batch state in one `BState` struct (1 reset, 1 read), params upload skipped when byte-identical (shared by T=1 and batch paths); B=1 ~+0.5% | yes |
+| E11 | conv history layout `[channel][ring 8]`: every step reads and writes one 32-byte sector per channel for 4 useful bytes (~0.39 MB/slot/layer = +19% over the 2 MB fp32 state); switch to `[ring][channel]` (both kernels; addressing only) | GDN 4312 -> 3853 us (0.8B), 4521 -> 3991 us (2B) at B=32 | yes |
+
+### Verification of the kept set (clean build, 0 warnings in qwen35 files)
+
+* det-probe ops 2-5 and 0, n = 1/8/32, with and without `--dup`: 30/30 PASS on 0.8B and on 2B.
+* G4 B = 2/8/16/32 (`--steps 16`) and DUP: PASS on both models.
+* Watchdog (`-DQ35_DBG_STALL`, `Q35_DBG_STALL_LAUNCH=3`): exactly one WATCHDOG error and one failed step at B=1 and B=8.
+* G1 (`g1.sh MODEL 64`, 5 prompts, tolerance 0.05): T=1 path max |dlogit| 0.0032 (0.8B) / 0.0022 (2B);
+  batch path N=1 and N=32 (identical) 0.0258 / 0.0205; 0 argmax mismatches everywhere. (The batch-path
+  number moved from 0.0240 to 0.0258 on 0.8B because the attention split changes the softmax merge order.)
+* A/B vs 46d27f7, `BENCH=batch scripts/ab_interleaved.sh 5`, paired ratio new/old [95% CI]:
+
+| model | B=1 | B=8 | B=32 |
+|---|---|---|---|
+| 0.8B | 1.0900 [1.0750, 1.1050] | 1.0806 [1.0686, 1.0926] | **1.3316** [1.3252, 1.3380] |
+| 2B | 0.9998 [0.9896, 1.0100] | 1.0485 [1.0333, 1.0638] | **1.1372** [1.1316, 1.1429] |
+
+### Engine numbers now (`qwen35-batch-bench --bench B --steps 64 --rounds 5`, median, aggregate tok/s)
+
+| B | 0.8B | target (server) | 2B | target (server) |
+|---|---|---|---|---|
+| 1 | 338.5 | 380 (P1) / 330 | 146.0 | 165 (P1) / 150 |
+| 2 | 602.0 | | 276.1 | |
+| 4 | 1089.9 | | 526.9 | |
+| 8 | 1893.7 | 1800 | 976.6 | 800 |
+| 16 | 2816.3 | 2800 | 1441.3 | 1400 |
+| 32 | 3322.6 | 4000 | 1674.9 | 2200 |
+
+The server targets are end-to-end (`batch_bench.py`, prefill + HTTP); these are engine numbers, an upper bound
+for them. The server benchmark was not rerun in this round.
+
+Per-op profile now (us/step): 0.8B B=32 `in` 1654 (prologue 712), mixer 4317 (GDN 3856, attention 461),
+`out` 535, gate/up 1419 (prologue 519), `down` 684, LM 922, total 9531. 0.8B B=1: total 2921, prologues
+655. 2B B=32: `in` 3548, mixer 4492 (GDN 4015), `out` 1070, gate/up 5002, `down` 2444, LM 1840, total 18396.
+
+### Distance to the floor
+
+* 0.8B B=32: weights 0.81 GB at 373 GB/s = 2.17 ms; fp32 GDN state 1.21 GB read+write at 353 GB/s =
+  3.42 ms; GEMV tensor work ~2.7 ms (overlaps the weight stream). Floor ~6.0-6.4 ms/step = ~5000-5300 tok/s.
+  Now 9.53 ms: GDN is at 89% of its floor; the loss is the GEMV part of `in` / gate/up (~1.5x the tensor
+  floor), ~1.9 ms of prologue dependency latency, and attention latency (0.46 ms for a short context).
+* 0.8B B=1: ~0.85 GB/token -> 2.28 ms at 373 GB/s (440 tok/s). The reference megakernel
+  (`megakernels/qwen3.5-0.8b`, sm_120 only) runs int8 at 88% of its card's roofline; that efficiency here
+  would be ~386 tok/s. Now 2.92 ms kernel (78% of the roofline): the GEMVs are at the roofline, the loss
+  is ~0.65 ms of prologue hops (~6 us each vs the reference's 3.2 us) and 0.27 ms mixer.
+
+### Next levers (not done)
+
+1. 2B GEMVs at K = 2048 / 6144 still reload activation fragments per chunk (E1 only covers one chunk per
+   group): gate/up is 208 us/layer at B=32 vs ~87 us tensor floor. Needs a register-light way to keep B
+   fragments (software-pipelined loads, or k-split teams).
+2. Prologue latency (1.9 ms at B=32, 0.65 ms at B=1): each sliced RMSNorm prologue is 3 grid-wide hops
+   (xl ready -> `g_ssl` partials -> `vready`); the reference hides its hops behind a producer warp that keeps
+   streaming weights (TMA ring + L2 prefetch cursor), which sm_86 can only approximate with cp.async.
+3. `down` / `out` have 64 row groups over 40 CTAs (25% imbalance).
+4. bf16/f16 GDN state would cut 1.7 ms at B=32 (0.8B) but changes numerics over long contexts; not tried.

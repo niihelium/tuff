@@ -89,6 +89,18 @@ static const uint8_t *tensor_data(gguf_context_t *g, const char *name, const ggu
     return g->tensor_data_blob + t->offset;
 }
 
+// The kernels read their params from one __constant__ copy.  Every launch path goes through here, so
+// the 4 KB upload is skipped when the params are byte-identical to the last ones uploaded.
+static q35_params_t g_last_params;
+static int g_have_last_params = 0;
+static int set_params_cached(const q35_params_t *p) {
+    if (g_have_last_params && memcmp(&g_last_params, p, sizeof(*p)) == 0) return 0;
+    if (q35_mk_set_params(p) != 0) { g_have_last_params = 0; return -1; }
+    g_last_params = *p;
+    g_have_last_params = 1;
+    return 0;
+}
+
 static void *dev_alloc(q35_model *m, size_t bytes, int zero) {
     void *p = NULL;
     if (cudaMalloc(&p, bytes ? bytes : 1) != cudaSuccess) return NULL;
@@ -528,9 +540,10 @@ q35_engine *q35_engine_init(q35_model *m, int ctx, int n_slots) {
         sl->k_cache = (char *)k_all + (size_t)s * 2 * n_kv * 6;
         sl->v_cache = (char *)v_all + (size_t)s * 2 * n_kv * 6;
     }
-    e->d_forced = (int32_t *)dev_alloc(m, sizeof(int32_t) * Q35_MAX_BATCH, 0);
-    e->d_slot_ids = (int *)dev_alloc(m, sizeof(int) * Q35_MAX_BATCH, 0);
-    e->d_positions = (int *)dev_alloc(m, sizeof(int) * Q35_MAX_BATCH, 0);
+    // forced | slot_ids | positions in one block, so a batch step uploads its inputs with one copy
+    e->d_forced = (int32_t *)dev_alloc(m, sizeof(int32_t) * 3 * Q35_MAX_BATCH, 0);
+    e->d_slot_ids = e->d_forced ? (int *)(e->d_forced + Q35_MAX_BATCH) : NULL;
+    e->d_positions = e->d_forced ? (int *)(e->d_forced + 2 * Q35_MAX_BATCH) : NULL;
     e->d_tokens = (unsigned long long *)dev_alloc(m, sizeof(unsigned long long) * Q35_MAX_BATCH, 1);
     e->d_info = (int *)dev_alloc(m, sizeof(int) * 8, 1);
     e->logits_cap = Q35_MAX_BATCH;
@@ -601,7 +614,7 @@ static int run_steps(q35_engine *e, int slot, const int32_t *tokens, int n, int 
     if (pos0 < 0 || pos0 + n > e->ctx) return -2;
     q35_params_t P;
     build_params(e, slot, &P);
-    if (q35_mk_set_params(&P) != 0) return -3;
+    if (set_params_cached(&P) != 0) return -3;
     cudaMemcpy(e->d_forced, tokens, sizeof(int32_t) * n, cudaMemcpyHostToDevice);
     cudaMemset(e->d_tokens, 0, sizeof(unsigned long long) * n);
     cudaMemset(e->d_info, 0, sizeof(int) * 2);
@@ -704,10 +717,14 @@ int q35_engine_decode_batch(q35_engine *e, const int *slots, const int *position
 
     q35_params_t P;
     build_params(e, 0, &P);
-    if (q35_mk_set_params(&P) != 0) return -3;
-    cudaMemcpy(e->d_slot_ids, slots, sizeof(int) * n, cudaMemcpyHostToDevice);
-    cudaMemcpy(e->d_positions, positions, sizeof(int) * n, cudaMemcpyHostToDevice);
-    cudaMemcpy(e->d_forced, tokens, sizeof(int32_t) * n, cudaMemcpyHostToDevice);
+    if (set_params_cached(&P) != 0) return -3;
+    {
+        int32_t in[3 * Q35_MAX_BATCH];
+        memcpy(in, tokens, sizeof(int32_t) * n);
+        memcpy(in + Q35_MAX_BATCH, slots, sizeof(int) * n);
+        memcpy(in + 2 * Q35_MAX_BATCH, positions, sizeof(int) * n);
+        cudaMemcpy(e->d_forced, in, sizeof(int32_t) * (2 * Q35_MAX_BATCH + n), cudaMemcpyHostToDevice);
+    }
     cudaMemset(e->d_tokens, 0, sizeof(unsigned long long) * n);
     cudaMemset(e->d_info, 0, sizeof(int) * 8);
 
@@ -751,7 +768,7 @@ int q35_engine_decode_batch(q35_engine *e, const int *slots, const int *position
     if (getenv("Q35_PROF") && A.prof) {
         // CTA 0 stamps every op end: per op type, time between consecutive stamps (CTA-0 view),
         // averaged over the launches of this process; printed every 64 launches.
-        static double acc[6], tot, pro[6];
+        static double acc[6], tot, pro[6], amix;
         static long cnt;
         unsigned long long h[256];
         cudaMemcpy(h, A.prof, sizeof(h), cudaMemcpyDeviceToHost);
@@ -759,6 +776,7 @@ int q35_engine_decode_batch(q35_engine *e, const int *slots, const int *position
         for (int i = 1; i <= nops; i++) {
             const int type = (i == nops) ? 5 : (i - 1) % 5;   // in, mixer, out, gate/up, down, lm
             acc[type] += (double)(h[i] - h[i - 1]) / 1e3;
+            if (type == 1 && ((i - 1) / 5) % 4 == 3) amix += (double)(h[i] - h[i - 1]) / 1e3;   // attention-layer mixer
             if (type != 1) pro[type] += (double)(h[128 + i - 1] - h[i - 1]) / 1e3;   // prologue part
         }
         tot += (double)(h[nops] - h[0]) / 1e3;
@@ -768,6 +786,8 @@ int q35_engine_decode_batch(q35_engine *e, const int *slots, const int *position
         if (cnt % 64 == 0)
             fprintf(stderr, "[qwen35] batch prof prologue-part us/step: in=%.0f out=%.0f gu=%.0f down=%.0f lm=%.0f (rest of each op = GEMV + epilogue + barrier)\n",
                     pro[0] / cnt, pro[2] / cnt, pro[3] / cnt, pro[4] / cnt, pro[5] / cnt);
+        if (cnt % 64 == 0)
+            fprintf(stderr, "[qwen35] batch prof mixer split us/step: gdn=%.0f attn=%.0f\n", (acc[1] - amix) / cnt, amix / cnt);
     }
     int info[8] = {0};
     cudaMemcpy(info, e->d_info, sizeof(int) * 8, cudaMemcpyDeviceToHost);

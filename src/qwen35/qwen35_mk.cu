@@ -19,11 +19,23 @@
 namespace q35 {
 
 __constant__ q35_params_t P;
-__device__ int g_wd_b = 0, g_wd_b_op = -1, g_wd_b_blk = -1;
-__device__ unsigned g_wd_b_ep = 0;   // epoch / counter target the timed-out wait was expecting
-__device__ unsigned g_vready = 0;   // batch path (sliced prologues): CTAs that have written their vecf slice
+// Per-launch batch-path state, one struct so the host resets it (and reads the watchdog record) with a
+// single copy each.
+struct BState {
+    int wd_b, wd_b_blk;   // watchdog kind / CTA of the first timed-out wait (sticky until reset)
+    unsigned wd_b_ep;     // epoch / counter target the timed-out wait was expecting
+    unsigned vready;      // batch path (sliced prologues): CTAs that have written their vecf slice
+    unsigned vdone;       // batch path: monotonic count of CTA "finished reading vecf" arrivals
+    unsigned pad[3];
+};
+__device__ BState g_bs = {0, -1, 0, 0, 0, {0, 0, 0}};
+#define g_wd_b (q35::g_bs.wd_b)
+#define g_wd_b_blk (q35::g_bs.wd_b_blk)
+#define g_wd_b_ep (q35::g_bs.wd_b_ep)
+#define g_vready (q35::g_bs.vready)
+#define g_vdone (q35::g_bs.vdone)
+__device__ int g_wd_b_op = -1;
 __device__ unsigned long long g_ssl[32 * 40];   // sliced rmsnorm: per-CTA partial sum of squares [entry][cta]
-__device__ unsigned g_vdone = 0;     // batch path: monotonic count of CTA "finished reading vecf" arrivals
 
 // ------------------------------------------------------------------ shape
 constexpr int GRID = 40;              // RTX 3070 Laptop SM count (one CTA per SM)
@@ -661,6 +673,11 @@ __device__ void prologue_act(float *vec, uint32_t e) {
     consumer_sync();
 }
 
+// Conv history of one slot/layer: CONV_RING rows of CONV_DIM floats ([ring][channel]), so a step reads
+// three rows and writes one, coalesced across channels.  (The old [channel][ring] layout touched one
+// 32-byte sector per channel per step for 4 useful bytes: +19% DRAM traffic over the GDN state.)
+__device__ __forceinline__ int hist_at(int r) { return r * CONV_DIM; }
+
 // ------------------------------------------------------------------ GDN recurrence
 // Task = (head, 32 value columns); state is [head][v][k] so a column is one 512-B row.
 __device__ void gdn_op(const q35_layer_ptrs_t &L, int pos, uint32_t e, float *sm) {
@@ -676,16 +693,16 @@ __device__ void gdn_op(const q35_layer_ptrs_t &L, int pos, uint32_t e, float *sm
             const int ch = t < 128 ? h * LIN_DK + t
                          : t < 256 ? LIN_QK + h * LIN_DK + (t - 128)
                                    : 2 * LIN_QK + h * LIN_DV + sl * GDN_SLICE + (t - 256);
-            float *hist = L.conv_hist + ch * CONV_RING;
+            float *hist = L.conv_hist + ch;   // [ring][channel] layout, see hist_at
             float win[CONV_K];
-            win[0] = __ldcg(hist + ((pos - 3) & RM));
-            win[1] = __ldcg(hist + ((pos - 2) & RM));
-            win[2] = __ldcg(hist + ((pos - 1) & RM));
+            win[0] = __ldcg(hist + hist_at((pos - 3) & RM));
+            win[1] = __ldcg(hist + hist_at((pos - 2) & RM));
+            win[2] = __ldcg(hist + hist_at((pos - 1) & RM));
             const float4 wq = *(const float4 *)(L.conv_w + ch * CONV_K);
             const unsigned long long raw = ld_ll(P.projl + ch);
             win[3] = ll_wait(raw, P.projl + ch, e - 1);
             const float acc = fmaf(wq.w, win[3], fmaf(wq.z, win[2], fmaf(wq.y, win[1], wq.x * win[0])));
-            if (t >= 256 || sl == 0) __stcg(hist + (pos & RM), win[3]);
+            if (t >= 256 || sl == 0) __stcg(hist + hist_at(pos & RM), win[3]);
             if (t < 256) sqk[t] = silu(acc); else sv[t - 256] = silu(acc);
         } else if (t < 256 + GDN_SLICE + 1) {
             const unsigned long long *pb = P.projl + GDN_B_OFF + h;
@@ -1176,6 +1193,20 @@ __device__ __forceinline__ uint32_t cvt_pair(uint32_t v) {
     __half2 h = __floats2half2_rn((float)(int8_t)(v & 0xff), (float)(int8_t)((v >> 8) & 0xff));
     return *reinterpret_cast<uint32_t *>(&h);
 }
+// int8 x4 -> two f16x2 (bytes 0,1 -> lo; bytes 2,3 -> hi), exact: PRMT builds the f16 1024 + (q + 128)
+// and one HSUB2 removes 1152.  Same values as cvt_pair (I2F is quarter rate on sm_86).
+__device__ __forceinline__ void cvt4(uint32_t p, uint32_t &lo, uint32_t &hi) {
+#ifdef Q35_CVT_I2F
+    lo = cvt_pair(p); hi = cvt_pair(p >> 16);
+#else
+    const uint32_t x = p ^ 0x80808080u;
+    const uint32_t a = __byte_perm(x, 0x6464u, 0x5140), b = __byte_perm(x, 0x6464u, 0x5342);
+    const __half2 bias = __halves2half2(__ushort_as_half(0x6480), __ushort_as_half(0x6480));
+    __half2 ha = __hsub2(*reinterpret_cast<const __half2 *>(&a), bias);
+    __half2 hb = __hsub2(*reinterpret_cast<const __half2 *>(&b), bias);
+    lo = *reinterpret_cast<uint32_t *>(&ha); hi = *reinterpret_cast<uint32_t *>(&hb);
+#endif
+}
 __device__ __forceinline__ void mma_m16n8k16(float d[4], uint32_t a0, uint32_t a1,
                                              uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
     asm volatile(
@@ -1606,14 +1637,20 @@ __device__ void prologue_act_s(uint32_t *vecf, uint32_t e, int nt, unsigned vt, 
 
 // ------------------------------------------------------------------ core ops (per entry)
 // Task = (entry, head, 32 value columns); state is [head][v][k] so a column is one 512-B row.
+#ifndef Q35_GDN_CPW
+#define Q35_GDN_CPW 2   // value columns per warp per task (2 = 32-column slices; 8 = one task per head was not faster)
+#endif
 template <int BT>
 __device__ void gdn_op_b(const q35_layer_ptrs_t &L, int nt, uint32_t e, float *sm,
                          const int *positions, const int *slots) {
+    constexpr int CPW = Q35_GDN_CPW;
+    constexpr int COLS = N_CONSUMER_WARPS * CPW;   // value columns per task
+    constexpr int SLICES = LIN_DV / COLS;
+    static_assert(SLICES * COLS == LIN_DV && 256 + COLS < N_CONSUMERS, "gdn task shape");
     const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
     float *sqk = sm;
     float *sv = sm + 256;
-    float *sc = sm + 288;
-    constexpr int SLICES = LIN_DV / GDN_SLICE;
+    float *sc = sm + 256 + COLS;
     constexpr int RM = CONV_RING - 1;
     for (int task = blockIdx.x; task < nt * LIN_H * SLICES; task += gridDim.x) {
         const int en = task / (LIN_H * SLICES);
@@ -1625,22 +1662,22 @@ __device__ void gdn_op_b(const q35_layer_ptrs_t &L, int nt, uint32_t e, float *s
         float *hist0 = L.conv_hist + (size_t)sid * L.conv_stride;
         const unsigned long long *projl = P.projl + (size_t)en * PROJ_MAX;
         unsigned long long *corel = P.corel + (size_t)en * LIN_V;
-        if (t < 256 + GDN_SLICE) {
+        if (t < 256 + COLS) {
             const int ch = t < 128 ? h * LIN_DK + t
                          : t < 256 ? LIN_QK + h * LIN_DK + (t - 128)
-                                   : 2 * LIN_QK + h * LIN_DV + sl * GDN_SLICE + (t - 256);
-            float *hist = hist0 + ch * CONV_RING;
+                                   : 2 * LIN_QK + h * LIN_DV + sl * COLS + (t - 256);
+            float *hist = hist0 + ch;   // [ring][channel] layout, see hist_at
             float win[CONV_K];
-            win[0] = __ldcg(hist + ((pos - 3) & RM));
-            win[1] = __ldcg(hist + ((pos - 2) & RM));
-            win[2] = __ldcg(hist + ((pos - 1) & RM));
+            win[0] = __ldcg(hist + hist_at((pos - 3) & RM));
+            win[1] = __ldcg(hist + hist_at((pos - 2) & RM));
+            win[2] = __ldcg(hist + hist_at((pos - 1) & RM));
             const float4 wq = *(const float4 *)(L.conv_w + ch * CONV_K);
             const unsigned long long raw = ld_ll(projl + ch);
             win[3] = ll_wait(raw, projl + ch, e - 1);
             const float acc = fmaf(wq.w, win[3], fmaf(wq.z, win[2], fmaf(wq.y, win[1], wq.x * win[0])));
-            if (t >= 256 || sl == 0) __stcg(hist + (pos & RM), win[3]);
+            if (t >= 256 || sl == 0) __stcg(hist + hist_at(pos & RM), win[3]);
             if (t < 256) sqk[t] = silu(acc); else sv[t - 256] = silu(acc);
-        } else if (t < 256 + GDN_SLICE + 1) {
+        } else if (t < 256 + COLS + 1) {
             const unsigned long long *pb = projl + GDN_B_OFF + h;
             const unsigned long long *pa = projl + GDN_A_OFF + h;
             const unsigned long long rb = ld_ll(pb), ra = ld_ll(pa);
@@ -1659,19 +1696,22 @@ __device__ void gdn_op_b(const q35_layer_ptrs_t &L, int nt, uint32_t e, float *s
             if (lane == 0) sc[2 + qk] = rsqrtf(ss + 1e-6f) * (qk == 0 ? rsqrtf((float)LIN_DK) : 1.f);
         }
         consumer_sync();
-        float s[2][4];
-        float *S[2];
+        // column c of this warp = warp + 16 * c (same per-column arithmetic for every CPW)
+        float s[CPW][4];
+        float *S[CPW];
 #pragma unroll
-        for (int c = 0; c < 2; c++) {
-            const size_t off = ((size_t)h * LIN_DV + sl * GDN_SLICE + warp + 16 * c) * LIN_DK;
+        for (int c = 0; c < CPW; c++) {
+            const size_t off = ((size_t)h * LIN_DV + sl * COLS + warp + 16 * c) * LIN_DK;
             S[c] = st + off;
         }
 #pragma unroll
-        for (int c = 0; c < 2; c++)
+        for (int c = 0; c < CPW; c++)
 #pragma unroll
             for (int i = 0; i < 4; i++) s[c][i] = __ldcg(S[c] + lane + 32 * i);
         const float beta = sc[0], decay = sc[1], rq = sc[2], rk = sc[3];
-        float kv[4], qv[4], km[2] = {0.f, 0.f};
+        float kv[4], qv[4], km[CPW];
+#pragma unroll
+        for (int c = 0; c < CPW; c++) km[c] = 0.f;
 #pragma unroll
         for (int i = 0; i < 4; i++) {
             const int k = lane + 32 * i;
@@ -1679,13 +1719,13 @@ __device__ void gdn_op_b(const q35_layer_ptrs_t &L, int nt, uint32_t e, float *s
             qv[i] = sqk[k] * rq;
         }
 #pragma unroll
-        for (int c = 0; c < 2; c++) {
+        for (int c = 0; c < CPW; c++) {
 #pragma unroll
             for (int i = 0; i < 4; i++) { s[c][i] *= decay; km[c] = fmaf(s[c][i], kv[i], km[c]); }
             km[c] = warp_sum(km[c]);
         }
 #pragma unroll
-        for (int c = 0; c < 2; c++) {
+        for (int c = 0; c < CPW; c++) {
             float *dst = S[c];
             const float delta = (sv[warp + 16 * c] - km[c]) * beta;
             float o = 0.f;
@@ -1696,16 +1736,30 @@ __device__ void gdn_op_b(const q35_layer_ptrs_t &L, int nt, uint32_t e, float *s
                 o = fmaf(s[c][i], qv[i], o);
             }
             o = warp_sum(o);
-            if (lane == 0) st_ll(corel + h * LIN_DV + sl * GDN_SLICE + warp + 16 * c, o, e);
+            if (lane == 0) st_ll(corel + h * LIN_DV + sl * COLS + warp + 16 * c, o, e);
         }
         consumer_sync();
     }
 }
 
+// Batch path split rule: a function of the position only (never of BT), so batch invariance (G4)
+// holds.  Chunks of at least Q35_ATT_B_CHUNK positions: a batch has enough (entry, kv-head) tasks
+// to fill the grid, so many tiny splits only add per-task latency and merge passes.
+#ifndef Q35_ATT_KVB
+#define Q35_ATT_KVB 1   // 2 and 4 raise register pressure and slow every op (B=32: -3% / -14%)
+#endif
+#ifndef Q35_ATT_B_CHUNK
+#define Q35_ATT_B_CHUNK 128
+#endif
+__device__ __forceinline__ void attn_split_b(int n, int &splits, int &chunk) {
+    splits = min(MAX_SPLITS, (n + Q35_ATT_B_CHUNK - 1) / Q35_ATT_B_CHUNK);
+    chunk = (n + splits - 1) / splits;
+    splits = (n + chunk - 1) / chunk;
+}
 __device__ __forceinline__ bool attn_task_b(int task, int nt, const int *positions, int &en, int &g, int &sp, int &splits, int &chunk) {
     for (int t = 0; t < nt; t++) {
         int splits_t, chunk_t;
-        attn_split(positions[t] + 1, splits_t, chunk_t);
+        attn_split_b(positions[t] + 1, splits_t, chunk_t);
         if (task < NKV * splits_t) { en = t; g = task / splits_t; sp = task % splits_t; splits = splits_t; chunk = chunk_t; return true; }
         task -= NKV * splits_t;
     }
@@ -1722,6 +1776,9 @@ __device__ void attn_op_b(const q35_layer_ptrs_t &L, int nt, uint32_t e, float *
     float *skv = sm + 2176;
     int *sflag = (int *)(red + 32);
     const size_t ms = (size_t)P.max_seq;
+    // positions per warp with loads in flight together; a warp still visits t0+warp+16k in increasing k,
+    // so the online-softmax order (and the result) does not depend on KVB
+    constexpr int KVB = Q35_ATT_KVB;
     int en, g, sp, splits, chunk;
     for (int task = blockIdx.x; attn_task_b(task, nt, positions, en, g, sp, splits, chunk); task += gridDim.x) {
         const int pos = positions[en];
@@ -1732,9 +1789,9 @@ __device__ void attn_op_b(const q35_layer_ptrs_t &L, int nt, uint32_t e, float *
         const __half *Kc = (const __half *)L.k_cache + (size_t)sid * L.kv_stride + (size_t)g * ms * HD + lane * 8;
         const __half *Vc = (const __half *)L.v_cache + (size_t)sid * L.kv_stride + (size_t)g * ms * HD + lane * 8;
         const unsigned long long *projl = P.projl + (size_t)en * PROJ_MAX;
-        uint4 kq[KV_BATCH], vq[KV_BATCH];
+        uint4 kq[KVB], vq[KVB];
 #pragma unroll
-        for (int b = 0; b < KV_BATCH; b++) {
+        for (int b = 0; b < KVB; b++) {
             const int tt = t0 + warp + b * N_CONSUMER_WARPS;
             if (tt < min(t1, pos)) {
                 kq[b] = __ldcg((const uint4 *)(Kc + (size_t)tt * HD));
@@ -1792,10 +1849,10 @@ __device__ void attn_op_b(const q35_layer_ptrs_t &L, int nt, uint32_t e, float *
 #pragma unroll
             for (int j = 0; j < 8; j++) acc[h][j] = 0.f;
         }
-        for (int base = t0 + warp, b0 = 0; base < t1; base += KV_BATCH * N_CONSUMER_WARPS, b0++) {
+        for (int base = t0 + warp, b0 = 0; base < t1; base += KVB * N_CONSUMER_WARPS, b0++) {
             if (b0 > 0) {
 #pragma unroll
-                for (int b = 0; b < KV_BATCH; b++) {
+                for (int b = 0; b < KVB; b++) {
                     const int tt = base + b * N_CONSUMER_WARPS;
                     if (tt < t1) {
                         kq[b] = __ldcg((const uint4 *)(Kc + (size_t)tt * HD));
@@ -1804,7 +1861,7 @@ __device__ void attn_op_b(const q35_layer_ptrs_t &L, int nt, uint32_t e, float *
                 }
             }
 #pragma unroll
-            for (int b = 0; b < KV_BATCH; b++) {
+            for (int b = 0; b < KVB; b++) {
                 const int tt = base + b * N_CONSUMER_WARPS;
                 if (tt >= t1) break;
                 if (tt >= pos) {
@@ -1984,10 +2041,9 @@ __device__ void gemv_direct_f(const void *Wv, const uint32_t *vecf, int n_groups
                         for (int j = 0; j < 4; j++) tmp[n][j] = 0.f;
 #pragma unroll
                     for (int h = 0; h < 2; h++) {
-                        const uint32_t a0 = cvt_pair(p[d][k][h * 2 + 0]);
-                        const uint32_t a1 = cvt_pair(p[d][k][h * 2 + 0] >> 16);
-                        const uint32_t a2 = cvt_pair(p[d][k][h * 2 + 1]);
-                        const uint32_t a3 = cvt_pair(p[d][k][h * 2 + 1] >> 16);
+                        uint32_t a0, a1, a2, a3;
+                        cvt4(p[d][k][h * 2 + 0], a0, a1);
+                        cvt4(p[d][k][h * 2 + 1], a2, a3);
 #pragma unroll
                         for (int n = 0; n < NT; n++)
                             mma_m16n8k16(tmp[n], a0, a1, a2, a3, b[n][h][0], b[n][h][1]);
@@ -2049,6 +2105,7 @@ __device__ void gemv_cta_f(const void *Wv, const uint32_t *vecf, int n_groups, i
     for (int n = 0; n < NT; n++)
 #pragma unroll
         for (int j = 0; j < 4; j++) acc[n][j] = 0.f;
+    uint32_t bb[2][NT][2][2];
 
     for (int u = 0; u < total; u++) {
         if (u + TC_NS <= total) cp_wait<TC_NS - 1>();
@@ -2058,8 +2115,10 @@ __device__ void gemv_cta_f(const void *Wv, const uint32_t *vecf, int n_groups, i
         const int t0 = c * TC_CHUNKT;
         const int nt = n_kt - t0 < TC_CHUNKT ? n_kt - t0 : TC_CHUNKT;
         const char *slot = ring + (u % TC_NS) * STAGE;
-        uint32_t bb[2][NT][2][2];
         int ntl = 0;
+        // E1: with one chunk per group (K <= 1024) every chunk uses the same k-tiles per warp, so the
+        // activation fragments are loaded once per op instead of once per group.
+        if (nch > 1 || u == 0)
         for (int j = warp; j < nt; j += N_CONSUMER_WARPS) {
             const int t = t0 + j;
 #pragma unroll
@@ -2085,10 +2144,9 @@ __device__ void gemv_cta_f(const void *Wv, const uint32_t *vecf, int n_groups, i
             for (int h = 0; h < 2; h++) {
                 const uint32_t p0 = *reinterpret_cast<const uint32_t *>(gt + ((h * 2 + 0) * 32 + lane) * 4);
                 const uint32_t p1 = *reinterpret_cast<const uint32_t *>(gt + ((h * 2 + 1) * 32 + lane) * 4);
-                const uint32_t a0 = cvt_pair(p0);
-                const uint32_t a1 = cvt_pair(p0 >> 16);
-                const uint32_t a2 = cvt_pair(p1);
-                const uint32_t a3 = cvt_pair(p1 >> 16);
+                uint32_t a0, a1, a2, a3;
+                cvt4(p0, a0, a1);
+                cvt4(p1, a2, a3);
 #pragma unroll
                 for (int n = 0; n < NT; n++)
                     mma_m16n8k16(tmp[n], a0, a1, a2, a3, bb[ntl][n][h][0], bb[ntl][n][h][1]);
@@ -2103,6 +2161,7 @@ __device__ void gemv_cta_f(const void *Wv, const uint32_t *vecf, int n_groups, i
             ntl++;
         }
         __syncthreads();
+#ifdef Q35_RED_SERIAL
         if (u + TC_NS < total) issue(u + TC_NS, u % TC_NS);
         if (c == nch - 1) {
             const int g = chunk_g(u);
@@ -2126,16 +2185,53 @@ __device__ void gemv_cta_f(const void *Wv, const uint32_t *vecf, int n_groups, i
 #pragma unroll
                 for (int j = 0; j < 4; j++) acc[n][j] = 0.f;
         }
+#else
+        // E2: reduce all NT n-tiles of a group at once (tiles 0..1 in `red`, tiles 2..3 in the ring slot
+        // just consumed), warp n sums tile n.  Same order (warps 0..15) as the serial version, so the
+        // result is bitwise identical; 2 barriers per group instead of 2*NT.
+        if (c == nch - 1) {
+            const int g = chunk_g(u);
+            float *slotf = reinterpret_cast<float *>(ring + (u % TC_NS) * STAGE);
+#pragma unroll
+            for (int n = 0; n < NT; n++) {
+                float *rb = (n < 2 ? red + n * 2048 : slotf + (n - 2) * 2048) + (warp * 32 + lane) * 4;
+                *reinterpret_cast<float4 *>(rb) = make_float4(acc[n][0], acc[n][1], acc[n][2], acc[n][3]);
+            }
+            __syncthreads();
+            if (warp < NT) {
+                const float *rbase = warp < 2 ? red + warp * 2048 : slotf + (warp - 2) * 2048;
+                float fin[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+                for (int q = 0; q < N_CONSUMER_WARPS; q++) {
+                    const float4 r4 = *reinterpret_cast<const float4 *>(rbase + (q * 32 + lane) * 4);
+                    fin[0] += r4.x; fin[1] += r4.y; fin[2] += r4.z; fin[3] += r4.w;
+                }
+                epi(g, warp, fin);
+            }
+            __syncthreads();
+#pragma unroll
+            for (int n = 0; n < NT; n++)
+#pragma unroll
+                for (int j = 0; j < 4; j++) acc[n][j] = 0.f;
+        }
+        if (u + TC_NS < total) issue(u + TC_NS, u % TC_NS);
+#endif
     }
 }
 
+#ifndef Q35_LM32_GPW
+#define Q35_LM32_GPW 2
+#endif
+#ifndef Q35_LM32_DEPTH
+#define Q35_LM32_DEPTH 2   // 4 spills more: LM head 1002 -> 941 us at B=32 (0.8B)
+#endif
 // Dispatch once per op: large row counts use the direct-load path, small ones the CTA ring.
 template <int BT, class Epi>
 __device__ void gemv_frag(const void *W, const uint32_t *vecf, int n_groups, int n_kt,
                           char *ring, float *red, Epi epi) {
     if (n_groups >= 64 * GRID) {
         if constexpr (BT <= 16) gemv_direct_f<BT, 4, 2>(W, vecf, n_groups, n_kt, epi);
-        else gemv_direct_f<BT, 2, 4>(W, vecf, n_groups, n_kt, epi);
+        else gemv_direct_f<BT, Q35_LM32_GPW, Q35_LM32_DEPTH>(W, vecf, n_groups, n_kt, epi);
     } else {
         gemv_cta_f<BT>(W, vecf, n_groups, n_kt, ring, red, epi);
     }
@@ -2435,16 +2531,10 @@ extern "C" int q35_mk_launch_batch(const q35_args_t *a, int bt, int grid, void *
         attr[which][ti] = true;
     }
     {
-        // per-launch reset: the vecf arrival counter and the watchdog record
-        static const unsigned zero = 0u;
-        static const int neg1 = -1;
-        cudaStream_t st = (cudaStream_t)stream;
-        cudaError_t e;
-        if ((e = cudaMemcpyToSymbolAsync(q35::g_vdone, &zero, 4, 0, cudaMemcpyHostToDevice, st)) != cudaSuccess) return (int)e;
-        if ((e = cudaMemcpyToSymbolAsync(q35::g_vready, &zero, 4, 0, cudaMemcpyHostToDevice, st)) != cudaSuccess) return (int)e;
-        if ((e = cudaMemcpyToSymbolAsync(q35::g_wd_b, &zero, 4, 0, cudaMemcpyHostToDevice, st)) != cudaSuccess) return (int)e;
-        if ((e = cudaMemcpyToSymbolAsync(q35::g_wd_b_blk, &neg1, 4, 0, cudaMemcpyHostToDevice, st)) != cudaSuccess) return (int)e;
-        if ((e = cudaMemcpyToSymbolAsync(q35::g_wd_b_ep, &zero, 4, 0, cudaMemcpyHostToDevice, st)) != cudaSuccess) return (int)e;
+        // per-launch reset: the vecf arrival counters and the watchdog record (one copy)
+        static const q35::BState init = {0, -1, 0, 0, 0, {0, 0, 0}};
+        cudaError_t e = cudaMemcpyToSymbolAsync(q35::g_bs, &init, sizeof(init), 0, cudaMemcpyHostToDevice, (cudaStream_t)stream);
+        if (e != cudaSuccess) return (int)e;
     }
     q35_args_t args = *a;
     void *kargs[] = {&args};
@@ -2455,12 +2545,9 @@ extern "C" int q35_mk_launch_batch(const q35_args_t *a, int bt, int grid, void *
 // Watchdog record of the last launch: returns the kind (0 none, 1 mbarrier, 2 ll_wait, 3 vecf-arrival
 // wait) and, if requested, the CTA and the epoch / counter target that timed out.
 extern "C" int q35_mk_watchdog_fired(int *blk, unsigned *ep) {
-    int kind = 0, b = -1;
-    unsigned x = 0;
-    if (cudaMemcpyFromSymbol(&kind, q35::g_wd_b, sizeof(int)) != cudaSuccess) return -1;
-    if (cudaMemcpyFromSymbol(&b, q35::g_wd_b_blk, sizeof(int)) != cudaSuccess) return -1;
-    if (cudaMemcpyFromSymbol(&x, q35::g_wd_b_ep, sizeof(unsigned)) != cudaSuccess) return -1;
-    if (blk) *blk = b;
-    if (ep) *ep = x;
-    return kind;
+    q35::BState b;
+    if (cudaMemcpyFromSymbol(&b, q35::g_bs, sizeof(b)) != cudaSuccess) return -1;
+    if (blk) *blk = b.wd_b_blk;
+    if (ep) *ep = b.wd_b_ep;
+    return b.wd_b;
 }

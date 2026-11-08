@@ -47,7 +47,7 @@ typedef struct {
     const float *ssm_a;     // [16], already -exp(A_log)
     const float *dt_bias;   // [16]
     const float *gdn_norm;  // [128]
-    float *conv_hist;       // [6144, 8] fp32 ring (slot 0)
+    float *conv_hist;       // [8, 6144] fp32 ring, [ring][channel] (slot 0)
     float *state;           // [16][128 v][128 k] fp32 (slot 0)
     long long conv_stride;  // elements per slot in conv_hist
     long long state_stride; // elements per slot in state

@@ -21,7 +21,7 @@ Target machine: RTX 3070 Laptop 8 GB (sm_86) + Ryzen 9 5900HX + 64 GB DDR4. Corr
 |---|---|---|
 | Qwen3.6-35B-A3B (`qwen35moe`, Q4_K_S) | hand-tuned `engine.c` | **67.5 tok/s** vs llama.cpp 43.9 (details below) |
 | LFM2.5 dense / MoE (`lfm2`, `lfm2moe`) | `lfm25_engine.c` | phase 1, see `LFM25_ROADMAP.md`, `wiki/lfm25/` |
-| Qwen3.5 0.8B / 2B (dense, Q8_0) | `src/qwen35/` megakernel | **Phases 1, 2 and 4 (server)**. 0.8B 348 tok/s / 2B 159 tok/s at batch 1; the batched path is bitwise batch-invariant (G4) and scales to 2511 / 1506 tok/s aggregate at B=32 (see `QWEN35_MK_REPORT.md`). `tuff-server` backend B has continuous batching, exact-prefix prompt cache, the Qwen3.5 template, tools/tool-call + reasoning parsing, the llama.cpp sampling chain and logprobs. G8/G9/G10 pass; G7 and the P2 throughput table are documented misses. |
+| Qwen3.5 0.8B / 2B (dense, Q8_0) | `src/qwen35/` megakernel | **Phases 1, 2 and 4 (server)**. 0.8B 348 tok/s / 2B 159 tok/s at batch 1; the batched path is bitwise batch-invariant (G4) and scales to 3323 / 1675 tok/s aggregate at B=32 (see `QWEN35_MK_REPORT.md`). `tuff-server` backend B has continuous batching, exact-prefix prompt cache, the Qwen3.5 template, tools/tool-call + reasoning parsing, the llama.cpp sampling chain and logprobs. G8/G9/G10 pass; G7 and the P2 throughput table are documented misses. |
 
 Backend A (Qwen3.6-35B-A3B) is unchanged: greedy only, one request at a time, no `tools`, `logprobs` null.
 `-np/--parallel > 1` is a startup error on backend A. Backend B (dense Qwen3.5 0.8B/2B) is selected from the
