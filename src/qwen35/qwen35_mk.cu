@@ -2108,9 +2108,6 @@ __device__ void gemv_cta_f(const void *Wv, const uint32_t *vecf, int n_groups, i
     uint32_t bb[2][NT][2][2];
 
     for (int u = 0; u < total; u++) {
-        if (u + TC_NS <= total) cp_wait<TC_NS - 1>();
-        else cp_wait<0>();
-        __syncthreads();
         const int c = chunk_c(u);
         const int t0 = c * TC_CHUNKT;
         const int nt = n_kt - t0 < TC_CHUNKT ? n_kt - t0 : TC_CHUNKT;
@@ -2118,18 +2115,31 @@ __device__ void gemv_cta_f(const void *Wv, const uint32_t *vecf, int n_groups, i
         int ntl = 0;
         // E1: with one chunk per group (K <= 1024) every chunk uses the same k-tiles per warp, so the
         // activation fragments are loaded once per op instead of once per group.
-        if (nch > 1 || u == 0)
-        for (int j = warp; j < nt; j += N_CONSUMER_WARPS) {
-            const int t = t0 + j;
+        // X3: the activation loads do not depend on the ring, so they are issued before the ring wait and
+        // the barrier; their L2 latency overlaps the wait instead of following it.
+        auto load_bb = [&]() {
+            if (nch > 1 || u == 0)
+            for (int j = warp; j < nt; j += N_CONSUMER_WARPS) {
+                const int t = t0 + j;
 #pragma unroll
-            for (int n = 0; n < NT; n++)
+                for (int n = 0; n < NT; n++)
 #pragma unroll
-                for (int h = 0; h < 2; h++) {
-                    bb[ntl][n][h][0] = ld_vecf(vecf + (size_t)((t * 4 + 2 * h + 0) * Q35_NTMAX + n) * 32 + lane);
-                    bb[ntl][n][h][1] = ld_vecf(vecf + (size_t)((t * 4 + 2 * h + 1) * Q35_NTMAX + n) * 32 + lane);
-                }
-            ntl++;
-        }
+                    for (int h = 0; h < 2; h++) {
+                        bb[ntl][n][h][0] = ld_vecf(vecf + (size_t)((t * 4 + 2 * h + 0) * Q35_NTMAX + n) * 32 + lane);
+                        bb[ntl][n][h][1] = ld_vecf(vecf + (size_t)((t * 4 + 2 * h + 1) * Q35_NTMAX + n) * 32 + lane);
+                    }
+                ntl++;
+            }
+        };
+#ifndef Q35_BB_AFTER_WAIT
+        load_bb();
+#endif
+        if (u + TC_NS <= total) cp_wait<TC_NS - 1>();
+        else cp_wait<0>();
+        __syncthreads();
+#ifdef Q35_BB_AFTER_WAIT
+        load_bb();
+#endif
         ntl = 0;
         for (int j = warp; j < nt; j += N_CONSUMER_WARPS) {
             const char *gt = slot + j * GROUP_BYTES;
@@ -2225,6 +2235,123 @@ __device__ void gemv_cta_f(const void *Wv, const uint32_t *vecf, int n_groups, i
 #ifndef Q35_LM32_DEPTH
 #define Q35_LM32_DEPTH 2   // 4 spills more: LM head 1002 -> 941 us at B=32 (0.8B)
 #endif
+// H-ks: k-split GEMV without a CTA ring.  Warp w owns k-tiles t = w + 16*i (i < KPW = n_kt/16) of every
+// row group of this CTA -- exactly the tiles and the order it had in gemv_cta_f -- and streams their A
+// fragments straight from global with a D-deep register pipeline that runs across group boundaries, so
+// there is no barrier per 32-tile chunk.  The cross-warp reduction (same 0..15 order, warp n sums n-tile n)
+// is double-buffered in the (now unused) ring smem: one barrier per group.  Bitwise identical to gemv_cta_f.
+#ifndef Q35_KS_MIN_BT
+#define Q35_KS_MIN_BT 16     // smallest BT that uses the k-split path (64 = never)
+#endif
+#ifndef Q35_KS_D
+#define Q35_KS_D 2           // register pipeline depth (3 and 8 were slower: spills)
+#endif
+template <int BT, int D, bool HOIST, class Epi>
+__device__ void gemv_ks_f(const void *Wv, const uint32_t *vecf, int n_groups, int n_kt, char *rbuf, Epi epi) {
+    constexpr int NT = (BT + 7) / 8;
+    const uint8_t *W = (const uint8_t *)Wv;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g0 = (int)((long long)n_groups * blockIdx.x / gridDim.x);
+    const int g1 = (int)((long long)n_groups * (blockIdx.x + 1) / gridDim.x);
+    const int r0 = lane >> 2;
+    const int KPW = n_kt / N_CONSUMER_WARPS;
+    const int U = (g1 - g0) * KPW;
+    if (U <= 0) return;
+    auto ldb = [&](uint32_t (&b)[NT][2][2], int t) {
+#pragma unroll
+        for (int n = 0; n < NT; n++)
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                b[n][h][0] = ld_vecf(vecf + (size_t)((t * 4 + 2 * h + 0) * Q35_NTMAX + n) * 32 + lane);
+                b[n][h][1] = ld_vecf(vecf + (size_t)((t * 4 + 2 * h + 1) * Q35_NTMAX + n) * 32 + lane);
+            }
+    };
+    uint32_t bh[HOIST ? 2 : 1][NT][2][2];
+    if constexpr (HOIST) {
+        ldb(bh[0], warp);
+        if (KPW > 1) ldb(bh[1], warp + N_CONSUMER_WARPS);
+    }
+    uint32_t pa[D][4];
+    float ps[D][2];
+    uint32_t pb[HOIST ? 1 : D][NT][2][2];
+    auto load = [&](int u, int d) {
+        const int gi = u / KPW, i = u - gi * KPW;
+        const int t = warp + N_CONSUMER_WARPS * i;
+        const uint8_t *gt = W + ((size_t)(g0 + gi) * n_kt + t) * GROUP_BYTES;
+#pragma unroll
+        for (int q = 0; q < 4; q++) pa[d][q] = __ldcs(reinterpret_cast<const uint32_t *>(gt + (q * 32 + lane) * 4));
+        ps[d][0] = __half2float(*reinterpret_cast<const __half *>(gt + 512 + 2 * r0));
+        ps[d][1] = __half2float(*reinterpret_cast<const __half *>(gt + 512 + 2 * (r0 + 8)));
+        if constexpr (!HOIST) ldb(pb[d], t);
+    };
+    float acc[NT][4];
+#pragma unroll
+    for (int n = 0; n < NT; n++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) acc[n][j] = 0.f;
+    auto mma_unit = [&](const uint32_t (&b)[NT][2][2], int d) {
+        float tmp[NT][4];
+#pragma unroll
+        for (int n = 0; n < NT; n++)
+#pragma unroll
+            for (int q = 0; q < 4; q++) tmp[n][q] = 0.f;
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            uint32_t a0, a1, a2, a3;
+            cvt4(pa[d][h * 2 + 0], a0, a1);
+            cvt4(pa[d][h * 2 + 1], a2, a3);
+#pragma unroll
+            for (int n = 0; n < NT; n++) mma_m16n8k16(tmp[n], a0, a1, a2, a3, b[n][h][0], b[n][h][1]);
+        }
+#pragma unroll
+        for (int n = 0; n < NT; n++) {
+            acc[n][0] = fmaf(tmp[n][0], ps[d][0], acc[n][0]);
+            acc[n][1] = fmaf(tmp[n][1], ps[d][0], acc[n][1]);
+            acc[n][2] = fmaf(tmp[n][2], ps[d][1], acc[n][2]);
+            acc[n][3] = fmaf(tmp[n][3], ps[d][1], acc[n][3]);
+        }
+    };
+#pragma unroll
+    for (int d = 0; d < D; d++) if (d < U) load(d, d);
+    for (int u0 = 0; u0 < U; u0 += D) {
+#pragma unroll
+        for (int d = 0; d < D; d++) {
+            const int u = u0 + d;
+            if (u >= U) break;
+            const int gi = u / KPW, i = u - gi * KPW;
+            if constexpr (HOIST) {
+                if (i == 0) mma_unit(bh[0], d); else mma_unit(bh[HOIST ? 1 : 0], d);
+            } else {
+                mma_unit(pb[HOIST ? 0 : d], d);
+            }
+            if (u + D < U) load(u + D, d);
+            if (i == KPW - 1) {
+                float *buf = reinterpret_cast<float *>(rbuf) + (gi & 1) * (2048 * NT);
+#pragma unroll
+                for (int n = 0; n < NT; n++)
+                    *reinterpret_cast<float4 *>(buf + n * 2048 + (warp * 32 + lane) * 4) =
+                        make_float4(acc[n][0], acc[n][1], acc[n][2], acc[n][3]);
+                __syncthreads();
+                if (warp < NT) {
+                    const float *rb = buf + warp * 2048;
+                    float fin[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+                    for (int q = 0; q < N_CONSUMER_WARPS; q++) {
+                        const float4 r4 = *reinterpret_cast<const float4 *>(rb + (q * 32 + lane) * 4);
+                        fin[0] += r4.x; fin[1] += r4.y; fin[2] += r4.z; fin[3] += r4.w;
+                    }
+                    epi(g0 + gi, warp, fin);
+                }
+#pragma unroll
+                for (int n = 0; n < NT; n++)
+#pragma unroll
+                    for (int j = 0; j < 4; j++) acc[n][j] = 0.f;
+            }
+        }
+    }
+    __syncthreads();   // the last group's reducing warps are done with rbuf before the caller moves on
+}
+
 // Dispatch once per op: large row counts use the direct-load path, small ones the CTA ring.
 template <int BT, class Epi>
 __device__ void gemv_frag(const void *W, const uint32_t *vecf, int n_groups, int n_kt,
@@ -2233,7 +2360,15 @@ __device__ void gemv_frag(const void *W, const uint32_t *vecf, int n_groups, int
         if constexpr (BT <= 16) gemv_direct_f<BT, 4, 2>(W, vecf, n_groups, n_kt, epi);
         else gemv_direct_f<BT, Q35_LM32_GPW, Q35_LM32_DEPTH>(W, vecf, n_groups, n_kt, epi);
     } else {
-        gemv_cta_f<BT>(W, vecf, n_groups, n_kt, ring, red, epi);
+        // Both paths compute bitwise-identical results, so the choice may depend on BT (G4 holds).
+        // Ring: more weight bytes in flight (wins at BT <= 8, -4..5%); k-split: no per-chunk barrier
+        // (wins at BT >= 16: B=32 2B +14%, 0.8B +6%).  Deeper k-split pipelines spill.
+        if constexpr (BT >= Q35_KS_MIN_BT) {
+            if (n_kt <= 2 * N_CONSUMER_WARPS) gemv_ks_f<BT, Q35_KS_D, true>(W, vecf, n_groups, n_kt, ring, epi);
+            else gemv_ks_f<BT, Q35_KS_D, false>(W, vecf, n_groups, n_kt, ring, epi);
+        } else {
+            gemv_cta_f<BT>(W, vecf, n_groups, n_kt, ring, red, epi);
+        }
     }
     vdone_arrive();
 }

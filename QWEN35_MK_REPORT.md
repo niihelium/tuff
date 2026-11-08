@@ -1017,3 +1017,41 @@ Per-op profile now (us/step): 0.8B B=32 `in` 1654 (prologue 712), mixer 4317 (GD
    streaming weights (TMA ring + L2 prefetch cursor), which sm_86 can only approximate with cp.async.
 3. `down` / `out` have 64 row groups over 40 CTAs (25% imbalance).
 4. bf16/f16 GDN state would cut 1.7 ms at B=32 (0.8B) but changes numerics over long contexts; not tried.
+
+## Batch throughput, round 3: 2B GEMVs (2026-11-08)
+
+Problem: at K = 2048 / 6144 (all 2B layer GEMVs; 0.8B `out` / `down`) a 16-row group spans 2-6 ring chunks of
+32 k-tiles, so round 2's once-per-op activation load (E1) does not apply, and every chunk is wait -> barrier ->
+L2 activation loads -> 16 MMAs per warp -> barrier. Measured on this GPU (`scratchpad mmabw.cu`): f16 MMA with
+fp32 accumulate = **13.1 TFMA/s** (f16 accumulate 26.3). 2B gate/up at B=32 was ~172 us/layer for its GEMV part
+vs 61 us of tensor work and 72 us of weight streaming: the weight stream ran at 42% of the roofline.
+
+| # | hypothesis | result | kept |
+|---|---|---|---|
+| X3 | issue a chunk's activation loads before the ring wait + barrier (they do not depend on the ring) | 2B B=32 step -1.5% (gate/up -230 us, `in` -120 us) | yes |
+| X1 | `ld.global.ca` (L1) instead of `.cg` for the activations | no gain (with or without X3) | no |
+| H-ks | k-split GEMV without the cp.async ring: warp w streams the A fragments of its own k-tiles (w + 16i, the same tiles and order as the ring path) straight from global with a 2-deep register pipeline across group boundaries; the cross-warp reduction is double-buffered in the free ring smem, 1 barrier per group (was 5 for a 2B group) | bitwise identical to the ring path (teacher logits `cmp`-equal vs 80d1fed at N=16 and N=32, both models). B=32: 2B 18.0 -> 15.7 ms/step, 0.8B 9.46 -> 8.94; B=16: 2B -6.6%, 0.8B -2%; but B<=8 +4-5% (a 2-deep register pipeline holds less in flight than the 70 KB ring) | yes, for BT >= 16 (`Q35_KS_MIN_BT`); ring below |
+| | pipeline depth 3 (BT >= 16) / 8 (BT <= 8) | spills: +9% / 1.5-3x slower | no |
+
+Verification (clean build, 0 warnings): det-probe 30/30 on both models, G4 B=2/8/16/32 and DUP PASS, watchdog
+one error per stalled launch at B=1/8, G1 unchanged (T=1 0.0032 / 0.0022, batch N=1 and N=32 0.0258 / 0.0205,
+0 argmax mismatches). A/B vs 80d1fed, 5 rounds, ratio [95% CI]:
+
+| model | B=1 | B=8 | B=16 | B=32 |
+|---|---|---|---|---|
+| 0.8B | 0.9978 [0.9863, 1.0094] | 1.0026 [1.0013, 1.0040] | 1.0207 [1.0091, 1.0323] | **1.0645** [1.0557, 1.0732] |
+| 2B | 1.0162 [0.9976, 1.0349] | 0.9967 [0.9835, 1.0099] | 1.0772 [1.0645, 1.0899] | **1.1848** [1.1525, 1.2170] |
+
+Engine now (`--bench B --steps 64 --rounds 5`, median, aggregate tok/s; target = server target):
+
+| B | 0.8B | target | 2B | target |
+|---|---|---|---|---|
+| 1 | 337.4 | 380 (P1) / 330 | 149.7 | 165 (P1) / 150 |
+| 8 | 1902.8 | 1800 | 995.6 | 800 |
+| 16 | 2863.0 | 2800 | 1528.0 | 1400 |
+| 32 | 3539.7 | 4000 | 2012.6 | 2200 |
+
+2B B=32 per op now (us/step): `in` 2839 (prologue 1011), mixer 4582 (GDN 4067, attention 515), `out` 826,
+gate/up 3800 (prologue 757), `down` 1819, LM 1972; total 15.84 ms (was 18.40 after round 2, 20.96 at 46d27f7).
+Gate/up GEMV part is now ~127 us/layer vs the 72 us weight floor. The prologues (2.5 ms at B=32 on 2B) are now the
+largest non-floor item after the GDN state traffic.
